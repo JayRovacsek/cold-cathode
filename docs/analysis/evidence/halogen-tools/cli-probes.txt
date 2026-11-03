@@ -1,0 +1,290 @@
+halogen-tools CLI probe transcript — 2026-11-03 UTC
+binary: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-tools
+host: linux x86_64; all invocations read-only (no file writes; subcommands that
+write were probed only with unreadable inputs so they fail before writing)
+
+===  ===
+--stdout--
+
+--stderr--
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== --help ===
+--stdout--
+
+--stderr--
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=0
+=== -h ===
+--stdout--
+
+--stderr--
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=0
+=== --version ===
+--stdout--
+
+--stderr--
+halogen-tools: unknown verb '--version'
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== --bogus ===
+--stdout--
+
+--stderr--
+halogen-tools: unknown verb '--bogus'
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== inspect ===
+--stdout--
+
+--stderr--
+usage: inspect FILE.hgn [--json] [--no-hash] [--threads N]
+--exit=2
+=== inspect /nonexistent.hgn ===
+--stdout--
+
+--stderr--
+cannot open /nonexistent.hgn
+--exit=2
+=== inspect /nonexistent.hgn --bogus ===
+--stdout--
+
+--stderr--
+cannot open /nonexistent.hgn
+--exit=2
+=== inspect /nonexistent.hgn --json ===
+--stdout--
+
+--stderr--
+cannot open /nonexistent.hgn
+--exit=2
+=== verify ===
+--stdout--
+
+--stderr--
+usage: verify FILE.hgn [--threads N]
+--exit=2
+=== verify /nonexistent.hgn ===
+--stdout--
+FAIL cannot open /nonexistent.hgn
+--stderr--
+
+--exit=1
+=== verify /nonexistent.hgn --json ===
+--stdout--
+FAIL cannot open /nonexistent.hgn
+--stderr--
+
+--exit=1
+=== ppl ===
+--stdout--
+
+--stderr--
+usage: ppl FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1] [--ref-out REF.bin [--topk K]] [--ref REF.bin [--per-pos P.bin]] [--rows-out ROWS.bin --rows LO-HI]
+--exit=2
+=== ppl /nonexistent ===
+--stdout--
+
+--stderr--
+ppl: --ids IDS.bin is required (a text front end is not built yet)
+--exit=2
+=== niah ===
+--stdout--
+
+--stderr--
+usage: niah FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+--exit=2
+=== niah /nonexistent ===
+--stdout--
+
+--stderr--
+niah: --manifest CASES.tsv is required (the battery builder is not in the image yet)
+--exit=2
+=== paired ===
+--stdout--
+
+--stderr--
+usage: paired A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== paired /nonexistent-a.bin ===
+--stdout--
+
+--stderr--
+usage: paired A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== paired /nonexistent-a.bin /nonexistent-b.bin ===
+--stdout--
+
+--stderr--
+cannot open /nonexistent-a.bin
+--exit=2
+=== paired /nonexistent-a.bin /nonexistent-b.bin --json ===
+--stdout--
+
+--stderr--
+cannot open /nonexistent-a.bin
+--exit=2
+=== help ===
+--stdout--
+
+--stderr--
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=0
+
+=== inspect x.hgn --threads x ===
+--stdout--
+
+--stderr--
+cannot open x.hgn
+--exit=2
+=== inspect x.hgn --threads ===
+--stdout--
+
+--stderr--
+cannot open x.hgn
+--exit=2
+=== verify x.hgn --threads x ===
+--stdout--
+FAIL cannot open x.hgn
+--stderr--
+
+--exit=1
+=== ppl x --ids y --chunk 7 ===
+--stdout--
+
+--stderr--
+cannot open y
+--exit=2
+=== ppl x --ids y --chunk 8 --out /dev/null ===
+--stdout--
+
+--stderr--
+cannot open y
+--exit=2
+=== niah x --manifest y --max-tok x ===
+--stdout--
+
+--stderr--
+cannot open y
+--exit=2
+=== niah x --manifest y --pin-trunk 2 ===
+--stdout--
+
+--stderr--
+cannot open y
+--exit=2
+=== paired a.bin b.bin --label-a ===
+--stdout--
+
+--stderr--
+cannot open a.bin
+--exit=2
+=== inspect x.hgn --json --no-hash --threads 4 ===
+--stdout--
+
+--stderr--
+cannot open x.hgn
+--exit=2
+=== HELP ===
+--stdout--
+
+--stderr--
+halogen-tools: unknown verb 'HELP'
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
+=== --Help ===
+--stdout--
+
+--stderr--
+halogen-tools: unknown verb '--Help'
+halogen-tools: the checkpoint tools
+  inspect FILE.hgn [--json] [--no-hash] [--threads N]
+  verify  FILE.hgn [--threads N]
+  ppl     FILE --ids IDS.bin [--chunk 1024|8] [--out NLL.bin] [--vs OTHER [--vs-out NLL.bin]] [--pin-trunk 0|1]
+          [--ref-out REF.bin [--topk 128]]   write the distribution at every position (top-K, tail, argmax)
+          [--ref REF.bin [--per-pos P.bin]]  score against it: KL(ref || this), top-1 agreement, delta p(target)
+          [--rows-out ROWS.bin --rows LO-HI] the full fp32 logits of positions [LO, HI)
+          [--worst N]                         with --ref: the N positions the two files disagree on most, as ids
+          [--json]                            one object on stdout (the prose goes to stderr)
+          [--seq 262144]                      a longer corpus is scored as consecutive sequences of this length
+  niah    FILE --manifest CASES.tsv [--out DIR] [--max-tok N] [--pin-trunk 0|1]
+  paired  A.bin B.bin [--label-a X] [--label-b Y] [--json]
+--exit=2
