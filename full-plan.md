@@ -124,10 +124,10 @@ before any real implementation — proving the harness works (TDD).
 
 ### Phase 4 — Rust implementation (iterative, smallest first)
 **Objective:** all five entry points green against the full matrix.
-- [ ] Order: `cc-halogen-healthcheck` → `cc-halogen-tools` → `cc-halogen-npu` → `cc-flash-serve` → `cc-launcher` (launcher last — it orchestrates the others). (this round implemented `cc-flash-serve` first per the 2026-11-03 decision-log scoping; the other crates are unimplemented — review F4)
-- [ ] Per-binary loop: implement from spec → unit tests → contract tests green → `cargo fmt` + `clippy -D warnings` + `cargo nextest run` green → commit → code review (code-reviewer agent per AGENTS.md) → resolve findings → mark done.
-- [ ] Unsafe blocks only per §7; each lands with its `// SAFETY:` note and tests in the same commit.
-- [ ] **Gate:** every contract matrix green (or GPU-gated with documented skips on this machine).
+- [x] Order: `cc-halogen-healthcheck` → `cc-halogen-tools` → `cc-halogen-npu` → `cc-flash-serve` → `cc-launcher` (launcher last — it orchestrates the others). (implemented out of order per the 2026-11-03 scoping: `cc-flash-serve` `404947f` first, then `cc-halogen-healthcheck` `e8ed65c`, `cc-halogen-npu` `e189c80`, `cc-halogen-tools` `4867333`, `cc-launcher` `96aba28`; all five reviewed — reports in `.tmp/`)
+- [x] Per-binary loop: implement from spec → unit tests → contract tests green → `cargo fmt` + `clippy -D warnings` + `cargo nextest run` green → commit → code review (code-reviewer agent per AGENTS.md) → resolve findings → mark done.
+- [x] Unsafe blocks only per §7; each lands with its `// SAFETY:` note and tests in the same commit. (all five crates are std-only with zero `unsafe` — nothing to annotate; every crate carries the crate-wide `#![warn(unsafe_op_in_unsafe_fn)]` attribute per §7.5)
+- [x] **Gate:** every contract matrix green (or GPU-gated with documented skips on this machine). (all five matrices green; the cold-cathode matrix runs live via the devShell `HALOGEN_COLD_CATHODE` override — 18 pass + 7 documented defers; the flash_serve HTTP tests remain a Phase 3 F4 carry-over)
 
 ### Phase 5 — Packaging and documentation
 - [ ] Finalise `packages/cold-cathode/default.nix` so `$out/bin` contains all five entry points and `$out/opt/halogen/` data paths match what the launcher expects.
@@ -341,3 +341,7 @@ the binary/tool that serves it.
 | 2026-11-03 | Phase 3 HTTP tests will stub the engine with a fixed fake engine-INFO fixture (makes `/health`, auth gate and §3 error vocabulary testable without GPU) | review adjudication 5d |
 | 2026-11-03 | `.hgn` format caveat accepted (HGN1 layout decompiled, writer unverified); npu XRT-stub-based probes accepted (`libxrt_coreutil.so.2` absent on host) | review adjudications 5a/5b |
 | 2026-11-03 | REA MCP provider gap (`GHIDRA_INSTALL_DIR` unset; `ps`/`JAVA_HOME` missing in MCP env) — workaround: REA CLI with Ghidra 12.1.4; permanent fix at MCP launch env | flash_serve/halogen-tools/halogen-npu analyses all hit it |
+| 2026-11-04 | `cold-cathode` usage strings keep the literal program name `entrypoint.sh` (general + convert usage, npu retirement line verbatim) | the frozen spec's explicit ask (`docs/analysis/specs/launcher.md` §Exact usage strings); recorded here per that ask — launcher review L3 |
+| 2026-11-04 | Appendix A path variance reconciled: the live v0.18.21 wrapper uses concrete store paths for `HALOGEN_MATMUL_TUNING_FILE`, `HALOGEN_DRAFT_VOCAB_FILE` and `_hg_hf` where this plan's Appendix A shows the `/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9/…` forms; the spec transcribed the live wrapper and the port follows the spec | spec §Variance vs the plan's Appendix A (open question 1): the live wrapper is the contract — launcher review L3 |
+| 2026-11-04 | The port honours `_hg_flash_serve` in every launching mode; the reference honours it only in `all` (hard-codes the store path in engine/bench/convert) | launcher review adjudication: accepted superset — identical behaviour when the var is unset |
+| 2026-11-04 | The port omits the entrypoint's `ulimit -c 0` (line 6) | launcher review adjudication: accepted — std-only constraint (`setrlimit` needs libc); invisible on stdout/stderr/exit, the only channels the harness compares |
