@@ -40,7 +40,9 @@ fn resolve_args(args: &[String]) -> Result<Vec<String>, String> {
 fn run_mode(mode: &str) {
     let Some(path) = repo_root().map(|root| root.join("tests/contract/matrix/flash_serve.toml"))
     else {
-        println!("SKIP {mode}: matrix unavailable (nix build src excludes the root tests/ directory)");
+        println!(
+            "SKIP {mode}: matrix unavailable (nix build src excludes the root tests/ directory)"
+        );
         return;
     };
     let cases = match matrix::load_matrix(&path) {
@@ -54,7 +56,9 @@ fn run_mode(mode: &str) {
     for case in cases.iter().filter(|case| case.mode == mode) {
         if case.deferred {
             tally.deferred += 1;
-            tally.notes.push(format!("DEFER {}: {}", case.name, case.reason));
+            tally
+                .notes
+                .push(format!("DEFER {}: {}", case.name, case.reason));
             continue;
         }
         if case.requires_gpu && !gating::gpu_present() {
@@ -81,15 +85,20 @@ fn run_mode(mode: &str) {
             ));
             continue;
         };
-        let reference_exec = runner::run(&reference, &args, &case.env)
-            .unwrap_or_else(|err| panic!("{}: reference {}: {err}", case.name, reference.display()));
+        let reference_exec = runner::run(&reference, &args, &case.env).unwrap_or_else(|err| {
+            panic!("{}: reference {}: {err}", case.name, reference.display())
+        });
         let subject_exec = runner::run(&subject, &args, &case.env)
             .unwrap_or_else(|err| panic!("{}: subject {}: {err}", case.name, subject.display()));
 
-        let reference_norm = normalise::normalise(&reference_exec.stderr, &reference.display().to_string());
-        let subject_norm = normalise::normalise(&subject_exec.stderr, &subject.display().to_string());
-        let reference_out = normalise::normalise(&reference_exec.stdout, &reference.display().to_string());
-        let subject_out = normalise::normalise(&subject_exec.stdout, &subject.display().to_string());
+        let reference_norm =
+            normalise::normalise(&reference_exec.stderr, &reference.display().to_string());
+        let subject_norm =
+            normalise::normalise(&subject_exec.stderr, &subject.display().to_string());
+        let reference_out =
+            normalise::normalise(&reference_exec.stdout, &reference.display().to_string());
+        let subject_out =
+            normalise::normalise(&subject_exec.stdout, &subject.display().to_string());
 
         if reference_exec.code == subject_exec.code
             && reference_norm == subject_norm

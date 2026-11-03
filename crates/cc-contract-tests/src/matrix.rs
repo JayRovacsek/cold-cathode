@@ -73,9 +73,12 @@ pub fn parse_matrix(text: &str) -> Result<Vec<Case>, MatrixError> {
             header_line = line_no;
             continue;
         }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| error(line_no, &format!("expected `key = value` or [[case]], found {line:?}")))?;
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            error(
+                line_no,
+                &format!("expected `key = value` or [[case]], found {line:?}"),
+            )
+        })?;
         let key = key.trim();
         let value = value.trim();
         let case = current
@@ -172,7 +175,8 @@ fn parse_string_array(value: &str, line: usize) -> Result<Vec<String>, MatrixErr
     split_commas(body)
         .iter()
         .map(|part| {
-            parse_quoted(part).ok_or_else(|| error(line, &format!("array element {part:?} is not quoted")))
+            parse_quoted(part)
+                .ok_or_else(|| error(line, &format!("array element {part:?} is not quoted")))
         })
         .collect()
 }
@@ -181,14 +185,27 @@ fn parse_inline_table(value: &str, line: usize) -> Result<Vec<(String, String)>,
     let body = value
         .strip_prefix('{')
         .and_then(|v| v.strip_suffix('}'))
-        .ok_or_else(|| error(line, "inline table must be on a single line: { KEY = \"value\" }"))?;
+        .ok_or_else(|| {
+            error(
+                line,
+                "inline table must be on a single line: { KEY = \"value\" }",
+            )
+        })?;
     split_commas(body)
         .iter()
         .map(|part| {
             let (key, val) = part
                 .split_once('=')
                 .ok_or_else(|| error(line, &format!("inline table entry {part:?} lacks `=`")))?;
-            Ok((key.trim().to_string(), parse_quoted(val.trim()).ok_or_else(|| error(line, &format!("inline table value for {key:?} is not quoted")))?))
+            Ok((
+                key.trim().to_string(),
+                parse_quoted(val.trim()).ok_or_else(|| {
+                    error(
+                        line,
+                        &format!("inline table value for {key:?} is not quoted"),
+                    )
+                })?,
+            ))
         })
         .collect()
 }
@@ -252,8 +269,9 @@ requires_gpu = false
 
     #[test]
     fn rejects_unknown_key() {
-        let err = parse_matrix("[[case]]\nname = \"x\"\nmode = \"m\"\nspec = \"s\"\nnope = \"v\"\n")
-            .unwrap_err();
+        let err =
+            parse_matrix("[[case]]\nname = \"x\"\nmode = \"m\"\nspec = \"s\"\nnope = \"v\"\n")
+                .unwrap_err();
         assert!(err.message.contains("unknown key"));
     }
 

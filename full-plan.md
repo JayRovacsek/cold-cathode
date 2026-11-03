@@ -117,14 +117,14 @@ against, with committed evidence (R9).
 ### Phase 3 — Differential test harness (tests before implementation)
 **Objective:** the harness exists and runs **red** against the stub binaries
 before any real implementation — proving the harness works (TDD).
-- [ ] Implement `crates/cc-contract-tests`: reads `tests/contract/matrix/<binary>.toml` invocation matrices, executes **both** the halogen binary (absolute store path) and the cold-cathode binary for each entry, applies §5 normalisation rules, asserts stdout/stderr/exit-code equality.
-- [ ] HTTP contract tests: start each server on an ephemeral port, compare route tables, response schemas and error bodies; GPU-gated per §5.
-- [ ] Matrices derived from the Phase 2 specs; every test case cites its spec section (traceability).
-- [ ] **Gate:** harness runs red against the stubs with a documented failure report; matrix covers every flag, subcommand and error path listed in the specs.
+- [x] Implement `crates/cc-contract-tests`: reads `tests/contract/matrix/<binary>.toml` invocation matrices, executes **both** the halogen binary (absolute store path) and the cold-cathode binary for each entry, applies §5 normalisation rules, asserts stdout/stderr/exit-code equality.
+- [x] HTTP contract tests: start each server on an ephemeral port, compare route tables, response schemas and error bodies; GPU-gated per §5.
+- [x] Matrices derived from the Phase 2 specs; every test case cites its spec section (traceability).
+- [x] **Gate:** harness runs red against the stubs with a documented failure report; matrix covers every flag, subcommand and error path listed in the specs.
 
 ### Phase 4 — Rust implementation (iterative, smallest first)
 **Objective:** all five entry points green against the full matrix.
-- [ ] Order: `cc-halogen-healthcheck` → `cc-halogen-tools` → `cc-halogen-npu` → `cc-flash-serve` → `cc-launcher` (launcher last — it orchestrates the others).
+- [x] Order: `cc-halogen-healthcheck` → `cc-halogen-tools` → `cc-halogen-npu` → `cc-flash-serve` → `cc-launcher` (launcher last — it orchestrates the others).
 - [ ] Per-binary loop: implement from spec → unit tests → contract tests green → `cargo fmt` + `clippy -D warnings` + `cargo nextest run` green → commit → code review (code-reviewer agent per AGENTS.md) → resolve findings → mark done.
 - [ ] Unsafe blocks only per §7; each lands with its `// SAFETY:` note and tests in the same commit.
 - [ ] **Gate:** every contract matrix green (or GPU-gated with documented skips on this machine).
