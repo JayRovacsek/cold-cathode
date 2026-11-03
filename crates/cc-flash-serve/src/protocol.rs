@@ -22,19 +22,21 @@
 //!    instead of the fixed fake fixture (decision log 2026-11-03, review
 //!    adjudication 5d).
 //!
-//! The whole module is pure except for `serve_connection`/`serve_forever`,
-//! which only move bytes; `handle_line` is unit-testable without a socket.
+//! The whole module is pure except for `serve_connection`/`serve_forever`
+//! (which only move bytes) and `EngineInfo::from_serve_args` (which reads
+//! the `--ck` file's 4-byte magic via `hgn::format_of` to report the real
+//! `checkpoint_format`); `handle_line` is unit-testable without a socket.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
-use crate::{env_strtod, env_var, fmt_g, sscanf_ints, ServeArgs};
+use crate::{env_strtod, env_var, fmt_g, hgn, sscanf_ints, ServeArgs};
 
 /// Everything INFO reports that the port can derive from the parsed serve
-/// configuration plus the environment (no cross-crate coupling to the
-/// `.hgn` reader: the reference answers from loaded weights, the port
-/// answers from its configuration, per the "CLI args + env + version" rule).
+/// configuration, the environment and the loaded checkpoint's format (the
+/// reference answers from loaded weights; the port answers from its
+/// configuration plus the `--ck` file's magic — see `hgn::format_of`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineInfo {
     /// Token 17 (`version`): the `HALOGEN_IMAGE_VERSION` the launcher pins
@@ -61,11 +63,18 @@ pub struct EngineInfo {
     /// unset or unparseable).
     pub pld_n: i64,
     pub pld_k: i64,
+    /// Token 20 (`checkpoint_format`): the format of the `--ck` checkpoint
+    /// as loaded by `run_serve` — `hgn` for an HGN1 file, `gguf` for a
+    /// GGUF (served without resident weights, the port's GGUF load being
+    /// repack-only). An unreadable or unrecognised file falls back to the
+    /// reference's `_parse_info` default `hgn`.
+    pub checkpoint_format: String,
 }
 
 impl EngineInfo {
     /// Build the INFO state from parsed serve args plus the environment
-    /// (reads `HALOGEN_IMAGE_VERSION`, `HALOGEN_ROPE_YARN`, `HALOGEN_PLD`).
+    /// (reads `HALOGEN_IMAGE_VERSION`, `HALOGEN_ROPE_YARN`, `HALOGEN_PLD`)
+    /// and the `--ck` file's magic (`hgn::format_of`).
     pub fn from_serve_args(opts: &ServeArgs) -> Self {
         let (pld_n, pld_k) = pld_pair(env_var("HALOGEN_PLD"));
         EngineInfo {
@@ -78,6 +87,7 @@ impl EngineInfo {
             rope_factor: env_strtod("HALOGEN_ROPE_YARN", 1.0),
             pld_n,
             pld_k,
+            checkpoint_format: hgn::format_of(&opts.ck).unwrap_or("hgn").to_string(),
         }
     }
 }
@@ -120,19 +130,21 @@ pub fn pld_pair(raw: Option<String>) -> (i64, i64) {
 /// I %d %d %d %d %d %d %d %lld %d %d %d %d 1 %g %lld %d %s %d %d %s %d %d %d %d %lld %s %d %d %s %d %d
 /// ```
 ///
-/// The port fills the configuration-derived fields from `EngineInfo` and
-/// the weight-derived fields with the honest zero/off values (the port's
-/// checkpoint load is the deferred GPU-gated path): `mtp`, `draft_head`,
-/// `drafter_weights`, `dflash2`, `cache_mb`, `cache_align`, `vision`,
+/// The port fills the configuration-derived fields from `EngineInfo` —
+/// including token 20 (`checkpoint_format`), now the real format of the
+/// loaded `--ck` file — and the remaining weight-derived fields with the
+/// honest zero/off values (the port's checkpoint load is the GPU-gated
+/// deferred path): `mtp`, `draft_head`, `drafter_weights` (their source is
+/// the MTP head checkpoint, which the serve path does not load), `dflash2`,
+/// `cache_mb`, `cache_align` (the port allocates no KV pool), `vision`,
 /// `grammar`, `composable`, `cc_floor`, `cc_seam`, `cc_bytes`, `tools`,
 /// `keep_end`, `masks_images` are 0; `cache_mode` is 1, `indexer_budget`
-/// 2048, `kv_cache` "bf16", `cc_fingerprint` "-" and `checkpoint_format`
-/// "hgn" — the same defaults serve_api's own `_fallback_info` (:1712–1717)
-/// assumes. Token 13 (`sampling`) is the literal `1` of the reference
-/// format string.
+/// 2048, `kv_cache` "bf16" and `cc_fingerprint` "-" — the same defaults
+/// serve_api's own `_fallback_info` (:1712–1717) assumes. Token 13
+/// (`sampling`) is the literal `1` of the reference format string.
 pub fn info_line(info: &EngineInfo) -> String {
     format!(
-        "I 0 0 {ctx} 0 {max_tok} 0 0 0 0 {slots} {slot_ctx} 1 1 {rope} {kv_pool} 0 {version} {pld_n} {pld_k} hgn 0 0 0 0 0 - 2048 0 bf16 0 0",
+        "I 0 0 {ctx} 0 {max_tok} 0 0 0 0 {slots} {slot_ctx} 1 1 {rope} {kv_pool} 0 {version} {pld_n} {pld_k} {checkpoint_format} 0 0 0 0 0 - 2048 0 bf16 0 0",
         ctx = info.ctx,
         max_tok = info.max_tok,
         slots = info.slots,
@@ -142,6 +154,7 @@ pub fn info_line(info: &EngineInfo) -> String {
         version = info.version,
         pld_n = info.pld_n,
         pld_k = info.pld_k,
+        checkpoint_format = info.checkpoint_format,
     )
 }
 
@@ -230,6 +243,7 @@ mod tests {
             rope_factor: 1.0,
             pld_n: 0,
             pld_k: 0,
+            checkpoint_format: "hgn".to_string(),
         }
     }
 
@@ -280,6 +294,7 @@ mod tests {
             rope_factor: 4.0,
             pld_n: 1,
             pld_k: 2,
+            checkpoint_format: "hgn".to_string(),
         };
         let line = info_line(&info);
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -292,6 +307,21 @@ mod tests {
         assert_eq!(parts[17], "0.18.21"); // version
         assert_eq!(parts[18], "1"); // pld_n
         assert_eq!(parts[19], "2"); // pld_k
+        assert_eq!(parts[20], "hgn"); // checkpoint_format
+    }
+
+    #[test]
+    fn info_reply_reports_the_real_checkpoint_format() {
+        // Token 20 now carries the loaded checkpoint's actual format: a
+        // GGUF served without resident weights reports `gguf` (the
+        // reference's server reads GGUF checkpoints directly).
+        let info = EngineInfo {
+            checkpoint_format: "gguf".to_string(),
+            ..fixture_info()
+        };
+        let line = info_line(&info);
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(parts[20], "gguf");
     }
 
     #[test]

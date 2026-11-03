@@ -11,6 +11,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod gguf;
+pub mod hgn;
 pub mod protocol;
 
 use std::env;
@@ -54,6 +55,56 @@ pub fn run(argv0: &str, args: &[String]) -> i32 {
 /// `/dev/kfd` and/or `/dev/dri`.
 pub fn gpu_present() -> bool {
     Path::new("/dev/kfd").exists() || Path::new("/dev/dri").exists()
+}
+
+// ---------------------------------------------------------------------------
+// HALOGEN_LOG verbosity channel (serve path)
+// ---------------------------------------------------------------------------
+
+/// Verbosity levels for the `HALOGEN_LOG` channel. The reference prints
+/// nothing on the serve path before binding (spec "Observed behaviours"),
+/// so with the variable unset — the default — no info/warn lines are
+/// emitted and the contract matrix bytes are unchanged; failure wordings
+/// always go to stderr regardless of the level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+}
+
+/// Parse `HALOGEN_LOG` (case-insensitive `error|warn|info`; `debug` maps
+/// to `info`). An unset or unrecognised value disables the channel.
+pub fn parse_log_level(raw: Option<&str>) -> Option<LogLevel> {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("error") => Some(LogLevel::Error),
+        Some("warn") => Some(LogLevel::Warn),
+        Some("info") | Some("debug") => Some(LogLevel::Info),
+        _ => None,
+    }
+}
+
+fn log_level() -> Option<LogLevel> {
+    parse_log_level(env_var("HALOGEN_LOG").as_deref())
+}
+
+/// Emit an info-level serve-path progress line when `HALOGEN_LOG` enables
+/// it (the reference's own load progress is not documented, so these lines
+/// only appear when the operator opts in).
+fn log_info(message: &str) {
+    if log_level().is_some_and(|enabled| LogLevel::Info <= enabled) {
+        eprintln!("{message}");
+    }
+}
+
+/// Emit a warn-level anomaly line when `HALOGEN_LOG` enables it.
+fn log_warn(message: &str) {
+    if log_level().is_some_and(|enabled| LogLevel::Warn <= enabled) {
+        eprintln!("{message}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,15 +241,46 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         eprintln!("flash_serve: bad --bind address '{}'", opts.bind);
         return 1;
     };
+    let addr = SocketAddr::V4(SocketAddrV4::new(ip, opts.port as u16));
+    // Checkpoint load (after the GPU check, before binding): the reference
+    // answers INFO from loaded weights; the port previously answered from
+    // its configuration and never read the file (the user's observation
+    // that RAM never grew when serving). `hgn::load` reads the whole file
+    // into one contiguous Vec — std-only, mmap deferred per the module
+    // docs. Failure wordings come from `hgn` (the tools spec's exact
+    // strings); a GGUF checkpoint only warns because the port's GGUF
+    // weight load is deferred (repack-only) while the reference's server
+    // reads GGUFs directly.
+    log_info(&format!("halogen: loading checkpoint {}", opts.ck));
+    let info = match hgn::load(&opts.ck) {
+        Ok(ck) => {
+            log_info(&format!(
+                "halogen: {} tensors, {} bytes mapped",
+                ck.entry_count, ck.weight_bytes
+            ));
+            if let Some(anomaly) = ck.payload_anomaly(&opts.ck) {
+                log_warn(&format!("halogen: {anomaly}"));
+            }
+            protocol::EngineInfo::from_serve_args(&opts)
+        }
+        Err(err) if hgn::format_of(&opts.ck) == Some("gguf") => {
+            log_warn(&format!("halogen: {err}"));
+            protocol::EngineInfo::from_serve_args(&opts)
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    log_info(&format!("halogen: checkpoint resident, binding {addr}"));
     // Socket setup (spec "Observed behaviours" #7): bind + listen(fd, 64),
     // then serve the engine's line protocol (PING/INFO, port 8730 per
     // docs/analysis/specs/api.md §1). The protocol itself lives in
     // `protocol`; the HTTP surface (port 8731) is specified separately and
     // served by the Python front-end, not this binary.
-    let addr = SocketAddr::V4(SocketAddrV4::new(ip, opts.port as u16));
     match TcpListener::bind(addr) {
         Ok(listener) => {
-            protocol::serve_forever(&listener, &protocol::EngineInfo::from_serve_args(&opts));
+            protocol::serve_forever(&listener, &info);
             0
         }
         Err(err) => {
@@ -968,6 +1050,20 @@ mod tests {
         for (key, _) in keys {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn halogen_log_levels_parse() {
+        // Pure (no process-env mutation): the channel's default (unset) is
+        // silent, so the contract matrix bytes never change; the serve
+        // path's load lines only appear when the operator opts in.
+        assert_eq!(parse_log_level(None), None);
+        assert_eq!(parse_log_level(Some("")), None);
+        assert_eq!(parse_log_level(Some("bogus")), None);
+        assert_eq!(parse_log_level(Some("error")), Some(LogLevel::Error));
+        assert_eq!(parse_log_level(Some("WARN")), Some(LogLevel::Warn));
+        assert_eq!(parse_log_level(Some(" info ")), Some(LogLevel::Info));
+        assert_eq!(parse_log_level(Some("debug")), Some(LogLevel::Info));
     }
 
     #[test]
