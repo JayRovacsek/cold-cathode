@@ -572,6 +572,12 @@ check and exits 0 (6686–6693).
    reproduce the literal structure exactly; the contract test needs a fixed
    fake engine INFO to compare against. Decide whether the harness stubs the
    engine or requires a live one (GPU-gated per §5).
+   *(resolved 2026-11-04: the ported engine answers INFO itself —
+   `cc-flash-serve` `80992e4` implements the line-protocol reply from the
+   decompiled format string (binutils-strings.txt:3752, aligned with
+   serve_api.py `_parse_info` :1741–1772); the `serve_socket_probe` contract
+   test exercises the live binary, GPU-gated per §5, superseding the fixed
+   fake fixture proposed by adjudication 5d.)*
 3. **`request_records` side-channel.** When `HALOGEN_RECORD_DIR` is set,
    `/health` gains a `request_records` section and responses are recorded;
    its schema lives in `request_records.py` (721 lines) and is only
