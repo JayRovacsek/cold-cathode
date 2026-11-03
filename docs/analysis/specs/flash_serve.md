@@ -53,9 +53,9 @@ Usage grammar: `[--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--ma
 | `--ck FILE` | string path | `/models/qwen38-flash-next-w4b.hgn` | file existence is checked only after the GPU check (not observable on a GPU-less host; `--ck /nonexistent` there yields the ROCm error instead) | — |
 | `--port P` | integer (`strtol`, base 10) | `8730` | none at parse time (observed: `abc`, `-1`, `0`, `99999`, `70000` all accepted and reach the GPU check) | — |
 | `--bind ADDR` | string, IPv4 dotted-quad | `127.0.0.1` | `inet_pton(AF_INET)` must succeed; checked **after** the GPU check | `flash_serve: bad --bind address '%s'` → exit 1 |
-| `--slots B` | integer (`strtol`) | `4`, or `$HALOGEN_KV_SLOTS` if set (flag overrides env) | `1..64` | `flash_serve: --slots 1..64, --ctx >= 16, --max-tok >= 1` → exit 2 |
-| `--ctx N` | integer (`strtol`) | `32768` | `>= 16`; also `<=` the largest supported context (native `262144`; with `HALOGEN_ROPE_YARN=f>1`: `min(f·262144, 1048576)`) | range: `flash_serve: --slots 1..64, --ctx >= 16, --max-tok >= 1` → exit 2. too-large: `flash_serve: --ctx %d exceeds %lld, the largest context this configuration supports (native %d%s). A context past the native %d needs HALOGEN_ROPE_YARN=<factor> (4 for %d, 2 for %d): Qwen's static YaRN, which changes the model's numerics at every position.` → exit 2 |
-| `--max-tok N` | integer (`strtol`) | `8192` | `>= 1`; silently clamped to `min(max-tok, ctx)` | `flash_serve: --slots 1..64, --ctx >= 16, --max-tok >= 1` → exit 2 |
+| `--slots B` | integer (`strtol`) | `4`, or `$HALOGEN_KV_SLOTS` if set (flag overrides env) | `1..64` | format string `flash_serve: --slots 1..%d, --ctx >= 16, --max-tok >= 1` → exit 2 (the upper bound is runtime-rendered, not a literal: the decompiled `main` passes the constant `64` (`0x40`), so it renders `flash_serve: --slots 1..64, --ctx >= 16, --max-tok >= 1` under the default configuration) |
+| `--ctx N` | integer (`strtol`) | `32768` | `>= 16`; also `<=` the largest supported context (native `262144`; with `HALOGEN_ROPE_YARN=f>1`: `min(f·262144, 1048576)`) | range: format string `flash_serve: --slots 1..%d, --ctx >= 16, --max-tok >= 1` → exit 2 (renders `1..64` under the default configuration, see the `--slots` row). too-large: `flash_serve: --ctx %d exceeds %lld, the largest context this configuration supports (native %d%s). A context past the native %d needs HALOGEN_ROPE_YARN=<factor> (4 for %d, 2 for %d): Qwen's static YaRN, which changes the model's numerics at every position.` → exit 2 |
+| `--max-tok N` | integer (`strtol`) | `8192` | `>= 1`; silently clamped to `min(max-tok, ctx)` | format string `flash_serve: --slots 1..%d, --ctx >= 16, --max-tok >= 1` → exit 2 (renders `1..64` under the default configuration, see the `--slots` row) |
 | `--kv-pool POSITIONS` | 64-bit integer (`strtoll`) | `0` = auto (becomes `ctx`, rounded up to a multiple of 256), or `$HALOGEN_KV_POOL_POSITIONS` if set (flag overrides env) | `>= ctx`, a multiple of 256 (otherwise rounded up with an informational message), `<= 16777216` | `flash_serve: --kv-pool %lld: at least --ctx %d, a multiple of 256, at most %lld` → exit 2. informational (valid but unaligned): `flash_serve: the KV pool is allocated in units of 256 positions: %lld rounded up to %lld` |
 | `--help` | — | — | **not recognised** in serve mode (behaves as an unknown flag) | serve usage → exit 2 |
 | `--version` | — | — | **not recognised** anywhere (no version output exists in the binary) | serve usage → exit 2 |
@@ -103,10 +103,21 @@ Input validation (observed, happens before any GPU work):
 - Unreadable/invalid checkpoint (e.g. `/nonexistent`, or a stub GGUF): **no output**, exit 1.
 - No GPU check, no usage output.
 
+> Provenance note (review C2): the literal string `--resident-gib` is not
+> visible in `binutils-strings.txt` nor in the two committed decompiled
+> functions (likely stored in a form binutils `strings` does not extract,
+> e.g. a length-prefixed string table). Its existence is substantiated by
+> the probe transcript (`--resident-gib /nonexistent` → exit 1 with no usage
+> output, distinct from the unknown-flag path, which prints usage and exits
+> 2) and by the `%.1f %d %d %d %.1f` output format in
+> `mode-dispatcher-FUN_01f23680.json`.
+
 ## Environment variables
 
 Read on the CLI paths (main / mode dispatcher / GPU selector). The binary
-contains 352 `HALOGEN_*` strings in total (full inventory in
+contains 353 unique `HALOGEN_[A-Z0-9_]*` variable names — 545 total string
+occurrences (counting method, review C1: `grep -o 'HALOGEN_[A-Z0-9_]*' | sort -u`
+over the full inventory in
 [`evidence/flash_serve/binutils-strings.txt`](../evidence/flash_serve/binutils-strings.txt));
 the table below covers the variables read by the argument-parsing and
 startup paths that `cc-flash-serve` must reproduce.
@@ -192,9 +203,9 @@ usage: <argv0> --repack IN.gguf --out OUT.hgn [--no-table] [--head HEAD.hgn|--no
 
 ## Evidence
 
-- [`evidence/flash_serve/mcp-session.evidence.json`](../evidence/flash_serve/mcp-session.evidence.json) — REA MCP session export: `open_binary` (SHA-256 above), `inspect_native_exports` (dynamic symbol table), `inspect_elf_notes` (ABI tag), `inspect_gpu_code_objects` (9 AMDGPU code objects).
+- [`evidence/flash_serve/mcp-session.evidence.json`](../evidence/flash_serve/mcp-session.evidence.json) — REA MCP session export: records for `inspect_native_exports` (dynamic symbol table), `inspect_elf_notes` (ABI tag), `inspect_analysis_view` (×2) and `inspect_gpu_code_objects` (9 AMDGPU code objects); the SHA-256 above is recorded in each record's `artifact` field (the `open_binary` operation itself is not an exported record — review C3).
 - [`evidence/flash_serve/decompile/`](../evidence/flash_serve/decompile/) — REA CLI + Ghidra 12.1.4 decompilation evidence: `main-FUN_01ede7e0.json` (serve parser, defaults, validation), `mode-dispatcher-FUN_01f23680.json` (repack/repack-hash/resident-gib grammar), `ctx-validator-FUN_01f24220.json` (ctx/YaRN limits), `gpu-guard-FUN_01f70090.json` + `gpu-selector-FUN_01f700f0.json` (HIP device check), `set-ops-FUN_01f25a20.json`.
-- [`evidence/flash_serve/cli-probes.txt`](../evidence/flash_serve/cli-probes.txt) — full runtime probe transcript (46 invocations, stdout/stderr/exit codes).
+- [`evidence/flash_serve/cli-probes.txt`](../evidence/flash_serve/cli-probes.txt) — full runtime probe transcript (49 captured invocations — 46 from the initial session plus 3 follow-up probes, review F2 — with stdout/stderr/exit codes).
 - [`evidence/flash_serve/search-procedure-main.json`](../evidence/flash_serve/search-procedure-main.json), [`search-string-rocm.json`](../evidence/flash_serve/search-string-rocm.json), [`xrefs-string-rocm.json`](../evidence/flash_serve/xrefs-string-rocm.json), [`search-string-not-a-gguf.json`](../evidence/flash_serve/search-string-not-a-gguf.json), [`search-string-truncated-header.json`](../evidence/flash_serve/search-string-truncated-header.json) — REA string/procedure search evidence.
 - [`evidence/flash_serve/binutils-elf-info.txt`](../evidence/flash_serve/binutils-elf-info.txt), [`binutils-strings.txt`](../evidence/flash_serve/binutils-strings.txt) — supplementary binutils evidence (used because the REA MCP server's string inventory requires a configured decompiler provider).
 
