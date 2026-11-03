@@ -155,7 +155,7 @@ Everything below runs **before** the mode dispatch, for every mode (lines
     `HALOGEN_ROPE_YARN` set with `ctx ≤ 262144` → `halogen: WARNING: …`
     (stderr, continues).
 11. **Front-end-only flag stripping** (lines 1002–1015): `HALOGEN_FORK`
-    defaults to `1` (exported); the list `FE_ONLY_FLAGS` (36 variables:
+    defaults to `1` (exported); the list `FE_ONLY_FLAGS` (37 variables:
     `HALOGEN_API_KEY HALOGEN_API_KEY_FILE HALOGEN_CLIENT_MARKERS
     HALOGEN_ENABLE_THINKING HALOGEN_ENGINE_PING_S HALOGEN_ENGINE_PROBE_S
     HALOGEN_FREQUENCY_PENALTY HALOGEN_KEEPALIVE_TIMEOUT
@@ -198,7 +198,7 @@ to **stdout**.
 | `bench` | engine + api + `bench-serving.py` | (1721–1775) `text_only_mode` (unsets `HALOGEN_VISION_TOWER` with a note if set), `need_ckpt; need_tokenizer; check_defaults`; engine stdout/err → `/tmp/halogen-engine.log`; api (spawned with `env -u HALOGEN_API_KEY -u HALOGEN_API_KEY_FILE`) → `tee /tmp/halogen-api.log`; poll `/health` up to 150×2 s (`halogen bench: the front-end never answered /health on $API_PORT after 300s.` → exit 1); then `HALOGEN_API=… HALOGEN_API_LOG=… python3 …/bench-serving.py "${1:-serial,mtp}" "${2:-256}" "${3:-low}" "${4:-1}"` (positional args **after** the mode shift, with those defaults); kills both, exits with the tool's rc | tool's rc; 1 if the front end never answers |
 | `sweep` | engine + api + `halogen-bench.py` | same preamble; runs `python3 …/halogen-bench.py --api "http://127.0.0.1:$API_PORT" "$@"` (all remaining args forwarded verbatim) | tool's rc |
 | `convert IN.gguf OUT.hgn` | `flash_serve --repack` | (1776–1800) requires exactly two more args else usage → **exit 2** (exact 3-line text below); `IN` must exist and start with `GGUF`; `OUT`'s dir must be writable; `need_head "$(dirname "$IN")"`; runs `flash_serve --repack "$IN" --out "$OUT" --with-table --head "$HALOGEN_MTP_HEAD"`; on success prints `halogen convert: done. …`; on failure `halogen convert: the repack failed (rc=$RC); $OUT is not usable and can be removed` | 2 (usage), 1 (missing/unwritable inputs), or flash_serve's rc |
-| `inspect [FILE] …` | `halogen-tools` | (1801–1821) `text_only_mode`; `FILE` = first non-flag arg, else `$HALOGEN_CHECKPOINT`; must exist (`halogen inspect: $FILE is not there (mount the models volume and name a file inside it, or set HALOGEN_CHECKPOINT)` → exit 1); **`exec /usr/local/bin/halogen-tools inspect "$FILE" "$@"`** (see `docs/analysis/specs/halogen-tools.md` when written) | halogen-tools' rc; 1 if FILE missing |
+| `inspect [FILE] …` | `halogen-tools` | (1801–1821) `text_only_mode`; `FILE` = first non-flag arg, else `$HALOGEN_CHECKPOINT`; must exist (`halogen inspect: $FILE is not there (mount the models volume and name a file inside it, or set HALOGEN_CHECKPOINT)` → exit 1); **`exec …/bin/halogen-tools "$MODE" "$FILE" "$@"`** (installed form; see `docs/analysis/specs/halogen-tools.md` when written) | halogen-tools' rc; 1 if FILE missing |
 | `verify [FILE] …` | `halogen-tools` | same as `inspect`, mode word `verify` | same |
 | `ppl [FILE] …` | `halogen_tools.py` | (1810–1819) `tuning_plan_copy`; GGUF file → `need_head`, else `HALOGEN_CHECKPOINT="$FILE" check_ngram_table >&2`; prints `halogen ppl: $FILE under this image's engine environment (tuning plan: ${HALOGEN_MATMUL_TUNING_FILE:-none}; quality sidecar: ${HALOGEN_CK_OVERLAY:-beside the checkpoint, if any}; trunk pinned: ${HALOGEN_FLASH_PIN_TRUNK:-1})` (stderr); `need_tokenizer`; **`exec python3 …/halogen_tools.py ppl "$FILE" --tokenizer "$HALOGEN_TOKENIZER" "$@"`** | python tool's rc |
 | `niah [FILE] …` | `halogen_tools.py` | same as `ppl`, mode word `niah` | same |
@@ -245,7 +245,7 @@ usage: entrypoint.sh convert IN.gguf OUT.hgn
 | `HALOGEN_ENGINE` | `serve_api.py --engine` override (api mode only) |
 | `HALOGEN_IMAGE_VERSION` | banner text (pinned by the wrapper) |
 | `HALOGEN_IMAGE_MODES` | advertises the mode list (informational; the dispatch is hard-coded) |
-| the 36 `FE_ONLY_FLAGS` | stripped from every `flash_serve` spawn via `env -u` (the engine must not see them) |
+| the 37 `FE_ONLY_FLAGS` | stripped from every `flash_serve` spawn via `env -u` (the engine must not see them) |
 | remaining `HALOGEN_*` (e.g. `HALOGEN_MATMUL_ALGOS`, `HALOGEN_ATTN_FA`, `HALOGEN_ARCH`, `HIP_FORCE_DEV_KERNARG`) | reach `flash_serve` through the inherited environment (see the flash_serve spec's env-var table) |
 
 ### Internal `_hg_*` indirection variables

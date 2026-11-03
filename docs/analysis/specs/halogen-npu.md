@@ -5,8 +5,8 @@
 > **Provenance:** halogen-flash-server v0.18.21 (see `full-plan.md` Appendix B).
 > **Evidence:** [`docs/analysis/evidence/halogen-npu/`](../evidence/halogen-npu/) (REA MCP session export + REA CLI/Ghidra 12.1.4 decompilation + binutils + runtime probes via a stub `libxrt_coreutil.so.2`).
 
-Fact markers used throughout: **[RT]** = runtime-verified (probe transcript),
-**[DC]** = decompile-derived (Ghidra 12.1.4), **[S]** = string-table observed.
+Fact markers used throughout: **[RV]** = runtime-verified (probe transcript),
+**[D]** = decompile-derived (Ghidra 12.1.4), **[S]** = string-table observed.
 
 ## Artifact identity
 
@@ -22,7 +22,7 @@ Fact markers used throughout: **[RT]** = runtime-verified (probe transcript),
 | Symbol table | stripped of function symbols (`.symtab` holds only section symbols + 238 `UND` entries; `.dynsym` carries the imports) |
 | Runtime dependency | AMD XRT (`libxrt_coreutil.so.2` — `xrt::device`, `xrt::bo`, `xrt::kernel`, `xrt::elf`, `xrt::hw_context`, `xrt::run`); the upstream derivation ignores it (`autoPatchelfIgnoreMissingDeps`) and it is **not** present on this host |
 
-**Loadability caveat [RT]:** invoked directly on this host the binary exits
+**Loadability caveat [RV]:** invoked directly on this host the binary exits
 **127** with `error while loading shared libraries: libxrt_coreutil.so.2`.
 All runtime probes below were executed with a purpose-built stub
 `libxrt_coreutil.so.2` (no-op definitions for the 23 imported XRT/`_ITM`
@@ -41,7 +41,7 @@ There is no flag-style CLI: **`argv[1]` selects a subcommand** (verified by
 decompilation of `main`/`FUN_00170740` and runtime probes). The program name
 in every usage/error string is the **hard-coded literal `halogen-npu`**, not
 `argv[0]` — verified by running a copy renamed `renamed-bin`, which still
-prints `usage: halogen-npu …` **[RT]** (contract tests need no argv[0]
+prints `usage: halogen-npu …` **[RV]** (contract tests need no argv[0]
 normalisation for this binary, unlike `flash_serve`).
 
 | Subcommand | In main usage? | Selected when `argv[1]` is |
@@ -49,7 +49,7 @@ normalisation for this binary, unlike `flash_serve`).
 | `selftest` | yes | `selftest` (requires ≥1 further arg) |
 | `replay` | yes | `replay` (requires ≥1 further arg) |
 | `serve` | yes | `serve` (requires ≥2 further args) |
-| `listen` | yes | `listen` (requires ≥3 further args, i.e. `argc >= 5`) **[DC]** |
+| `listen` | yes | `listen` (requires ≥3 further args, i.e. `argc >= 5`) **[D]** |
 | `probe` | yes | `probe` (requires ≥1 further arg) |
 | `convert` | yes | `convert` (requires ≥2 further args) |
 | `flux` | **hidden** | `flux` (requires ≥1 further arg) |
@@ -60,17 +60,17 @@ normalisation for this binary, unlike `flash_serve`).
 | `cache` | **hidden** | `cache ecopy` only (`cache` alone or `cache bogus` → cache usage) |
 
 Any other `argv[1]` (including `--help`, `--version`, `-h`, `-v`,
-`--bogus-flag`, `--model`, `--repack`, `edit`, `enc`, `.vis`) prints the
-**main usage** to stderr and exits **1** **[RT]**. There is **no `--help` or
+`--bogus-flag`, `--model`, `--repack`, `edit`, `enc`) prints the
+**main usage** to stderr and exits **1** **[RV]**. There is **no `--help` or
 `--version` handler** (no comparison against those strings exists in the
-decompiled dispatcher **[DC]**).
+decompiled dispatcher **[D]**).
 
 ## Flag table — top level
 
 | Invocation | stdout | stderr | exit |
 |---|---|---|---|
-| (no args) | — | main usage (316-byte embedded string, `fwrite` in `main` **[DC]**) | 1 **[RT]** |
-| `--help` / `--version` / `-h` / `-v` / `--bogus-flag` / `help` / `--model x` / `--repack` / `edit` / `enc` / `.vis` | — | main usage | 1 **[RT]** |
+| (no args) | — | main usage (316-byte embedded string, `fwrite` in `main` **[D]**) | 1 **[RV]** |
+| `--help` / `--version` / `-h` / `-v` / `--bogus-flag` / `help` / `--model x` / `--repack` / `edit` / `enc` | — | main usage | 1 **[RV]** |
 
 Main usage (verbatim, single line):
 
@@ -84,47 +84,47 @@ usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve
 
 Usage grammar (embedded string): `selftest bf16|norm|head|resid ...` (the
 `...` hides further kinds). Decompile confirms the accepted kinds
-`bf16`, `head`, `resid`, `hostx`, `gx` **[DC]**; `norm` appears in the usage
+`bf16`, `head`, `resid`, `hostx`, `gx` **[D]**; `norm` appears in the usage
 string but its comparison was not located in `main`'s inline strings
 (escalated as an ambiguity).
 
 | Form | Behaviour | exit |
 |---|---|---|
-| `selftest` (no kind) | main usage | 1 **[RT]** |
-| `selftest bogus` | main usage | 1 **[RT]** |
-| `selftest bf16 OUTFILE` (`argc == 4`) | opens `OUTFILE` with `fopen(..., "w")` and writes the bf16 test artefact; with the stub XRT the file is created (6 136 bytes) and nothing prints | 0 **[RT]** |
-| `selftest bf16 UNWRITABLE` | `halogen-npu: cannot write <path>` **[DC]** | (not probed) |
+| `selftest` (no kind) | main usage | 1 **[RV]** |
+| `selftest bogus` | main usage | 1 **[RV]** |
+| `selftest bf16 OUTFILE` (`argc == 4`) | opens `OUTFILE` with `fopen(..., "w")` and writes the bf16 test artefact; with the stub XRT the file is created (6 136 bytes) and nothing prints | 0 **[S]+[D]** |
+| `selftest bf16 UNWRITABLE` | `halogen-npu: cannot write <path>` **[D]** | (not probed) |
 
 ### `replay DIR [REPS]`
 
 | Form | stderr | exit |
 |---|---|---|
-| `replay` (no DIR) | main usage | 1 **[RT]** |
-| `replay /nonexistent` | `halogen-npu: cannot open /nonexistent/replay.hnpm` | 1 **[RT]** |
+| `replay` (no DIR) | main usage | 1 **[RV]** |
+| `replay /nonexistent` | `halogen-npu: cannot open /nonexistent/replay.hnpm` | 1 **[RV]** |
 
 ### `serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]...`
 
 | Form | stderr | exit |
 |---|---|---|
-| `serve` (no args) | main usage | 1 **[RT]** |
-| `serve /nonexistent /nonexistent` | `halogen-npu: cannot open /nonexistent/devices.hnpm` | 1 **[RT]** |
+| `serve` (no args) | main usage | 1 **[RV]** |
+| `serve /nonexistent /nonexistent` | `halogen-npu: cannot open /nonexistent/devices.hnpm` | 1 **[RV]** |
 
-(`--model` pairs are parsed by the serve handler **[DC]**; the
+(`--model` pairs are parsed by the serve handler **[D]**; the
 `devices.hnpm` manifest check precedes any XRT work, so the error is
 observable even with the stub library.)
 
 ### `listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]...`
 
-Requires `argc >= 5` **[DC]**.
+Requires `argc >= 5` **[D]**.
 
 | Form | stderr | exit |
 |---|---|---|
-| `listen` (no args) | main usage | 1 **[RT]** |
-| `listen /nonexistent /nonexistent 127.0.0.1:9999` | `halogen-npu: cannot open /nonexistent/devices.hnpm` | 1 **[RT]** |
+| `listen` (no args) | main usage | 1 **[RV]** |
+| `listen /nonexistent /nonexistent 127.0.0.1:9999` | `halogen-npu: cannot open /nonexistent/devices.hnpm` | 1 **[RV]** |
 
 ### `probe MODEL_DIR` / `convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]`
 
-Shared handler `FUN_0022f180` **[DC]**. Sub-usage (verbatim):
+Shared handler `FUN_0022f180` **[D]**. Sub-usage (verbatim):
 
 ```
 usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]
@@ -132,13 +132,13 @@ usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name I
 
 | Form | stderr | exit |
 |---|---|---|
-| `probe` (no DIR) | sub-usage above | 1 **[RT]** |
-| `convert /nonexistent` (missing args) | sub-usage above | 1 **[RT]** |
-| `probe /nonexistent` | `halogen-npu: /nonexistent holds no config.json (a Hugging Face checkpoint directory); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)` | 2 **[RT]** |
-| `probe DIR` with `config.json` = `{}` | `halogen-npu: DIR is a unknown checkpoint (model_type unknown); the NPU serves fine-tunes of …` (same tail) | 2 **[RT]** |
-| `probe DIR` with `config.json` = `{"model_type":"qwen3_dense"}` | `halogen-npu: DIR is a qwen3_dense checkpoint (model_type qwen3_dense); the NPU serves fine-tunes of …` | 2 **[RT]** |
-| `probe DIR` with `config.json` = `{"model_type":"qwen35_hybrid"}` | `halogen-npu: DIR is a qwen35_hybrid checkpoint (model_type qwen35_hybrid); the NPU serves fine-tunes of …` | 2 **[RT]** |
-| `convert /nonexistent /nonexistent /nonexistent` | same `holds no config.json` error as `probe /nonexistent` | 2 **[RT]** |
+| `probe` (no DIR) | sub-usage above | 1 **[RV]** |
+| `convert /nonexistent` (missing args) | sub-usage above | 1 **[RV]** |
+| `probe /nonexistent` | `halogen-npu: /nonexistent holds no config.json (a Hugging Face checkpoint directory); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)` | 2 **[RV]** |
+| `probe DIR` with `config.json` = `{}` | `halogen-npu: DIR is a unknown checkpoint (model_type unknown); the NPU serves fine-tunes of …` (same tail) | 2 **[RV]** |
+| `probe DIR` with `config.json` = `{"model_type":"qwen3_dense"}` | `halogen-npu: DIR is a qwen3_dense checkpoint (model_type qwen3_dense); the NPU serves fine-tunes of …` | 2 **[RV]** |
+| `probe DIR` with `config.json` = `{"model_type":"qwen35_hybrid"}` | `halogen-npu: DIR is a qwen35_hybrid checkpoint (model_type qwen35_hybrid); the NPU serves fine-tunes of …` | 2 **[RV]** |
+| `convert /nonexistent /nonexistent /nonexistent` | same `holds no config.json` error as `probe /nonexistent` | 2 **[RV]** |
 
 Note: even a recognised `model_type` exits 2 when the checkpoint lacks the
 weight artefacts the engine expects; the success output format requires a
@@ -160,19 +160,19 @@ usage: halogen-npu flux noise SEED RES OUT | taef2 TAEF2 Z H W OUT_RGB [OUT_F32]
 
 | Form | stderr | exit |
 |---|---|---|
-| `flux` / `flux bogus` / `flux noise` | sub-usage above | 1 **[RT]** |
+| `flux` / `flux bogus` / `flux noise` | sub-usage above | 1 **[RV]** |
 
 ### `gemma DEVDIR WEIGHTS IDS OUT [REPS [BATCH [MASK|- [SOFT|- [IMG|- [AUD]]]]]]` (hidden)
 
 | Form | stderr | exit |
 |---|---|---|
-| `gemma` / `gemma a` | its own usage (above, verbatim) | 1 **[RT]** |
+| `gemma` / `gemma a` | its own usage (above, verbatim) | 1 **[RV]** |
 
 ### `tts SET MODEL REQS OUT [--tf] [--stream N] [--threads N] [--greedy] [--reps N]` (hidden)
 
 | Form | stderr | exit |
 |---|---|---|
-| `tts` / `tts a b` / `tts a b c` | its own usage (above, verbatim) | 2 **[RT]** |
+| `tts` / `tts a b` / `tts a b c` | its own usage (above, verbatim) | 2 **[RV]** |
 
 ### `asr encode|decode|feat …` (hidden)
 
@@ -186,34 +186,35 @@ usage: asr feat IN.wav OUTDIR [STEM.safetensors [PREFIX]]
 
 | Form | stderr | exit |
 |---|---|---|
-| `asr` / `asr bogus` | the `feat` usage | 2 **[RT]** |
-| `asr encode` | the `encode` usage | 2 **[RT]** |
-| `asr decode` | the `decode` usage | 2 **[RT]** |
-| `asr feat` | the `feat` usage | 2 **[RT]** |
+| `asr` / `asr bogus` | the `feat` usage | 2 **[RV]** |
+| `asr encode` | the `encode` usage | 2 **[RV]** |
+| `asr decode` | the `decode` usage | 2 **[RV]** |
+| `asr feat` | the `feat` usage | 2 **[RV]** |
 
 ### `vis encode DEVDIR WEIGHTS IN.rgb H W OUT.f32 [REPS]` (hidden)
 
 | Form | stderr | exit |
 |---|---|---|
-| `vis` / `vis bogus` / `vis decode` | **main** usage | 1 **[RT]** |
-| `vis encode` / `vis encode x` | `usage: vis encode DEVDIR WEIGHTS IN.rgb H W OUT.f32 [REPS]` | 2 **[RT]** |
+| `vis` / `vis bogus` / `vis decode` | **main** usage | 1 **[RV]** |
+| `vis encode` / `vis encode x` | `usage: vis encode DEVDIR WEIGHTS IN.rgb H W OUT.f32 [REPS]` | 2 **[RV]** |
 
 ### `cache ecopy IN OUT CAP` (hidden)
 
 | Form | stderr | exit |
 |---|---|---|
-| `cache` / `cache bogus` / `cache ecopy` | `usage: halogen-npu cache ecopy IN OUT CAP` | 2 **[RT]** |
+| `cache` / `cache bogus` / `cache ecopy` | `usage: halogen-npu cache ecopy IN OUT CAP` | 2 **[RV]** |
 
 ## Environment variables
 
-Read on the `main` path **[DC]** (`FUN_0013c2f0`):
+Read on the `main` path **[D]** (`FUN_0013c2f0`):
 
 | Variable | Default | Behaviour |
 |---|---|---|
 | `HALOGEN_NPU_ASR_HOST` | unset | if value starts with `1`, `main` sets (no-clobber, `setenv(...,0)`) `HALOGEN_NPU_HOST_THREADS=8`, `HALOGEN_NPU_WAIT_SPIN=0`, `HALOGEN_NPU_HOST_PREWAKE=0` before dispatch |
 
-The binary's `.rodata` contains **92 unique `HALOGEN_NPU_[A-Z0-9_]*`
-variable names** (counting method: `grep -o 'HALOGEN_[A-Z0-9_]*' | sort -u`
+The binary's `.rodata` contains **85 unique `HALOGEN_NPU_[A-Z0-9_]*`
+variable names — 92 total string occurrences** (counting method:
+`grep -o 'HALOGEN_[A-Z0-9_]*' | sort -u`
 over [`evidence/halogen-npu/binutils-strings.txt`](../evidence/halogen-npu/binutils-strings.txt)).
 The full inventory **[S]** (per-subcommand readers not individually located;
 `cc-halogen-npu` must reproduce the four `main`-path variables above and the
@@ -266,22 +267,22 @@ names below as its env surface):
 
 | Code | Meaning | Observed via |
 |---|---|---|
-| 0 | success | `selftest bf16 OUTFILE` **[RT]**; serve/listen success is GPU/XRT-gated |
-| 1 | usage error (main usage), missing `devices.hnpm` / `replay.hnpm`, sub-usage for `flux`/`gemma`/`probe`/`selftest`-missing-kind | runtime probes **[RT]** |
-| 2 | sub-usage for `cache`/`tts`/`asr`/`vis encode`, invalid/unusable checkpoint in `probe`/`convert` | runtime probes **[RT]** |
-| 127 | dynamic-loader failure (missing `libxrt_coreutil.so.2`) — the state of this host without the stub | runtime probe **[RT]** |
+| 0 | success | `selftest bf16 OUTFILE` **[S]+[D]**; serve/listen success is GPU/XRT-gated |
+| 1 | usage error (main usage), missing `devices.hnpm` / `replay.hnpm`, sub-usage for `flux`/`gemma`/`probe`/`selftest`-missing-kind | runtime probes **[RV]** |
+| 2 | sub-usage for `cache`/`tts`/`asr`/`vis encode`, invalid/unusable checkpoint in `probe`/`convert` | runtime probes **[RV]** |
+| 127 | dynamic-loader failure (missing `libxrt_coreutil.so.2`) — the state of this host without the stub | runtime probe **[RV]** |
 
 Note the asymmetry (contract-relevant): the **top-level** usage error exits
 **1**, while **subcommand-internal** usage errors exit **2** for
 `cache`/`tts`/`asr`/`vis encode` but **1** for `flux`/`gemma`/`probe`
-(missing args)/`selftest` (missing kind) **[RT]**.
+(missing args)/`selftest` (missing kind) **[RV]**.
 
 ## Verbatim help text
 
 `halogen-npu` has **no `--help` handler**: any unrecognised `argv[1]`
 (including `--help` and `--version`) prints the main usage to **stderr** and
 exits **1**. The program name is the hard-coded literal `halogen-npu`
-(not `argv[0]`) **[RT]**. All usage strings (main + per-subcommand) are
+(not `argv[0]`) **[RV]**. All usage strings (main + per-subcommand) are
 listed verbatim in the flag tables above and captured in
 [`evidence/halogen-npu/binutils-strings.txt`](../evidence/halogen-npu/binutils-strings.txt)
 (lines 4419, 4519, 4733, 4772, 4812, 4863, 4897, 4912, 4914, 4916).
@@ -289,24 +290,25 @@ listed verbatim in the flag tables above and captured in
 ## Observed behaviours (ground truth, stub-XRT host)
 
 1. Direct invocation (no stub) → `error while loading shared libraries:
-   libxrt_coreutil.so.2`, exit 127 **[RT]**.
-2. No args → main usage, exit 1; stdout empty **[RT]**.
+   libxrt_coreutil.so.2`, exit 127 **[RV]**.
+2. No args → main usage, exit 1; stdout empty **[RV]**.
 3. `--help` / `--version` / `-h` / `-v` / `--bogus-flag` / `help` → main
-   usage, exit 1 (no help/version output exists) **[RT]**.
+   usage, exit 1 (no help/version output exists) **[RV]**.
 4. Renamed binary (`renamed-bin`) still prints `halogen-npu` as the program
-   name → the name is embedded, not derived from `argv[0]` **[RT]**.
+   name → the name is embedded, not derived from `argv[0]` **[RV]**.
 5. `serve /nonexistent /nonexistent` and `listen …` → `cannot open
-   <dir>/devices.hnpm`, exit 1 (manifest check precedes XRT) **[RT]**.
-6. `replay /nonexistent` → `cannot open <dir>/replay.hnpm`, exit 1 **[RT]**.
+   <dir>/devices.hnpm`, exit 1 (manifest check precedes XRT) **[RV]**.
+6. `replay /nonexistent` → `cannot open <dir>/replay.hnpm`, exit 1 **[RV]**.
 7. `probe /nonexistent` → `holds no config.json …` error, exit 2; a
    `config.json` with `{}` → `is a unknown checkpoint (model_type unknown)`;
    `model_type` `qwen3_dense` / `qwen35_hybrid` → recognised-family error,
-   exit 2 **[RT]**.
+   exit 2 **[RV]**.
 8. `selftest bf16 FILE` → writes the test artefact to FILE (6 136 bytes with
-   the stub), exit 0, no stdout/stderr **[RT]**.
+   the stub), exit 0, no stdout/stderr **[S]+[D]** (not in the probe
+   transcript; string- and decompile-derived).
 9. `main` reads `HALOGEN_NPU_ASR_HOST` and, when `1`, seeds
    `HALOGEN_NPU_HOST_THREADS=8`, `HALOGEN_NPU_WAIT_SPIN=0`,
-   `HALOGEN_NPU_HOST_PREWAKE=0` (no-clobber) **[DC]**.
+   `HALOGEN_NPU_HOST_PREWAKE=0` (no-clobber) **[D]**.
 
 ## Evidence
 
@@ -333,12 +335,12 @@ listed verbatim in the flag tables above and captured in
   XRT use), but XRT-dependent behaviour (device enumeration, engine I/O,
   inference output, `serve`/`listen` success paths) remains unverified —
   GPU/XRT-gated per plan §5.
-- Static analysis never observes execution: facts marked **[DC]** are
+- Static analysis never observes execution: facts marked **[D]** are
   corroborated by runtime probes where possible.
 - The binary is stripped; `FUN_*` names are Ghidra-derived.
 - **Escalated ambiguities:** (a) the `selftest` usage advertises `norm` but
   no `norm` comparison was located in `main`'s inline strings (the decompile
   confirms `bf16|head|resid|hostx|gx`); (b) the `probe` success output
   format for a fully valid checkpoint is not observable without real weights;
-  (c) per-subcommand readers of the 88 non-`main` `HALOGEN_NPU_*` variables
+  (c) per-subcommand readers of the 81 non-`main` `HALOGEN_NPU_*` variables
   are inventoried by name only, not individually located.

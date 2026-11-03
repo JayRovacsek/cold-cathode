@@ -546,7 +546,7 @@ Other front-end env (from the makeWrapper, Appendix A): `HALOGEN_MODEL_ID`,
 `HALOGEN_TEMPLATE_UNCHECKED`, `HALOGEN_CHAT_TEMPLATE`, `HALOGEN_TOOL_DEFER`,
 `HALOGEN_RECORD_*` (request records), `HALOGEN_NPU_STALL_S` (npu_api).
 The full launcher table is in `launcher.md`; the front-end-only subset is
-also listed there as `FE_ONLY_FLAGS` (entrypoint:1002–1011).
+also listed there as `FE_ONLY_FLAGS` (entrypoint:1002–1015).
 
 ---
 
@@ -588,4 +588,3 @@ check and exits 0 (6686–6693).
 6. **Bind address differs by mode** (`0.0.0.0` for `api`/`all`,
    `127.0.0.1` for `bench`/`sweep`) — the harness should bind ephemeral
    ports anyway (plan §5 normalisation covers port numbers).
-```

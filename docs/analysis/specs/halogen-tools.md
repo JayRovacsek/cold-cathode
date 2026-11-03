@@ -28,9 +28,10 @@ files without a GPU, while `ppl`/`niah` construct the engine (GPU-gated).
 
 ## Entry points and verbs
 
-One entry point: `$out/bin/halogen-tools`. The launcher's `inspect`, `verify`,
-`ppl` and `niah` modes dispatch to this binary (see
-`docs/analysis/specs/launcher.md`); `paired` has no launcher mode.
+One entry point: `$out/bin/halogen-tools`. The launcher's `inspect`/`verify`
+modes dispatch to this binary; its `ppl`/`niah` modes exec
+`halogen_tools.py`, which is separate from this binary's `ppl`/`niah` verbs
+(see `docs/analysis/specs/launcher.md`). `paired` has no launcher mode.
 
 Verb selection is an exact, case-sensitive match on `argv[1]` (decompiled
 `main` = `FUN_01ecabf0`, switch on `strlen(argv[1])` + `bcmp`):
@@ -52,7 +53,8 @@ Dispatch rules (all **[RV]** unless noted):
   compared against `--help`, `-h`, `help`; anything else is an unknown verb.)
 - Any other unknown verb → `halogen-tools: unknown verb '<argv[1]>'` line
   followed by the help block, both to **stderr**, exit **2** (verified with
-  `--version`, `-V`, `--bogus`, `INSPECT`, `--Help` — the verb match is
+  `--version`, `--bogus`, `--Help` **[RV]**; `-V` and `INSPECT` are **[D]** —
+  decompile-derived, not in the probe transcript — the verb match is
   case-sensitive and `--version` is **not** a version flag).
 - Per-verb usage strings embed the verb name, **not** `argv[0]` (e.g.
   `usage: inspect FILE.hgn …`), so no argv[0] normalisation is needed for
@@ -211,8 +213,9 @@ Execution is GPU-gated.
 **No environment variables are read on the CLI argument-parsing paths**
 **[D]**: `main`, the `inspect`/`verify` handlers, the shared checkpoint
 loader and the `--threads` parser contain no `getenv` calls. The binary
-imports `getenv` and embeds 365 unique `HALOGEN_[A-Z0-9_]*` names
-(`grep -o 'HALOGEN_[A-Z0-9_]*' | sort -u` over
+imports `getenv` and embeds 274 unique `HALOGEN_[A-Z0-9_]*` names — 391
+total string occurrences across 365 lines (counting method:
+`grep -o 'HALOGEN_[A-Z0-9_]*' | sort -u` over
 [`evidence/halogen-tools/binutils-strings.txt`](../evidence/halogen-tools/binutils-strings.txt))
 used by the engine internals (GPU paths, e.g. `HALOGEN_ATTN_QS_BT2_WPE`
 referenced in `main`'s engine-tuning tables). The launcher's `HALOGEN_*`
@@ -230,8 +233,9 @@ itself.
 ## Observed behaviours (ground truth, GPU-less host)
 
 1. No args → help (stderr), exit 2; `--help`/`-h`/`help` → help, exit 0;
-   `--version`/`-V`/`--bogus`/`INSPECT`/`--Help` → `halogen-tools: unknown
-   verb '<x>'` + help, exit 2.
+   `--version`/`--bogus`/`--Help` → `halogen-tools: unknown verb '<x>'` +
+   help, exit 2 **[RV]** (`-V` and `INSPECT` are **[D]** — decompile-derived,
+   not in the probe transcript).
 2. `inspect`/`verify`/`ppl`/`niah`/`paired` with no further args → their
    one-line usage, exit 2 (all five verified).
 3. `inspect /nonexistent.hgn` → `cannot open /nonexistent.hgn` (stderr),
@@ -258,7 +262,7 @@ itself.
 - [`evidence/halogen-tools/native-exports.json`](../evidence/halogen-tools/native-exports.json), [`evidence/halogen-tools/elf-notes.json`](../evidence/halogen-tools/elf-notes.json) — provider-free REA records (identical evidence IDs to the MCP `inspect_native_exports` / `inspect_elf_notes` results).
 - [`evidence/halogen-tools/overview-analyze.json`](../evidence/halogen-tools/overview-analyze.json) — REA `analyze` (`binary_overview`) record for the Ghidra analysis snapshot.
 - [`evidence/halogen-tools/mcp-session.evidence.json`](../evidence/halogen-tools/mcp-session.evidence.json) — MCP session export (empty: see limitation below).
-- [`evidence/halogen-tools/cli-probes.txt`](../evidence/halogen-tools/cli-probes.txt) — runtime probe transcript (31 invocations with separated stdout/stderr and exit codes).
+- [`evidence/halogen-tools/cli-probes.txt`](../evidence/halogen-tools/cli-probes.txt) — runtime probe transcript (32 invocations with separated stdout/stderr and exit codes).
 - [`evidence/halogen-tools/binutils-elf-info.txt`](../evidence/halogen-tools/binutils-elf-info.txt), [`binutils-strings.txt`](../evidence/halogen-tools/binutils-strings.txt) — binutils ELF header/dynamic-section dump and full string inventory.
 
 ### Method and limitations
