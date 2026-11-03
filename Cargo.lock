@@ -7,6 +7,10 @@ name = "cc-contract-tests"
 version = "0.1.0"
 dependencies = [
  "cc-flash-serve",
+ "cc-halogen-healthcheck",
+ "cc-halogen-npu",
+ "cc-halogen-tools",
+ "cc-launcher",
 ]
 
 [[package]]

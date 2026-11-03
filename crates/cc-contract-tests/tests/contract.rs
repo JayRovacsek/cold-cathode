@@ -1,21 +1,31 @@
-//! Differential contract tests for `flash_serve` (plan §5, Phase 3).
+//! Differential contract tests for every cold-cathode binary (plan §5, Phase 3).
 //!
-//! Each test drives one mode group of `tests/contract/matrix/flash_serve.toml`:
-//! every entry runs the halogen reference binary and the cold-cathode binary
-//! with identical arguments and environment, normalises both outputs per §5
-//! and compares exit code, stdout and stderr. Failures are collected and
-//! reported together so one run yields the full red/green picture.
+//! The harness discovers all `*.toml` files in `tests/contract/matrix/`;
+//! each filename stem names the subject binary (`flash_serve.toml` →
+//! `CARGO_BIN_EXE_flash_serve`, `halogen-tools.toml` →
+//! `CARGO_BIN_EXE_halogen-tools`, see `cc_contract_tests::discovery`) and
+//! the halogen reference binary (`HALOGEN_<NAME>` env override, then a
+//! `PATH` lookup, see `cc_contract_tests::gating`). Every entry runs the
+//! halogen reference binary and the cold-cathode binary with identical
+//! arguments and environment, normalises both outputs per §5 and compares
+//! exit code, stdout and stderr. Failures are collected and reported
+//! together so one run yields the full red/green picture.
+//!
+//! The nix package source (`lib.sourceByRegex`) excludes the root `tests/`
+//! directory, so discovery finds nothing there and every test below skips
+//! gracefully.
 
-use cc_contract_tests::{gating, matrix, normalise, repo_root, runner};
-use std::path::PathBuf;
+use cc_contract_tests::{discovery, gating, matrix, normalise, repo_root, runner};
 
-/// The flash_serve matrix file, when present. The nix package source
-/// (`lib.sourceByRegex`) excludes the root `tests/` directory, so the
-/// contract tests skip gracefully there.
-fn matrix_path() -> Option<PathBuf> {
-    let path = repo_root()?.join("tests/contract/matrix/flash_serve.toml");
-    path.is_file().then_some(path)
-}
+/// The workspace binaries with a dedicated test below. A matrix file named
+/// after anything else fails `every_matrix_file_names_a_known_binary`.
+const KNOWN_STEMS: &[&str] = &[
+    "cold-cathode",
+    "flash_serve",
+    "halogen-healthcheck",
+    "halogen-npu",
+    "halogen-tools",
+];
 
 #[derive(Default)]
 struct Tally {
@@ -53,19 +63,11 @@ fn resolve_args(args: &[String]) -> Result<Vec<String>, String> {
     Ok(resolved)
 }
 
-fn run_mode(mode: &str) {
-    let Some(path) = matrix_path() else {
-        println!(
-            "SKIP {mode}: matrix unavailable (nix build src excludes the root tests/ directory)"
-        );
-        return;
-    };
-    let cases = match matrix::load_matrix(&path) {
-        Ok(cases) => cases,
-        Err(err) => panic!("matrix {}: {err}", path.display()),
-    };
-    let subject = gating::subject_binary();
-    let reference = gating::reference_binary();
+/// Execute every case of `cases` belonging to `mode` against the reference
+/// and subject binaries resolved for `stem`.
+fn collect(stem: &str, mode: &str, cases: &[matrix::Case]) -> Tally {
+    let subject = gating::subject_binary(stem);
+    let reference = gating::reference_binary(stem);
     let mut tally = Tally::default();
 
     for case in cases.iter().filter(|case| case.mode == mode) {
@@ -135,7 +137,12 @@ fn run_mode(mode: &str) {
             truncate(&subject_norm),
         ));
     }
+    tally
+}
 
+/// Report one mode tally: print the summary (plus notes) or panic with the
+/// collected failures.
+fn report(mode: &str, tally: Tally) {
     let summary = format!(
         "mode {mode}: {} pass, {} fail, {} skip, {} deferred",
         tally.pass, tally.fail, tally.skip, tally.deferred
@@ -146,6 +153,47 @@ fn run_mode(mode: &str) {
     println!("{summary}");
     for note in &tally.notes {
         println!("{note}");
+    }
+}
+
+/// Run one mode group of the matrix for `stem`, skipping when the matrix is
+/// unavailable (nix build source).
+fn run_mode(stem: &str, mode: &str) {
+    let Some(path) = discovery::matrix_for(stem) else {
+        println!(
+            "SKIP {mode}: matrix unavailable (nix build src excludes the root tests/ directory)"
+        );
+        return;
+    };
+    let cases = match matrix::load_matrix(&path) {
+        Ok(cases) => cases,
+        Err(err) => panic!("matrix {}: {err}", path.display()),
+    };
+    report(mode, collect(stem, mode, &cases));
+}
+
+/// Run every mode present in the matrix for `stem` (for binaries whose mode
+/// set is not enumerated by dedicated tests the way flash_serve's is).
+fn run_all_modes(stem: &str) {
+    let Some(path) = discovery::matrix_for(stem) else {
+        println!(
+            "SKIP {stem}: matrix unavailable (nix build src excludes the root tests/ directory)"
+        );
+        return;
+    };
+    let cases = match matrix::load_matrix(&path) {
+        Ok(cases) => cases,
+        Err(err) => panic!("matrix {}: {err}", path.display()),
+    };
+    let mut modes: Vec<&str> = Vec::new();
+    for case in &cases {
+        if !modes.contains(&case.mode.as_str()) {
+            modes.push(&case.mode);
+        }
+    }
+    assert!(!modes.is_empty(), "matrix {} has no cases", path.display());
+    for mode in modes {
+        report(mode, collect(stem, mode, &cases));
     }
 }
 
@@ -161,34 +209,56 @@ fn truncate(text: &str) -> String {
     format!("{}…", &text[..end])
 }
 
+// flash_serve — per-mode tests from the original harness, kept as-is.
 #[test]
 fn serve_matrix() {
-    run_mode("serve");
+    run_mode("flash_serve", "serve");
 }
 
 #[test]
 fn dispatch_matrix() {
-    run_mode("dispatch");
+    run_mode("flash_serve", "dispatch");
 }
 
 #[test]
 fn repack_matrix() {
-    run_mode("repack");
+    run_mode("flash_serve", "repack");
 }
 
 #[test]
 fn resident_gib_matrix() {
-    run_mode("resident-gib");
+    run_mode("flash_serve", "resident-gib");
 }
 
 #[test]
 fn env_matrix() {
-    run_mode("env");
+    run_mode("flash_serve", "env");
+}
+
+// Remaining workspace binaries — one test each, running every mode present.
+#[test]
+fn halogen_tools_matrix() {
+    run_all_modes("halogen-tools");
+}
+
+#[test]
+fn halogen_npu_matrix() {
+    run_all_modes("halogen-npu");
+}
+
+#[test]
+fn halogen_healthcheck_matrix() {
+    run_all_modes("halogen-healthcheck");
+}
+
+#[test]
+fn cold_cathode_matrix() {
+    run_all_modes("cold-cathode");
 }
 
 #[test]
 fn matrix_covers_every_mode() {
-    let Some(path) = matrix_path() else {
+    let Some(path) = discovery::matrix_for("flash_serve") else {
         println!("SKIP: matrix unavailable");
         return;
     };
@@ -199,4 +269,28 @@ fn matrix_covers_every_mode() {
             "matrix has no {mode} entries"
         );
     }
+}
+
+#[test]
+fn every_matrix_file_names_a_known_binary() {
+    let Some(root) = repo_root() else {
+        println!("SKIP: repo root unavailable");
+        return;
+    };
+    let dir = root.join("tests/contract/matrix");
+    if !dir.is_dir() {
+        println!(
+            "SKIP: matrix directory unavailable (nix build src excludes the root tests/ directory)"
+        );
+        return;
+    }
+    let unknown: Vec<String> = discovery::matrices()
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .filter(|stem| !KNOWN_STEMS.contains(&stem.as_str()))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "matrix files without a dedicated test or dev-dep: {unknown:?}"
+    );
 }
