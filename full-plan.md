@@ -98,11 +98,11 @@ this document doubles as the progress ledger.
 ### Phase 1 — Nix foundation (before any Rust code)
 **Objective:** the flake exists and builds *before* implementation starts, so
 Rust work never happens outside Nix (R2 ordering requirement).
-- [ ] Write `flake.nix`: single `nixpkgs` input (R2 pin); `packages.x86_64-linux.halogen-flash-server` via `callPackage packages/halogen-flash-server/default.nix`; `packages.x86_64-linux.cold-cathode` via `rustPlatform.buildRustPackage`; `devShells.x86_64-linux.default` with `rustc`, `cargo`, `clippy`, `rustfmt`, `cargo-nextest`, `nixfmt-rfc-style`, and the halogen package on `PATH` (needed by the §5 harness).
-- [ ] Reconstruct `packages/halogen-flash-server/default.nix` from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734` (v0.18.21); fidelity verified by drv-path match (`nix eval .#halogen-flash-server.drvPath` equals the store drv).
-- [ ] Add `.gitignore` (`.tmp/`, `tmp/`, `target/`).
-- [ ] Create the Cargo workspace skeleton: all six crates compile as stubs (`fn main() {}`); `Cargo.lock` committed.
-- [ ] **Gate:** `nix flake check` green · `nix build .#halogen-flash-server` green · `nix build .#cold-cathode` green (stubs) · `nix develop` provides the full toolchain.
+- [x] Write `flake.nix`: single `nixpkgs` input (R2 pin); `packages.x86_64-linux.halogen-flash-server` via `callPackage packages/halogen-flash-server/default.nix`; `packages.x86_64-linux.cold-cathode` via `rustPlatform.buildRustPackage`; `devShells.x86_64-linux.default` with `rustc`, `cargo`, `clippy`, `rustfmt`, `cargo-nextest`, `nixfmt-rfc-style`, and the halogen package on `PATH` (needed by the §5 harness).
+- [x] Reconstruct `packages/halogen-flash-server/default.nix` from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734` (v0.18.21); fidelity verified by drv-path match (`nix eval .#halogen-flash-server.drvPath` equals the store drv).
+- [x] Add `.gitignore` (`.tmp/`, `tmp/`, `target/`).
+- [x] Create the Cargo workspace skeleton: all six crates compile as stubs (`fn main() {}`); `Cargo.lock` committed.
+- [x] **Gate:** `nix flake check` green · `nix build .#halogen-flash-server` green · `nix build .#cold-cathode` green (stubs) · `nix develop` provides the full toolchain.
 
 ### Phase 2 — REA reverse engineering
 **Objective:** produce the per-binary contracts that everything else is tested

@@ -1,0 +1,4 @@
+[package]
+name = "cc-flash-serve"
+version = "0.1.0"
+edition = "2021"

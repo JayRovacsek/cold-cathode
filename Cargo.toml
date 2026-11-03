@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "crates/cc-contract-tests",
+  "crates/cc-flash-serve",
+  "crates/cc-halogen-healthcheck",
+  "crates/cc-halogen-npu",
+  "crates/cc-halogen-tools",
+  "crates/cc-launcher",
+]
+resolver = "2"
