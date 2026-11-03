@@ -50,6 +50,8 @@
 //!   child's exit code is returned through `main`; a missing program yields
 //!   exit 127, matching bash.
 
+#![warn(unsafe_op_in_unsafe_fn)]
+
 use std::env;
 use std::fs;
 use std::io::Write;
