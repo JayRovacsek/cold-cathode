@@ -28,8 +28,8 @@ requirement R6) and records the current status across the workspace.
 | `cc-halogen-healthcheck` | 0 | `#![warn(unsafe_op_in_unsafe_fn)]` |
 
 **All five crates contain zero `unsafe` blocks.** The `#![warn(unsafe_op_in_unsafe_fn)]`
-attribute is set crate-wide in every crate root (`src/main.rs` for
-`cc-launcher`, `src/lib.rs` for the other four), and clippy's `unsafe` lints
+attribute is set crate-wide in every crate root (`src/lib.rs` for
+all five crates), and clippy's `unsafe` lints
 are held to pedantic level per rule 5.
 
 Because no port has so far required C++-style pointer arithmetic, no unsafe

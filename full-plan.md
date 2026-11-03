@@ -130,13 +130,13 @@ before any real implementation — proving the harness works (TDD).
 - [x] **Gate:** every contract matrix green (or GPU-gated with documented skips on this machine). (all five matrices green; the cold-cathode matrix runs live via the devShell `HALOGEN_COLD_CATHODE` override — 18 pass + 7 documented defers; the flash_serve HTTP tests remain a Phase 3 F4 carry-over)
 
 ### Phase 5 — Packaging and documentation
-- [ ] Finalise `packages/cold-cathode/default.nix` so `$out/bin` contains all five entry points and `$out/opt/halogen/` data paths match what the launcher expects.
-- [ ] Write `.github/README.md per §8; write `docs/unsafe-policy.md` (§7).
-- [ ] **Gate:** `nix build .#cold-cathode` green; README reviewed by the user.
+- [x] Finalise `packages/cold-cathode/default.nix` so `$out/bin` contains all five entry points and `$out/opt/halogen/` data paths match what the launcher expects. (`def23cb` bin names, `5a2064c` devShell export; build verified green)
+- [x] Write `.github/README.md per §8; write `docs/unsafe-policy.md` (§7). (`d895c4b`, full-branch review fixes folded in)
+- [ ] **Gate:** `nix build .#cold-cathode` green; README reviewed by the user. (build green; ticks on user approval of the merge)
 
 ### Phase 6 — Final validation and review
-- [ ] Full matrix run; `nix flake check`; both packages build.
-- [ ] Run a full-branch review (code-reviewer agent); resolve all findings.
+- [x] Full matrix run; `nix flake check`; both packages build. (2026-11-04: `nix flake check` all passed; `nix build .#cold-cathode .#halogen-flash-server --no-link` OK; `cargo test --workspace` 18 suites ok; contract tests 15 unit + 11 integration pass)
+- [x] Run a full-branch review (code-reviewer agent); resolve all findings. (2026-11-04: approve-with-nits, no critical findings; F1–F3 applied in this commit — report in `.tmp/review-report-full-branch.md`)
 - [ ] Present `init` → `main` merge to the user for approval. **Do not merge without it.**
 
 ---
@@ -261,7 +261,7 @@ Sections, in order:
 
 - [ ] All six phases' gates green and ticked in this file.
 - [ ] `nix flake check`, `nix build .#halogen-flash-server`, `nix build .#cold-cathode` all green on this machine.
-- [ ] Every CLI matrix green (or documented GPU-gated skips); HTTP contract tests green.
+- [ ] Every CLI matrix green (or documented GPU-gated skips); HTTP contract tests green *(deferred to `docs/analysis/specs/api.md` per the Phase 3 F4 annotation — live HTTP surface validation awaits a GPU-capable host)*.
 - [ ] `docs/analysis/` contains evidence + specs for all four binaries and the launcher (R9).
 - [ ] `.github/README.md` reviewed by the user and credits halogen (R7).
 - [ ] Full-branch code review completed with findings resolved.

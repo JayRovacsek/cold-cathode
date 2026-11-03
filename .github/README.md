@@ -5,9 +5,10 @@
 **cold-cathode** is a Rust reimplementation of the `halogen-flash-server`
 binary blobs published by
 [peonist-ai/halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
-(v0.18.21). The four vendored ELF binaries (`flash_serve`, `halogen-tools`,
-`halogen-npu`, `halogen-healthcheck`) and the `halogen-flash-server` launcher
-were reverse-engineered with [REA](https://github.com/morluto/rea) and rebuilt
+(v0.18.21). The three vendored ELF binaries (`flash_serve`, `halogen-tools`,
+`halogen-npu`), the `halogen-healthcheck` shell script and the
+`halogen-flash-server` launcher were reverse-engineered with
+[REA](https://github.com/morluto/rea) and rebuilt
 in Rust, validated by differential testing against the original binaries: for
 every way you can invoke a halogen binary, invoking the cold-cathode equivalent
 produces the same stdout, stderr and exit codes. The upstream Python front-end
