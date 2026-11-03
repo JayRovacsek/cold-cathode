@@ -1,0 +1,392 @@
+# halogen-npu contract matrix — Phase 4 (plan §5).
+#
+# Every entry cites the spec section it proves:
+#   docs/analysis/specs/halogen-npu.md (frozen contract, commit bf641c7).
+#
+# Modes: usage | selftest | replay | serve | listen | probe | flux | gemma |
+#        tts | asr | vis | cache.
+# Optional keys: env (inline table), deferred + reason, requires_gpu.
+# Argument tokens: @fixture/<name> resolves to crates/cc-contract-tests/fixtures/<name>;
+# @tmp/<name> resolves to the project-local .tmp/<name> scratch path (AGENTS.md).
+#
+# Reference-binary execution on this host: the store binary exits 127 without
+# AMD XRT (libxrt_coreutil.so.2, spec "Loadability caveat"). Every case sets
+# LD_LIBRARY_PATH to the committed XRT stub (docs/analysis/evidence/halogen-npu/
+# xrt-stub/) so the reference actually executes its real CLI paths; the stub is
+# inert for the Rust subject (its deps resolve via RUNPATH).
+#
+# Ground truth: docs/analysis/evidence/halogen-npu/cli-probes.txt (46 captured
+# invocations) plus the Phase 4 re-probe of every live case below.
+
+# ---------------------------------------------------------------------------
+# top-level usage — main usage to stderr, exit 1 (no --help/--version handler)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "no-args"
+mode = "usage"
+spec = "Flag table — top level (no args row); Observed behaviours #2"
+args = []
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "help-flag"
+mode = "usage"
+spec = "Flag table — top level (--help row); Observed behaviours #3"
+args = ["--help"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "version-flag"
+mode = "usage"
+spec = "Flag table — top level (--version row); Observed behaviours #3"
+args = ["--version"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "h-flag"
+mode = "usage"
+spec = "Flag table — top level (-h row); Observed behaviours #3"
+args = ["-h"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "v-flag"
+mode = "usage"
+spec = "Flag table — top level (-v row); Observed behaviours #3"
+args = ["-v"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "bogus-flag"
+mode = "usage"
+spec = "Flag table — top level (--bogus-flag row); Observed behaviours #3"
+args = ["--bogus-flag"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "help-word"
+mode = "usage"
+spec = "Flag table — top level (help row); Observed behaviours #3"
+args = ["help"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "model-flag"
+mode = "usage"
+spec = "Flag table — top level (--model x row)"
+args = ["--model", "x"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "repack-flag"
+mode = "usage"
+spec = "Flag table — top level (--repack row)"
+args = ["--repack"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "edit-word"
+mode = "usage"
+spec = "Flag table — top level (edit row; `edit` is a flux sub-op, not a top-level subcommand)"
+args = ["edit"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "enc-word"
+mode = "usage"
+spec = "Flag table — top level (enc row; `enc` is a flux sub-op, not a top-level subcommand)"
+args = ["enc"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "unknown-path"
+mode = "usage"
+spec = "Entry points and modes (any other argv[1] → main usage, exit 1)"
+args = ["/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+# ---------------------------------------------------------------------------
+# selftest — usage rows exit 1; bf16 OUTFILE exits 0 (artefact written)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "selftest"
+mode = "selftest"
+spec = "Flag tables — selftest (no kind row, main usage exit 1); Exit codes (1)"
+args = ["selftest"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "selftest-bogus"
+mode = "selftest"
+spec = "Flag tables — selftest (bogus kind row, main usage exit 1)"
+args = ["selftest", "bogus"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "selftest-bf16-outfile"
+mode = "selftest"
+spec = "Flag tables — selftest (bf16 OUTFILE row, argc == 4, exit 0, silent)"
+args = ["selftest", "bf16", "@tmp/npu-bf16-artifact"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+# ---------------------------------------------------------------------------
+# replay / serve / listen — usage rows + cannot-open rows (exit 1)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "replay"
+mode = "replay"
+spec = "Flag tables — replay (no DIR row, main usage exit 1)"
+args = ["replay"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "replay-nonexistent"
+mode = "replay"
+spec = "Flag tables — replay (/nonexistent row, cannot open replay.hnpm exit 1); Observed behaviours #6"
+args = ["replay", "/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "serve"
+mode = "serve"
+spec = "Flag tables — serve (no args row, main usage exit 1)"
+args = ["serve"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "serve-nonexistent"
+mode = "serve"
+spec = "Flag tables — serve (/nonexistent /nonexistent row, cannot open devices.hnpm exit 1); Observed behaviours #5"
+args = ["serve", "/nonexistent", "/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "listen"
+mode = "listen"
+spec = "Flag tables — listen (no args row, main usage exit 1)"
+args = ["listen"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "listen-nonexistent"
+mode = "listen"
+spec = "Flag tables — listen (/nonexistent /nonexistent 127.0.0.1:9999 row, cannot open devices.hnpm exit 1); Observed behaviours #5"
+args = ["listen", "/nonexistent", "/nonexistent", "127.0.0.1:9999"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+# ---------------------------------------------------------------------------
+# probe / convert — sub-usage exit 1; checkpoint errors exit 2
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "probe"
+mode = "probe"
+spec = "Flag tables — probe/convert (probe no DIR row, sub-usage exit 1)"
+args = ["probe"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "convert"
+mode = "probe"
+spec = "Flag tables — probe/convert (convert no args row, sub-usage exit 1)"
+args = ["convert"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "convert-nonexistent"
+mode = "probe"
+spec = "Flag tables — probe/convert (convert /nonexistent missing args row, sub-usage exit 1)"
+args = ["convert", "/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "probe-nonexistent"
+mode = "probe"
+spec = "Flag tables — probe/convert (probe /nonexistent row, holds no config.json exit 2); Observed behaviours #7"
+args = ["probe", "/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "convert-nonexistent-x3"
+mode = "probe"
+spec = "Flag tables — probe/convert (convert /nonexistent x3 row, holds no config.json exit 2)"
+args = ["convert", "/nonexistent", "/nonexistent", "/nonexistent"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "probe-config-empty"
+mode = "probe"
+spec = "Flag tables — probe/convert (config.json {} row, is a unknown checkpoint exit 2)"
+args = ["probe", "@tmp/npu-fake-model-empty"]
+deferred = true
+reason = "needs a fixture dir containing config.json {}; @tmp tokens are not created by the harness and fixtures/ is owned by cc-contract-tests"
+
+[[case]]
+name = "probe-config-qwen3-dense"
+mode = "probe"
+spec = "Flag tables — probe/convert (config.json model_type qwen3_dense row, exit 2)"
+args = ["probe", "@tmp/npu-fake-model-qwen3-dense"]
+deferred = true
+reason = "needs a fixture dir containing config.json; fixtures/ is owned by cc-contract-tests"
+
+[[case]]
+name = "probe-config-qwen35-hybrid"
+mode = "probe"
+spec = "Flag tables — probe/convert (config.json model_type qwen35_hybrid row, exit 2)"
+args = ["probe", "@tmp/npu-fake-model-qwen35-hybrid"]
+deferred = true
+reason = "needs a fixture dir containing config.json; fixtures/ is owned by cc-contract-tests"
+
+# ---------------------------------------------------------------------------
+# hidden subcommands: flux / gemma (exit 1), tts / asr / cache (exit 2)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "flux"
+mode = "flux"
+spec = "Flag tables — flux (flux row, flux sub-usage exit 1); Exit codes (1)"
+args = ["flux"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "flux-bogus"
+mode = "flux"
+spec = "Flag tables — flux (flux bogus row, flux sub-usage exit 1)"
+args = ["flux", "bogus"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "flux-noise"
+mode = "flux"
+spec = "Flag tables — flux (flux noise row, flux sub-usage exit 1)"
+args = ["flux", "noise"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "gemma"
+mode = "gemma"
+spec = "Flag tables — gemma (gemma row, gemma usage exit 1); Exit codes (1)"
+args = ["gemma"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "gemma-a"
+mode = "gemma"
+spec = "Flag tables — gemma (gemma a row, gemma usage exit 1)"
+args = ["gemma", "a"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "tts"
+mode = "tts"
+spec = "Flag tables — tts (tts row, tts usage exit 2); Exit codes (2)"
+args = ["tts"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "tts-a-b"
+mode = "tts"
+spec = "Flag tables — tts (tts a b row, tts usage exit 2)"
+args = ["tts", "a", "b"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "tts-a-b-c"
+mode = "tts"
+spec = "Flag tables — tts (tts a b c row, tts usage exit 2)"
+args = ["tts", "a", "b", "c"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "asr"
+mode = "asr"
+spec = "Flag tables — asr (asr row, feat usage exit 2); Exit codes (2)"
+args = ["asr"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "asr-bogus"
+mode = "asr"
+spec = "Flag tables — asr (asr bogus row, feat usage exit 2 — bogus defaults to the feat grammar)"
+args = ["asr", "bogus"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "asr-encode"
+mode = "asr"
+spec = "Flag tables — asr (asr encode row, encode usage exit 2)"
+args = ["asr", "encode"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "asr-decode"
+mode = "asr"
+spec = "Flag tables — asr (asr decode row, decode usage exit 2)"
+args = ["asr", "decode"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "asr-feat"
+mode = "asr"
+spec = "Flag tables — asr (asr feat row, feat usage exit 2)"
+args = ["asr", "feat"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "vis"
+mode = "vis"
+spec = "Flag tables — vis (vis row, main usage exit 1)"
+args = ["vis"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "vis-bogus"
+mode = "vis"
+spec = "Flag tables — vis (vis bogus row, main usage exit 1)"
+args = ["vis", "bogus"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "vis-decode"
+mode = "vis"
+spec = "Flag tables — vis (vis decode row, main usage exit 1)"
+args = ["vis", "decode"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "vis-encode"
+mode = "vis"
+spec = "Flag tables — vis (vis encode row, vis encode usage exit 2); Exit codes (2)"
+args = ["vis", "encode"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "vis-encode-x"
+mode = "vis"
+spec = "Flag tables — vis (vis encode x row, vis encode usage exit 2)"
+args = ["vis", "encode", "x"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "cache"
+mode = "cache"
+spec = "Flag tables — cache (cache row, cache usage exit 2); Exit codes (2)"
+args = ["cache"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "cache-bogus"
+mode = "cache"
+spec = "Flag tables — cache (cache bogus row, cache usage exit 2)"
+args = ["cache", "bogus"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
+
+[[case]]
+name = "cache-ecopy"
+mode = "cache"
+spec = "Flag tables — cache (cache ecopy row, cache usage exit 2)"
+args = ["cache", "ecopy"]
+env = { LD_LIBRARY_PATH = "/home/jay/.local/share/opencode/worktree/73290a/init/docs/analysis/evidence/halogen-npu/xrt-stub" }
