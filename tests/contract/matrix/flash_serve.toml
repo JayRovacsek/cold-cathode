@@ -1,0 +1,505 @@
+# flash_serve contract matrix — Phase 3 (plan §5).
+#
+# Every entry cites the spec section it proves:
+#   docs/analysis/specs/flash_serve.md (frozen contract, commit 4134bd2 + review fixes).
+#
+# Modes: serve | dispatch | repack | resident-gib | env.
+# Optional keys: env (inline table), deferred + reason, requires_gpu.
+# Argument tokens: @fixture/<name> resolves to crates/cc-contract-tests/fixtures/<name>.
+#
+# Ground truth: docs/analysis/evidence/flash_serve/cli-probes.txt (49 captured
+# invocations) plus the follow-up probes recorded in the Phase 3 commit bodies.
+# On this GPU-less host every otherwise-valid serve invocation ends in the
+# ROCm error (exit 1); that wording is part of the contract and is compared.
+
+# ---------------------------------------------------------------------------
+# serve mode — usage errors (exit 2, comparable without a GPU)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "serve-help"
+mode = "serve"
+spec = "Flag table — serve mode (--help row); Verbatim help text; Observed behaviours #2"
+args = ["--help"]
+
+[[case]]
+name = "serve-version"
+mode = "serve"
+spec = "Flag table — serve mode (--version row); Verbatim help text; Observed behaviours #2"
+args = ["--version"]
+
+[[case]]
+name = "serve-bogus-flag"
+mode = "serve"
+spec = "Entry points and modes (unknown flags → serve usage); Observed behaviours #2"
+args = ["--bogus-flag"]
+
+[[case]]
+name = "serve-quiet"
+mode = "serve"
+spec = "Flag table — repack mode (--quiet is unknown in the serve grammar)"
+args = ["--quiet"]
+
+[[case]]
+name = "serve-threads"
+mode = "serve"
+spec = "Flag table — repack mode (--threads is unknown in the serve grammar)"
+args = ["--threads", "4"]
+
+[[case]]
+name = "serve-out"
+mode = "serve"
+spec = "Entry points and modes (--out is unknown in the serve grammar)"
+args = ["--out", "y"]
+
+[[case]]
+name = "serve-head"
+mode = "serve"
+spec = "Flag table — repack mode (--head is unknown in the serve grammar)"
+args = ["--head", "x"]
+
+[[case]]
+name = "serve-with-table"
+mode = "serve"
+spec = "Flag table — repack mode (--with-table is unknown in the serve grammar)"
+args = ["--with-table"]
+
+[[case]]
+name = "serve-bind-missing-value"
+mode = "serve"
+spec = "Flag table — serve mode (every flag requires a separate value argument)"
+args = ["--bind"]
+
+[[case]]
+name = "serve-ck-equals"
+mode = "serve"
+spec = "Entry points and modes (--flag=value is not supported anywhere)"
+args = ["--ck=x"]
+
+[[case]]
+name = "serve-repack-equals"
+mode = "serve"
+spec = "Entry points and modes (--flag=value is not supported anywhere)"
+args = ["--repack=x", "--out=y"]
+
+[[case]]
+name = "serve-ck-x-port"
+mode = "serve"
+spec = "Entry points and modes (--ck=x unknown; --port without a value)"
+args = ["--ck=x", "--port"]
+
+# ---------------------------------------------------------------------------
+# serve mode — valid grammar, masked by the GPU check (exit 1 on this host)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "serve-no-args"
+mode = "serve"
+spec = "Observed behaviours #1 (no args → ROCm error, exit 1)"
+args = []
+
+[[case]]
+name = "serve-port-abc"
+mode = "serve"
+spec = "Flag table — serve mode (--port: no validation at parse time); Observed behaviours #3"
+args = ["--port", "abc"]
+
+[[case]]
+name = "serve-port-neg1"
+mode = "serve"
+spec = "Flag table — serve mode (--port: no validation at parse time); Observed behaviours #3"
+args = ["--port", "-1"]
+
+[[case]]
+name = "serve-port-0"
+mode = "serve"
+spec = "Flag table — serve mode (--port: no validation at parse time); Observed behaviours #3"
+args = ["--port", "0"]
+
+[[case]]
+name = "serve-port-99999"
+mode = "serve"
+spec = "Flag table — serve mode (--port: no validation at parse time); Observed behaviours #3"
+args = ["--port", "99999"]
+
+[[case]]
+name = "serve-port-65536"
+mode = "serve"
+spec = "Flag table — serve mode (--port: no validation at parse time)"
+args = ["--port", "65536"]
+
+[[case]]
+name = "serve-ck-nonexistent"
+mode = "serve"
+spec = "Flag table — serve mode (--ck existence is checked only after the GPU check); Observed behaviours #3"
+args = ["--ck", "/nonexistent"]
+
+[[case]]
+name = "serve-slots-x"
+mode = "serve"
+spec = "Flag table — serve mode (--slots strtol failure is not a parse error); Observed behaviours #3"
+args = ["--slots", "x"]
+
+[[case]]
+name = "serve-slots-0"
+mode = "serve"
+spec = "Flag table — serve mode (--slots range 1..64, masked by the GPU check); Observed behaviours #3"
+args = ["--slots", "0"]
+
+[[case]]
+name = "serve-slots-neg1"
+mode = "serve"
+spec = "Flag table — serve mode (--slots range 1..64, masked by the GPU check); Observed behaviours #3"
+args = ["--slots", "-1"]
+
+[[case]]
+name = "serve-slots-65"
+mode = "serve"
+spec = "Flag table — serve mode (--slots range 1..64 above max, masked by the GPU check)"
+args = ["--slots", "65"]
+
+[[case]]
+name = "serve-ctx-abc"
+mode = "serve"
+spec = "Flag table — serve mode (--ctx: no validation at parse time); Observed behaviours #3"
+args = ["--ctx", "abc"]
+
+[[case]]
+name = "serve-ctx-0"
+mode = "serve"
+spec = "Flag table — serve mode (--ctx >= 16 range, masked by the GPU check); Observed behaviours #3"
+args = ["--ctx", "0"]
+
+[[case]]
+name = "serve-ctx-15"
+mode = "serve"
+spec = "Flag table — serve mode (--ctx >= 16 range, masked by the GPU check)"
+args = ["--ctx", "15"]
+
+[[case]]
+name = "serve-max-tok-abc"
+mode = "serve"
+spec = "Flag table — serve mode (--max-tok: no validation at parse time); Observed behaviours #3"
+args = ["--max-tok", "abc"]
+
+[[case]]
+name = "serve-max-tok-neg5"
+mode = "serve"
+spec = "Flag table — serve mode (--max-tok >= 1 range, masked by the GPU check); Observed behaviours #3"
+args = ["--max-tok", "-5"]
+
+[[case]]
+name = "serve-max-tok-0"
+mode = "serve"
+spec = "Flag table — serve mode (--max-tok >= 1 range, masked by the GPU check)"
+args = ["--max-tok", "0"]
+
+[[case]]
+name = "serve-kv-pool-x"
+mode = "serve"
+spec = "Flag table — serve mode (--kv-pool strtoll failure is not a parse error); Observed behaviours #3"
+args = ["--kv-pool", "x"]
+
+[[case]]
+name = "serve-kv-pool-100"
+mode = "serve"
+spec = "Flag table — serve mode (--kv-pool rule, masked by the GPU check); Observed behaviours #3"
+args = ["--kv-pool", "100"]
+
+[[case]]
+name = "serve-kv-pool-512"
+mode = "serve"
+spec = "Flag table — serve mode (--kv-pool rule, masked by the GPU check)"
+args = ["--kv-pool", "512"]
+
+[[case]]
+name = "serve-kv-pool-over-cap"
+mode = "serve"
+spec = "Flag table — serve mode (--kv-pool <= 16777216 cap, masked by the GPU check)"
+args = ["--kv-pool", "16777217"]
+
+[[case]]
+name = "serve-bind-xyz"
+mode = "serve"
+spec = "Flag table — serve mode (--bind inet_pton is checked after the GPU check); Observed behaviours #3"
+args = ["--bind", "xyz"]
+
+[[case]]
+name = "serve-bind-999"
+mode = "serve"
+spec = "Flag table — serve mode (--bind inet_pton is checked after the GPU check)"
+args = ["--bind", "999.999.999.999"]
+
+[[case]]
+name = "serve-all-flags"
+mode = "serve"
+spec = "Flag table — serve mode (full usage grammar with every default made explicit)"
+args = ["--ck", "/nonexistent", "--port", "8730", "--bind", "127.0.0.1", "--slots", "4", "--ctx", "32768", "--max-tok", "8192", "--kv-pool", "32768"]
+
+# ---------------------------------------------------------------------------
+# mode dispatch — argv[1] selects the mode (spec: Entry points and modes)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "dispatch-ck-repack-out"
+mode = "dispatch"
+spec = "Entry points and modes (--ck x --repack y --out z → serve usage)"
+args = ["--ck", "x", "--repack", "y", "--out", "z"]
+
+[[case]]
+name = "dispatch-version-repack-out"
+mode = "dispatch"
+spec = "Entry points and modes (--version --repack x --out y → serve usage)"
+args = ["--version", "--repack", "x", "--out", "y"]
+
+[[case]]
+name = "dispatch-out-repack"
+mode = "dispatch"
+spec = "Entry points and modes (--out y --repack x → serve usage)"
+args = ["--out", "y", "--repack", "x"]
+
+[[case]]
+name = "dispatch-repack-out-port"
+mode = "dispatch"
+spec = "Entry points and modes (--repack x --out y --port 1 → repack usage)"
+args = ["--repack", "x", "--out", "y", "--port", "1"]
+
+[[case]]
+name = "dispatch-resident-gib-equals"
+mode = "dispatch"
+spec = "Entry points and modes (--resident-gib=/nonexistent → serve usage)"
+args = ["--resident-gib=/nonexistent"]
+
+[[case]]
+name = "dispatch-port-repack-out"
+mode = "dispatch"
+spec = "Entry points and modes (only argv[1] selects the mode: --port 1 --repack x --out y → serve usage)"
+args = ["--port", "1", "--repack", "x", "--out", "y"]
+
+[[case]]
+name = "dispatch-quiet-repack-out"
+mode = "dispatch"
+spec = "Entry points and modes (only argv[1] selects the mode: --quiet --repack x --out y → serve usage)"
+args = ["--quiet", "--repack", "x", "--out", "y"]
+
+[[case]]
+name = "dispatch-slots-repack-out"
+mode = "dispatch"
+spec = "Entry points and modes (only argv[1] selects the mode: --slots 2 --repack x --out y → serve usage)"
+args = ["--slots", "2", "--repack", "x", "--out", "y"]
+
+# ---------------------------------------------------------------------------
+# repack mode
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "repack-missing-out"
+mode = "repack"
+spec = "Flag table — repack mode (--repack requires --out); Observed behaviours #4"
+args = ["--repack", "/nonexistent"]
+
+[[case]]
+name = "repack-nonexistent"
+mode = "repack"
+spec = "Flag table — repack mode (non-GGUF input); Observed behaviours #4"
+args = ["--repack", "/nonexistent", "--out", "/tmp/x"]
+
+[[case]]
+name = "repack-hash-nonexistent"
+mode = "repack"
+spec = "Flag table — repack mode (--repack-hash needs no --out); Observed behaviours #5"
+args = ["--repack-hash", "/nonexistent"]
+
+[[case]]
+name = "repack-hash-missing-input"
+mode = "repack"
+spec = "Flag table — repack mode (--repack-hash without IN → the --repack needs error)"
+args = ["--repack-hash"]
+
+[[case]]
+name = "repack-usage-help"
+mode = "repack"
+spec = "Flag table — repack mode (--help is unknown in the repack grammar); Verbatim help text (repack block)"
+args = ["--repack", "x", "--out", "y", "--help"]
+
+[[case]]
+name = "repack-quiet"
+mode = "repack"
+spec = "Flag table — repack mode (--quiet is accepted in the repack grammar)"
+args = ["--repack", "x", "--out", "y", "--quiet"]
+
+[[case]]
+name = "repack-threads-abc"
+mode = "repack"
+spec = "Flag table — repack mode (--threads: no validation observed)"
+args = ["--repack", "x", "--out", "y", "--threads", "abc"]
+
+[[case]]
+name = "repack-table-flags"
+mode = "repack"
+spec = "Flag table — repack mode (--with-table accepted alongside --no-table)"
+args = ["--repack", "x", "--out", "y", "--no-table", "--with-table"]
+
+[[case]]
+name = "repack-out-missing-value"
+mode = "repack"
+spec = "Flag table — repack mode (--out requires a value)"
+args = ["--repack", "x", "--out"]
+
+[[case]]
+name = "repack-stub-gguf"
+mode = "repack"
+spec = "Flag table — repack mode (GGUF magic but short file → truncated header); Observed behaviours #4"
+args = ["--repack", "@fixture/stub.gguf", "--out", "/tmp/cc-contract-out.hgn"]
+
+[[case]]
+name = "repack-hash-stub-gguf"
+mode = "repack"
+spec = "Flag table — repack mode (truncated header via --repack-hash)"
+args = ["--repack-hash", "@fixture/stub.gguf"]
+
+[[case]]
+name = "repack-junk-input"
+mode = "repack"
+spec = "Flag table — repack mode (non-GGUF input, existing file)"
+args = ["--repack", "@fixture/junk.bin", "--out", "/tmp/cc-contract-out.hgn"]
+
+[[case]]
+name = "repack-valid-gguf"
+mode = "repack"
+spec = "Flag table — repack mode (success path: writing OUT.hgn from a valid GGUF)"
+deferred = true
+reason = "no full valid .gguf fixture available; the success path (writing OUT.hgn) needs a real GGUF checkpoint"
+args = ["--repack", "@fixture/valid.gguf", "--out", "/tmp/cc-contract-out.hgn"]
+
+# ---------------------------------------------------------------------------
+# resident-gib query mode
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "resident-gib-nonexistent"
+mode = "resident-gib"
+spec = "Flag table — resident-gib query mode (unreadable checkpoint → exit 1, no output); Observed behaviours #6"
+args = ["--resident-gib", "/nonexistent"]
+
+[[case]]
+name = "resident-gib-ignores-rest"
+mode = "resident-gib"
+spec = "Entry points and modes (the rest of argv is ignored in resident-gib mode)"
+args = ["--resident-gib", "/nonexistent", "--help"]
+
+[[case]]
+name = "resident-gib-stub-gguf"
+mode = "resident-gib"
+spec = "Flag table — resident-gib query mode (stub GGUF → no output, exit 1)"
+args = ["--resident-gib", "@fixture/stub.gguf"]
+
+[[case]]
+name = "resident-gib-junk"
+mode = "resident-gib"
+spec = "Flag table — resident-gib query mode (invalid checkpoint → no output, exit 1)"
+args = ["--resident-gib", "@fixture/junk.bin"]
+
+[[case]]
+name = "resident-gib-valid-checkpoint"
+mode = "resident-gib"
+spec = "Flag table — resident-gib query mode (success format `%.1f %d %d %d %.1f`)"
+deferred = true
+reason = "no valid .hgn checkpoint fixture available; the success format `%.1f %d %d %d %.1f` needs a readable checkpoint"
+args = ["--resident-gib", "@fixture/valid.hgn"]
+
+# ---------------------------------------------------------------------------
+# environment variables (serve path; every check sits behind the GPU check,
+# so on this host each entry must reproduce the ROCm error, exit 1)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "env-pld-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_PLD=N,K; invalid → exit 2, masked by the GPU check)"
+args = []
+env = { HALOGEN_PLD = "bad" }
+
+[[case]]
+name = "env-pld-valid"
+mode = "env"
+spec = "Environment variables (HALOGEN_PLD valid form; serve proceeds to the GPU check)"
+args = []
+env = { HALOGEN_PLD = "1,2" }
+
+[[case]]
+name = "env-pld-adapt-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_PLD_ADAPT=%d,%f,%d; invalid → exit 2, masked by the GPU check)"
+args = []
+env = { HALOGEN_PLD_ADAPT = "x" }
+
+[[case]]
+name = "env-spec-adapt-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_SPEC_ADAPT=%d,%f,%d; invalid → exit 2, masked by the GPU check)"
+args = []
+env = { HALOGEN_SPEC_ADAPT = "x" }
+
+[[case]]
+name = "env-mtp-depth-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_MTP_DEPTH=%s needs 1 <= D and HALOGEN_SPEC_N >= D + 1; masked by the GPU check)"
+args = []
+env = { HALOGEN_MTP_DEPTH = "x" }
+
+[[case]]
+name = "env-mtp-depth-hi-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_MTP_DEPTH_HI=%s needs 0 <= D <= 8; masked by the GPU check)"
+args = []
+env = { HALOGEN_MTP_DEPTH_HI = "x" }
+
+[[case]]
+name = "env-mtp-gate-p-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_MTP_GATE_P=%s needs a value in [0, 1]; masked by the GPU check)"
+args = []
+env = { HALOGEN_MTP_GATE_P = "2" }
+
+[[case]]
+name = "env-sampled-depth-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_SAMPLED_DEPTH=%s needs 1 <= D and HALOGEN_SPEC_N >= D + 1; masked by the GPU check)"
+args = []
+env = { HALOGEN_SAMPLED_DEPTH = "x" }
+
+[[case]]
+name = "env-sampled-gate-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_SAMPLED_GATE=t1[,t2] needs values in [0, 1]; masked by the GPU check)"
+args = []
+env = { HALOGEN_SAMPLED_GATE = "x" }
+
+[[case]]
+name = "env-admit-splice-for-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_ADMIT_SPLICE_FOR=%s: expected h or all; masked by the GPU check)"
+args = []
+env = { HALOGEN_ADMIT_SPLICE_FOR = "x" }
+
+[[case]]
+name = "env-admit-nest-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_ADMIT_NEST=%s: expected 0 or 1; masked by the GPU check)"
+args = []
+env = { HALOGEN_ADMIT_NEST = "x" }
+
+[[case]]
+name = "env-kv-slots-invalid"
+mode = "env"
+spec = "Environment variables (HALOGEN_KV_SLOTS as the --slots default; invalid value masked by the GPU check)"
+args = []
+env = { HALOGEN_KV_SLOTS = "x" }
+
+[[case]]
+name = "env-rope-yarn-set"
+mode = "env"
+spec = "Environment variables (HALOGEN_ROPE_YARN with the default ctx; the warning path is post-GPU, masked here)"
+args = []
+env = { HALOGEN_ROPE_YARN = "2" }

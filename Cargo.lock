@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "cc-contract-tests"
 version = "0.1.0"
+dependencies = [
+ "cc-flash-serve",
+]
 
 [[package]]
 name = "cc-flash-serve"
