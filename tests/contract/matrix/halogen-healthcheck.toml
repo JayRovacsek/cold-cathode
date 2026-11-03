@@ -1,0 +1,91 @@
+# Contract matrix for `halogen-healthcheck` (crates/cc-halogen-healthcheck).
+#
+# Cases derived from docs/analysis/specs/halogen-healthcheck.md (frozen
+# contract). Ground truth captured on this host 2026-11-03 (spec
+# §Ground truth): TCP 127.0.0.1:8730 open and answering PONG, 127.0.0.1:8731
+# closed, python3 absent from PATH. The harness runs every case against both
+# the reference script and the Rust subject with identical args and env.
+
+# --- auto (default mode) --------------------------------------------------
+
+[[case]]
+name = "auto-no-args"
+mode = "auto"
+spec = "§Entry points and modes — `auto` (default); §Ground truth row 1 (probe 8731 closed → engine → PONG)"
+args = []
+
+[[case]]
+name = "auto-explicit"
+mode = "auto"
+spec = "§Entry points and modes — `auto`"
+args = ["auto"]
+
+[[case]]
+name = "auto-empty-arg"
+mode = "auto"
+spec = "§Entry points and modes — `${1:-auto}` empty-arg defaulting"
+args = [""]
+
+# --- engine ---------------------------------------------------------------
+
+[[case]]
+name = "engine-open-port"
+mode = "engine"
+spec = "§engine mode — PONG from 127.0.0.1:8730; §Ground truth row 2"
+args = ["engine"]
+
+[[case]]
+name = "engine-closed-port"
+mode = "engine"
+spec = "§engine mode — connect failure → exit 1, silent"
+args = ["engine"]
+env = { HALOGEN_PORT = "1" }
+
+[[case]]
+name = "engine-wait-override"
+mode = "engine"
+spec = "§Environment variables — HALOGEN_ENGINE_PING_S as the PONG read timeout"
+args = ["engine"]
+env = { HALOGEN_PORT = "8730", HALOGEN_ENGINE_PING_S = "5" }
+
+[[case]]
+name = "engine-invalid-wait"
+mode = "engine"
+spec = "§Environment variables — non-numeric HALOGEN_ENGINE_PING_S makes `read -t` fail → exit 1"
+args = ["engine"]
+env = { HALOGEN_PORT = "8730", HALOGEN_ENGINE_PING_S = "abc" }
+
+# --- api ------------------------------------------------------------------
+
+[[case]]
+name = "api-default-port"
+mode = "api"
+spec = "§api mode; §Exit codes — 127 when python3 is absent from PATH; §Ground truth row 3"
+args = ["api"]
+
+[[case]]
+name = "api-closed-port"
+mode = "api"
+spec = "§api mode — the python3 lookup precedes the request (127 on this host, 1 where python3 exists)"
+args = ["api"]
+env = { HALOGEN_API_PORT = "1" }
+
+# --- usage errors -----------------------------------------------------------
+
+[[case]]
+name = "usage-bogus"
+mode = "usage"
+spec = "§Entry points and modes — unknown mode → usage on stderr, exit 2; §Exact output strings"
+args = ["bogus"]
+
+[[case]]
+name = "usage-help-flag"
+mode = "usage"
+spec = "§Exit codes — usage error for `--help` (the script has no flags)"
+args = ["--help"]
+
+[[case]]
+name = "usage-case-sensitive"
+mode = "usage"
+spec = "§Exit codes — usage error for `AUTO` (mode matching is case-sensitive)"
+args = ["AUTO"]
