@@ -1,0 +1,252 @@
+flash_serve CLI probe transcript — 2026-11-03T04:14:17Z UTC
+binary: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve
+host: linux x86_64, no /dev/kfd or /dev/dri present (no ROCm GPU)
+note: usage lines below embed argv[0] verbatim (full store path)
+
+### args: []
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--help]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--version]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--bogus-flag]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--port abc]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--port 99999]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--port -1]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--port 0]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--port 65536]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--ck /nonexistent]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--slots x]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--slots 0]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--slots -1]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--ctx abc]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--ctx 0]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--max-tok abc]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--max-tok -5]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--kv-pool x]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--kv-pool 100]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--kv-pool 512]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--bind]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--bind xyz]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--bind 999.999.999.999]
+--exit: 1
+--stderr:
+halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.
+
+### args: [--quiet]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--threads 4]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--out y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--head x]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--with-table]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--repack /nonexistent]
+--exit: 2
+--stderr:
+/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve: --repack needs IN.gguf and --out OUT.hgn
+
+### args: [--repack /nonexistent --out /tmp/x]
+--exit: 2
+--stderr:
+gguf: /nonexistent is not a GGUF
+
+### args: [--repack-hash /nonexistent]
+--exit: 2
+--stderr:
+gguf: /nonexistent is not a GGUF
+
+### args: [--repack x --out y --help]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack IN.gguf --out OUT.hgn [--no-table] [--head HEAD.hgn|--no-head] [--threads N]
+         (the n-gram table is written by default; a file without it cannot serve)
+       /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack-hash IN.gguf [--with-table] [--head HEAD.hgn|--no-head] [--threads N]
+
+### args: [--repack x --out y --quiet]
+--exit: 2
+--stderr:
+gguf: x is not a GGUF
+
+### args: [--repack x --out y --threads abc]
+--exit: 2
+--stderr:
+gguf: x is not a GGUF
+
+### args: [--repack x --out y --no-table --with-table]
+--exit: 2
+--stderr:
+gguf: x is not a GGUF
+
+### args: [--repack x --out y --port 1]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack IN.gguf --out OUT.hgn [--no-table] [--head HEAD.hgn|--no-head] [--threads N]
+         (the n-gram table is written by default; a file without it cannot serve)
+       /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack-hash IN.gguf [--with-table] [--head HEAD.hgn|--no-head] [--threads N]
+
+### args: [--port 1 --repack x --out y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--quiet --repack x --out y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--repack=x --out=y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--ck=x]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--ck=x --port]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--slots 2 --repack x --out y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--out y --repack x]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--version --repack x --out y]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--resident-gib /nonexistent]
+--exit: 1
+
+### args: [--resident-gib=/nonexistent]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
+
+### args: [--resident-gib /nonexistent --help]
+--exit: 1
+
+### args: [--repack-hash]
+--exit: 2
+--stderr:
+/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve: --repack needs IN.gguf and --out OUT.hgn
+
+### args: [--repack x --out]
+--exit: 2
+--stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack IN.gguf --out OUT.hgn [--no-table] [--head HEAD.hgn|--no-head] [--threads N]
+         (the n-gram table is written by default; a file without it cannot serve)
+       /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack-hash IN.gguf [--with-table] [--head HEAD.hgn|--no-head] [--threads N]
+

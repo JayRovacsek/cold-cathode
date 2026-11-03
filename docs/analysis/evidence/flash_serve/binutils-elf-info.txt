@@ -1,0 +1,105 @@
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00 
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  ABI Version:                       0
+  Type:                              DYN (Position-Independent Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Version:                           0x1
+  Entry point address:               0x1dde5d0
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          33718272 (bytes into file)
+  Flags:                             0x0
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         14
+  Size of section headers:           64 (bytes)
+  Number of section headers:         32
+  Section header string table index: 27
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  PHDR           0x0000000000000040 0x0000000000000040 0x0000000000000040
+                 0x0000000000000310 0x0000000000000310  R      0x8
+  LOAD           0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000001ddd5c8 0x0000000001ddd5c8  R      0x1000
+  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000000000000 0x0000000000000000  RW     0x0
+  GNU_EH_FRAME   0x0000000001d9d008 0x0000000001d9d008 0x0000000001d9d008
+                 0x000000000000762c 0x000000000000762c  R      0x4
+  LOAD           0x0000000001ddd5d0 0x0000000001dde5d0 0x0000000001dde5d0
+                 0x0000000000240ec0 0x0000000000240ec0  R E    0x1000
+  TLS            0x000000000201e490 0x000000000201f490 0x000000000201f490
+                 0x0000000000000000 0x00000000000000c0  R      0x10
+  LOAD           0x000000000201e490 0x0000000002020490 0x0000000002020490
+                 0x0000000000005038 0x0000000000005b70  RW     0x1000
+  GNU_RELRO      0x000000000201e490 0x0000000002020490 0x0000000002020490
+                 0x0000000000005038 0x0000000000005b70  R      0x1
+  DYNAMIC        0x0000000002023208 0x0000000002025208 0x0000000002025208
+                 0x0000000000000200 0x0000000000000200  RW     0x8
+  LOAD           0x00000000020234d0 0x00000000020264d0 0x00000000020264d0
+                 0x0000000000000d00 0x0000000000004f49  RW     0x1000
+  LOAD           0x0000000002025000 0x000000000202c000 0x000000000202c000
+                 0x00000000000026f0 0x00000000000026f0  RW     0x1000
+  INTERP         0x0000000002025800 0x000000000202c800 0x000000000202c800
+                 0x0000000000000053 0x0000000000000053  R      0x1
+      [Requesting program interpreter: /nix/store/pqyiidz5mi73wv5f91d48s9plcqyj5bz-glibc-2.44-57/lib/ld-linux-x86-64.so.2]
+  NOTE           0x0000000002025858 0x000000000202c858 0x000000000202c858
+                 0x0000000000000020 0x0000000000000020  R      0x4
+  LOAD           0x0000000002028000 0x000000000202f000 0x000000000202f000
+                 0x0000000000003708 0x0000000000003708  RW     0x1000
+
+ Section to Segment mapping:
+  Segment Sections...
+   00     
+   01     .gnu.version .gnu.version_r .gnu.hash .rela.dyn .rela.plt .rodata .gcc_except_table .hip_fatbin .eh_frame_hdr .eh_frame 
+   02     
+   03     .eh_frame_hdr 
+   04     .text .init .fini .plt 
+   05     .tbss 
+   06     .init_array .fini_array .data.rel.ro .dynamic .got .relro_padding 
+   07     .init_array .fini_array .data.rel.ro .dynamic .got .relro_padding 
+   08     .dynamic 
+   09     .data .hipFatBinSegment .got.plt .bss 
+   10     .interp .note.ABI-tag .dynsym 
+   11     .interp 
+   12     .note.ABI-tag 
+   13     .dynstr 
+
+Dynamic section at offset 0x2023208 contains 32 entries:
+  Tag        Type                         Name/Value
+ 0x000000000000001d (RUNPATH)            Library runpath: [/nix/store/p3d8spgwb1wgp5xycsdzjx8zb33dwfn1-hipblaslt-7.2.4/lib:/nix/store/nyccgqvlq59jxsk7klrxipq260l1ibin-clr-7.2.4/lib:/nix/store/7a2cjhcgzyym5zaz6m4fksw47qvm150w-gcc-16.2.0-lib/lib:/nix/store/3sj8msrsym648f35mk3gb3pp385hhk8r-gcc-16.2.0-libgcc/lib]
+ 0x0000000000000001 (NEEDED)             Shared library: [libhipblaslt.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libamdhip64.so.7]
+ 0x0000000000000001 (NEEDED)             Shared library: [libstdc++.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x000000006ffffffb (FLAGS_1)            Flags: PIE
+ 0x0000000000000015 (DEBUG)              0x0
+ 0x0000000000000007 (RELA)               0x5600
+ 0x0000000000000008 (RELASZ)             62976 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x000000006ffffff9 (RELACOUNT)          2528
+ 0x0000000000000017 (JMPREL)             0x14c00
+ 0x0000000000000002 (PLTRELSZ)           5808 (bytes)
+ 0x0000000000000003 (PLTGOT)             0x2026a28
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000006 (SYMTAB)             0x202c878
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000005 (STRTAB)             0x202f800
+ 0x000000000000000a (STRSZ)              12039 (bytes)
+ 0x000000006ffffef5 (GNU_HASH)           0x2658
+ 0x0000000000000019 (INIT_ARRAY)         0x2020490
+ 0x000000000000001b (INIT_ARRAYSZ)       96 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x20204f0
+ 0x000000000000001c (FINI_ARRAYSZ)       8 (bytes)
+ 0x000000000000000c (INIT)               0x201e530
+ 0x000000000000000d (FINI)               0x201e548
+ 0x000000006ffffff0 (VERSYM)             0x2198
+ 0x000000006ffffffe (VERNEED)            0x2424
+ 0x000000006fffffff (VERNEEDNUM)         5
+ 0x0000000000000000 (NULL)               0x0
