@@ -11,6 +11,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod gguf;
+pub mod protocol;
 
 use std::env;
 use std::fs;
@@ -190,17 +191,14 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         return 1;
     };
     // Socket setup (spec "Observed behaviours" #7): bind + listen(fd, 64),
-    // then serve the engine's HTTP protocol. The HTTP surface is specified
-    // separately (docs/analysis/specs/api.md); until that lands the port
-    // accepts and closes connections, mirroring the reference's lifetime.
+    // then serve the engine's line protocol (PING/INFO, port 8730 per
+    // docs/analysis/specs/api.md §1). The protocol itself lives in
+    // `protocol`; the HTTP surface (port 8731) is specified separately and
+    // served by the Python front-end, not this binary.
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, opts.port as u16));
     match TcpListener::bind(addr) {
         Ok(listener) => {
-            for conn in listener.incoming() {
-                if conn.is_err() {
-                    break;
-                }
-            }
+            protocol::serve_forever(&listener, &protocol::EngineInfo::from_serve_args(&opts));
             0
         }
         Err(err) => {

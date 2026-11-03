@@ -293,6 +293,109 @@ fn matrix_covers_every_mode() {
     }
 }
 
+/// Claim an ephemeral port and hand it to the child (the brief
+/// bind-then-drop race is accepted; a busy port fails the connect below).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Connect to the spawned serve socket (retrying while the child binds),
+/// send `PING\nINFO\n` and compare both replies against the library's
+/// derivation for the same argv/env.
+fn probe_serve_socket(port: u16, expected_info: &str) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("connect 127.0.0.1:{port}: {err}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .write_all(b"PING\nINFO\n")
+        .map_err(|err| err.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut ping = String::new();
+    reader.read_line(&mut ping).map_err(|err| err.to_string())?;
+    if ping != "PONG\n" {
+        return Err(format!("PING reply {ping:?}, expected \"PONG\\n\""));
+    }
+    let mut info = String::new();
+    reader.read_line(&mut info).map_err(|err| err.to_string())?;
+    if info != format!("{expected_info}\n") {
+        return Err(format!("INFO reply {info:?}, expected {expected_info:?}"));
+    }
+    Ok(())
+}
+
+/// Live socket probe of the subject's serve path (plan §5 category 3, the
+/// port-8730 line protocol): spawns the subject `flash_serve` on an
+/// ephemeral port and checks `PING`→`PONG` plus the exact `INFO` reply the
+/// library derives for the same argv/env. GPU-gated (plan §5): the binary
+/// exits before binding on GPU-less hosts, so the test skips there.
+/// Subject-only — the reference needs a real `.hgn` checkpoint to serve
+/// (matrix reason `hgn-format-not-reverse-engineered`), so there is no
+/// reference side to diff against until that format lands.
+#[test]
+fn serve_socket_probe() {
+    if !gating::gpu_present() {
+        println!("SKIP serve_socket_probe (CLI-only mode: no /dev/kfd or /dev/dri)");
+        return;
+    }
+    let Some(subject) = gating::subject_binary("flash_serve") else {
+        println!("SKIP serve_socket_probe: subject binary unavailable");
+        return;
+    };
+    let Ok(ck) = resolve_token("@fixture/stub.gguf") else {
+        println!("SKIP serve_socket_probe: checkpoint fixture unavailable");
+        return;
+    };
+    let port = free_port();
+    let args: Vec<String> = vec![
+        "--ck".to_string(),
+        ck,
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    // The reply the binary's accept loop derives for exactly this
+    // argv/env (protocol.rs unit tests cover the pure logic on every
+    // host; this proves the wired-up binary answers the same bytes).
+    let expected = cc_flash_serve::protocol::info_line(
+        &cc_flash_serve::protocol::EngineInfo::from_serve_args(
+            &cc_flash_serve::parse_serve(&args).expect("serve args parse"),
+        ),
+    );
+    let mut child = std::process::Command::new(&subject)
+        .args(&args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("serve_socket_probe: spawn {}: {err}", subject.display()));
+    let probe = probe_serve_socket(port, &expected);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(err) = probe {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!("serve_socket_probe: {err}\nchild stderr: {stderr}");
+    }
+}
+
 #[test]
 fn every_matrix_file_names_a_known_binary() {
     let Some(root) = repo_root() else {
