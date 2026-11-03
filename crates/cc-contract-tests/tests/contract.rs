@@ -7,6 +7,15 @@
 //! reported together so one run yields the full red/green picture.
 
 use cc_contract_tests::{gating, matrix, normalise, repo_root, runner};
+use std::path::PathBuf;
+
+/// The flash_serve matrix file, when present. The nix package source
+/// (`lib.sourceByRegex`) excludes the root `tests/` directory, so the
+/// contract tests skip gracefully there.
+fn matrix_path() -> Option<PathBuf> {
+    let path = repo_root()?.join("tests/contract/matrix/flash_serve.toml");
+    path.is_file().then_some(path)
+}
 
 #[derive(Default)]
 struct Tally {
@@ -18,7 +27,9 @@ struct Tally {
     notes: Vec<String>,
 }
 
-/// Resolve `@fixture/<name>` argument tokens to the committed fixture path.
+/// Resolve `@fixture/<name>` argument tokens to the committed fixture path
+/// and `@tmp/<name>` tokens to the project-local `.tmp/` scratch path
+/// (AGENTS.md: no system temp dirs).
 fn resolve_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut resolved = Vec::with_capacity(args.len());
     for arg in args {
@@ -30,6 +41,11 @@ fn resolve_args(args: &[String]) -> Result<Vec<String>, String> {
                 return Err(format!("fixture {fixture} missing"));
             }
             resolved.push(path.display().to_string());
+        } else if let Some(name) = arg.strip_prefix("@tmp/") {
+            let root = repo_root().ok_or_else(|| "repo root unavailable".to_string())?;
+            let dir = root.join(".tmp");
+            std::fs::create_dir_all(&dir).map_err(|err| format!("cannot create .tmp: {err}"))?;
+            resolved.push(dir.join(name).display().to_string());
         } else {
             resolved.push(arg.clone());
         }
@@ -38,8 +54,7 @@ fn resolve_args(args: &[String]) -> Result<Vec<String>, String> {
 }
 
 fn run_mode(mode: &str) {
-    let Some(path) = repo_root().map(|root| root.join("tests/contract/matrix/flash_serve.toml"))
-    else {
+    let Some(path) = matrix_path() else {
         println!(
             "SKIP {mode}: matrix unavailable (nix build src excludes the root tests/ directory)"
         );
@@ -173,8 +188,7 @@ fn env_matrix() {
 
 #[test]
 fn matrix_covers_every_mode() {
-    let Some(path) = repo_root().map(|root| root.join("tests/contract/matrix/flash_serve.toml"))
-    else {
+    let Some(path) = matrix_path() else {
         println!("SKIP: matrix unavailable");
         return;
     };

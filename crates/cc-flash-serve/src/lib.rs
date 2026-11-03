@@ -126,6 +126,15 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         eprintln!("{message}");
         return 2;
     }
+    // C1 (review): the spec's `--ck` row documents a file-existence check
+    // after the GPU check; the reference exits 1 on a missing checkpoint
+    // before binding the socket. The wording is the binary's
+    // `checkpoint: fstat failed on %s` string (evidence/flash_serve/
+    // binutils-strings.txt:571); it is not observable on a GPU-less host.
+    if !Path::new(&opts.ck).exists() {
+        eprintln!("checkpoint: fstat failed on {}", opts.ck);
+        return 1;
+    }
     // The reviewed `--slots 1..%d` fix: the upper bound is the constant 64
     // (0x40) rendered at runtime, not a literal.
     if !(1..=MAX_SLOTS).contains(&opts.slots) || opts.ctx < MIN_CTX || opts.max_tok < 1 {
@@ -373,18 +382,10 @@ fn run_repack(argv0: &str, args: &[String], hash_mode: bool) -> i32 {
     } else {
         head.as_deref().map(Path::new)
     };
+    // The full validation chain (header → version → tensor-info → MTP head
+    // → architecture → qwen4exp schema, review F2) lives in `gguf::inspect`.
     match gguf::inspect(Path::new(input), head_path) {
-        Ok(meta) => {
-            let arch = if meta.architecture.is_empty() {
-                "?"
-            } else {
-                &meta.architecture
-            };
-            // The reference only reads qwen4exp checkpoints (probed).
-            if arch != "qwen4exp" {
-                eprintln!("gguf: architecture '{arch}': this engine reads qwen4exp (Qwen3.8-Flash-Next) only");
-                return 1;
-            }
+        Ok(_meta) => {
             if let Some(out_path) = out {
                 write_hgn(Path::new(&out_path), Path::new(input), with_table);
             }
@@ -750,6 +751,20 @@ fn round_up(value: i64, unit: i64) -> i64 {
     }
 }
 
+/// Project-local scratch directory for test fixtures (AGENTS.md: no system
+/// temp dirs). Resolves to `<repo-root>/.tmp` via `CARGO_MANIFEST_DIR`
+/// (`crates/<crate>` -> repo root), falling back to the crate directory.
+#[cfg(test)]
+pub(crate) fn scratch_dir() -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dir = manifest
+        .ancestors()
+        .nth(2)
+        .map_or_else(|| manifest.join(".tmp"), |root| root.join(".tmp"));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,7 +974,7 @@ mod tests {
 
     #[test]
     fn resident_gib_reads_written_checkpoints() {
-        let dir = std::env::temp_dir();
+        let dir = scratch_dir();
         let input = dir.join("cc-flash-serve-test-input.gguf");
         fs::write(&input, b"GGUF").ok();
         let out = dir.join("cc-flash-serve-test-out.hgn");
@@ -974,7 +989,7 @@ mod tests {
     #[test]
     fn resident_gib_rejects_non_hgn_files() {
         // stub.gguf (GGUF magic) and junk.bin are invalid checkpoints.
-        let dir = std::env::temp_dir();
+        let dir = scratch_dir();
         let path = dir.join("cc-flash-serve-test-stub.hgn");
         fs::write(&path, b"GGUF").ok();
         assert_eq!(

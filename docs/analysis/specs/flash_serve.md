@@ -112,6 +112,17 @@ Input validation (observed, happens before any GPU work):
 > 2) and by the `%.1f %d %d %d %.1f` output format in
 > `mode-dispatcher-FUN_01f23680.json`.
 
+> `.hgn` format caveat (review F3): the checkpoint layout inferred by the
+> Phase 4 port (`HGN1` magic + version + f64 GiB + flag bytes, derived from
+> the `HGN1` string in `binutils-strings.txt`) is **falsified**: probing the
+> reference with a subject-written `.hgn` (`--resident-gib sub.hgn`) yields
+> exit 1 with no output — the reference rejects it — while the subject reads
+> it back and prints `0.0 1 1 0 0.0` with exit 0. The reference's actual
+> `.hgn` format differs from the inference; decompiling the resident-gib
+> handler, or obtaining a reference-produced checkpoint, is required before
+> the deferred success case can be un-deferred (matrix reason
+> `hgn-format-not-reverse-engineered`).
+
 ## Environment variables
 
 Read on the CLI paths (main / mode dispatcher / GPU selector). The binary

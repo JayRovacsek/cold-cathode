@@ -5,7 +5,8 @@
 #
 # Modes: serve | dispatch | repack | resident-gib | env.
 # Optional keys: env (inline table), deferred + reason, requires_gpu.
-# Argument tokens: @fixture/<name> resolves to crates/cc-contract-tests/fixtures/<name>.
+# Argument tokens: @fixture/<name> resolves to crates/cc-contract-tests/fixtures/<name>;
+# @tmp/<name> resolves to the project-local .tmp/<name> scratch path (AGENTS.md).
 #
 # Ground truth: docs/analysis/evidence/flash_serve/cli-probes.txt (49 captured
 # invocations) plus the follow-up probes recorded in the Phase 3 commit bodies.
@@ -302,7 +303,7 @@ args = ["--repack", "/nonexistent"]
 name = "repack-nonexistent"
 mode = "repack"
 spec = "Flag table — repack mode (non-GGUF input); Observed behaviours #4"
-args = ["--repack", "/nonexistent", "--out", "/tmp/x"]
+args = ["--repack", "/nonexistent", "--out", "@tmp/cc-contract-out.hgn"]
 
 [[case]]
 name = "repack-hash-nonexistent"
@@ -350,7 +351,7 @@ args = ["--repack", "x", "--out"]
 name = "repack-stub-gguf"
 mode = "repack"
 spec = "Flag table — repack mode (GGUF magic but short file → truncated header); Observed behaviours #4"
-args = ["--repack", "@fixture/stub.gguf", "--out", "/tmp/cc-contract-out.hgn"]
+args = ["--repack", "@fixture/stub.gguf", "--out", "@tmp/cc-contract-out.hgn"]
 
 [[case]]
 name = "repack-hash-stub-gguf"
@@ -362,7 +363,7 @@ args = ["--repack-hash", "@fixture/stub.gguf"]
 name = "repack-junk-input"
 mode = "repack"
 spec = "Flag table — repack mode (non-GGUF input, existing file)"
-args = ["--repack", "@fixture/junk.bin", "--out", "/tmp/cc-contract-out.hgn"]
+args = ["--repack", "@fixture/junk.bin", "--out", "@tmp/cc-contract-out.hgn"]
 
 [[case]]
 name = "repack-valid-gguf"
@@ -370,7 +371,49 @@ mode = "repack"
 spec = "Flag table — repack mode (success path: writing OUT.hgn from a valid GGUF)"
 deferred = true
 reason = "no full valid .gguf fixture available; the success path (writing OUT.hgn) needs a real GGUF checkpoint"
-args = ["--repack", "@fixture/valid.gguf", "--out", "/tmp/cc-contract-out.hgn"]
+args = ["--repack", "@fixture/valid.gguf", "--out", "@tmp/cc-contract-out.hgn"]
+
+[[case]]
+name = "repack-bogus-tensor-count"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: header declaring n_tensors=2^32 with no tensor-info records → truncated header)"
+args = ["--repack", "@fixture/bogus-tensors.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-tensor-past-shard"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: tensor data range beyond the file → `blk.0.w runs past the end of the shard`)"
+args = ["--repack", "@fixture/tensor-past-shard.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-arch-llama"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review C2: architecture error carries the `gguf: ` prefix — `gguf: architecture 'llama': this engine reads qwen4exp (Qwen3.8-Flash-Next) only`)"
+args = ["--repack", "@fixture/llama.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-qwen4exp-minimal"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: qwen4exp schema — `gguf: qwen4exp.ssm.group_count = missing, expected 16`)"
+args = ["--repack", "@fixture/qwen4exp-minimal.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-qwen4exp-group-count"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: qwen4exp schema — `gguf: qwen4exp.ssm.time_step_rank = missing, expected 48`)"
+args = ["--repack", "@fixture/qwen4exp-group-count.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-qwen4exp-wrong-group-count"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: qwen4exp schema — `gguf: qwen4exp.ssm.group_count = 3, expected 16`)"
+args = ["--repack", "@fixture/qwen4exp-wrong-group-count.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
+
+[[case]]
+name = "repack-qwen4exp-two-scalars"
+mode = "repack"
+spec = "Flag table — repack mode (Input validation, review F2: qwen4exp schema — `gguf: qwen4exp.ssm.state_size = missing, expected 128`)"
+args = ["--repack", "@fixture/qwen4exp-two-scalars.gguf", "--out", "@tmp/cc-contract-out.hgn", "--no-head"]
 
 # ---------------------------------------------------------------------------
 # resident-gib query mode
@@ -405,7 +448,7 @@ name = "resident-gib-valid-checkpoint"
 mode = "resident-gib"
 spec = "Flag table — resident-gib query mode (success format `%.1f %d %d %d %.1f`)"
 deferred = true
-reason = "no valid .hgn checkpoint fixture available; the success format `%.1f %d %d %d %.1f` needs a readable checkpoint"
+reason = "hgn-format-not-reverse-engineered: the reference rejects the subject's inferred HGN1 layout (review F3); no reference-produced .hgn fixture exists on this machine"
 args = ["--resident-gib", "@fixture/valid.hgn"]
 
 # ---------------------------------------------------------------------------
