@@ -1,0 +1,350 @@
+# halogen-tools contract matrix — Phase 4 (plan §5).
+#
+# Every entry cites the spec section it proves:
+#   docs/analysis/specs/halogen-tools.md (frozen contract, commit 71bf903).
+#
+# Ground truth: docs/analysis/evidence/halogen-tools/cli-probes.txt (32
+# captured invocations) plus a Phase 4 re-probe of every live case below.
+#
+# The .hgn success paths are deferred (reason: hgn-format-not-reverse-
+# engineered — no reference .hgn exists on this host and the subject-written
+# header layout is decompile-derived, flash_serve review F3). The header
+# *error* paths (shorter-than-a-header, GGUF) are proven live via
+# @fixture/ files whose contents the reference accepts byte-exactly.
+#
+# Modes: help | unknown-verb | inspect | verify | ppl | niah | paired.
+# Optional keys: deferred + reason.
+
+# ---------------------------------------------------------------------------
+# help paths — no args (exit 2), --help/-h/help (exit 0), all on stderr
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "no-args"
+mode = "help"
+spec = "Dispatch rules (argc < 2 → help to stderr, exit 2); Observed behaviours #1"
+args = []
+
+[[case]]
+name = "help-flag"
+mode = "help"
+spec = "Entry points and verbs (--help row, exit 0); Observed behaviours #1"
+args = ["--help"]
+
+[[case]]
+name = "h-flag"
+mode = "help"
+spec = "Entry points and verbs (-h row, exit 0); Observed behaviours #1"
+args = ["-h"]
+
+[[case]]
+name = "help-word"
+mode = "help"
+spec = "Entry points and verbs (help row, exit 0); Observed behaviours #1"
+args = ["help"]
+
+# ---------------------------------------------------------------------------
+# unknown verbs — `halogen-tools: unknown verb '<x>'` + help, exit 2
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "version-flag"
+mode = "unknown-verb"
+spec = "Dispatch rules (--version is NOT a version flag [RV]); Observed behaviours #1"
+args = ["--version"]
+
+[[case]]
+name = "bogus-flag"
+mode = "unknown-verb"
+spec = "Dispatch rules (any other unknown verb → unknown-verb line + help, exit 2 [RV])"
+args = ["--bogus"]
+
+[[case]]
+name = "Help-capital"
+mode = "unknown-verb"
+spec = "Dispatch rules (--Help [RV]; verb match is case-sensitive)"
+args = ["--Help"]
+
+[[case]]
+name = "HELP-upper"
+mode = "unknown-verb"
+spec = "Entry points and verbs (case-sensitive match; HELP is not help — probed live in Phase 4)"
+args = ["HELP"]
+
+[[case]]
+name = "V-flag"
+mode = "unknown-verb"
+spec = "Dispatch rules (-V [D], decompile-derived; probed live in Phase 4)"
+args = ["-V"]
+
+[[case]]
+name = "INSPECT-upper"
+mode = "unknown-verb"
+spec = "Dispatch rules (INSPECT [D], case-sensitive verb match; probed live in Phase 4)"
+args = ["INSPECT"]
+
+# ---------------------------------------------------------------------------
+# inspect — usage, cannot-open, positional-verbatim, threads variants,
+# header error paths via fixtures
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "inspect-no-file"
+mode = "inspect"
+spec = "Flag table — inspect (missing FILE row, usage exit 2 [RV]); Observed behaviours #2"
+args = ["inspect"]
+
+[[case]]
+name = "inspect-nonexistent"
+mode = "inspect"
+spec = "Flag table — inspect (unreadable file → `cannot open <file>` exit 2 [RV]); Observed behaviours #3"
+args = ["inspect", "/nonexistent.hgn"]
+
+[[case]]
+name = "inspect-json-flag-as-file"
+mode = "inspect"
+spec = "Flag table — inspect (FILE taken verbatim even if it starts with `-`: `inspect --json` → `cannot open --json` [RV]); Observed behaviours #3"
+args = ["inspect", "--json"]
+
+[[case]]
+name = "inspect-nonexistent-bogus"
+mode = "inspect"
+spec = "Flag table — inspect (unknown flags ignored by the shared scanner; file check first [RV]); Observed behaviours #7"
+args = ["inspect", "/nonexistent.hgn", "--bogus"]
+
+[[case]]
+name = "inspect-nonexistent-json"
+mode = "inspect"
+spec = "Flag table — inspect (--json flag with unreadable FILE [RV]); Observed behaviours #3"
+args = ["inspect", "/nonexistent.hgn", "--json"]
+
+[[case]]
+name = "inspect-threads-nonnumeric"
+mode = "inspect"
+spec = "Flag table — inspect (--threads N clamped, never an error [D]; file-open precedes flag checks [RV]); Observed behaviours #7"
+args = ["inspect", "x.hgn", "--threads", "x"]
+
+[[case]]
+name = "inspect-threads-dangling"
+mode = "inspect"
+spec = "Flag table — inspect (--threads without a value falls back to the default 8 [D]; file check first [RV]); Observed behaviours #7"
+args = ["inspect", "x.hgn", "--threads"]
+
+[[case]]
+name = "inspect-threads-equals"
+mode = "inspect"
+spec = "Flag table — inspect (--threads N is matched as exact words; `--threads=4` is not the flag [D] and is ignored; file check first [RV])"
+args = ["inspect", "x.hgn", "--threads=4"]
+
+[[case]]
+name = "inspect-all-flags"
+mode = "inspect"
+spec = "Flag table — inspect (--json --no-hash --threads 4 with unreadable FILE [RV])"
+args = ["inspect", "x.hgn", "--json", "--no-hash", "--threads", "4"]
+
+[[case]]
+name = "inspect-junk-fixture"
+mode = "inspect"
+spec = "Flag table — inspect (file ≤ 103 bytes → `<file>: shorter than a header` exit 2 [D]; 44-byte fixture, re-probed live in Phase 4)"
+args = ["inspect", "@fixture/junk.bin"]
+
+[[case]]
+name = "inspect-gguf-fixture"
+mode = "inspect"
+spec = "Flag table — inspect (first 4 bytes = GGUF → `<file>: a GGUF. …` exit 2 [D]; 124-byte GGUF fixture, wording re-probed live via verify in Phase 4)"
+args = ["inspect", "@fixture/tensor-past-shard.gguf"]
+
+[[case]]
+name = "inspect-success"
+mode = "inspect"
+spec = "Flag table — inspect (success output, decompile-derived, not runtime-verifiable: no reference .hgn on this host)"
+args = ["inspect", "@fixture/minimal.hgn"]
+deferred = true
+reason = "hgn-format-not-reverse-engineered"
+
+# ---------------------------------------------------------------------------
+# verify — usage, FAIL-on-stdout failure path (exit 1), header errors
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "verify-no-file"
+mode = "verify"
+spec = "Flag table — verify (missing FILE row, usage exit 2 [RV]); Observed behaviours #2"
+args = ["verify"]
+
+[[case]]
+name = "verify-nonexistent"
+mode = "verify"
+spec = "Flag table — verify (unreadable file → `FAIL cannot open <file>` on STDOUT, exit 1 [RV]); Observed behaviours #4"
+args = ["verify", "/nonexistent.hgn"]
+
+[[case]]
+name = "verify-nonexistent-json"
+mode = "verify"
+spec = "Flag table — verify (--json is not accepted by verify; consumed as scanner noise [D]; output unchanged [RV])"
+args = ["verify", "/nonexistent.hgn", "--json"]
+
+[[case]]
+name = "verify-threads-nonnumeric"
+mode = "verify"
+spec = "Flag table — verify (--threads N clamped, never an error [D]); Observed behaviours #7 (probed live: verify x.hgn --threads x)"
+args = ["verify", "x.hgn", "--threads", "x"]
+
+[[case]]
+name = "verify-junk-fixture"
+mode = "verify"
+spec = "Flag table — verify (file ≤ 103 bytes → `FAIL <file>: shorter than a header` stdout exit 1 [D]; 44-byte fixture, re-probed live in Phase 4)"
+args = ["verify", "@fixture/junk.bin"]
+
+[[case]]
+name = "verify-gguf-fixture"
+mode = "verify"
+spec = "Flag table — verify (GGUF magic → `FAIL <file>: a GGUF. …` stdout exit 1 [D]; 124-byte GGUF fixture, re-probed live in Phase 4)"
+args = ["verify", "@fixture/tensor-past-shard.gguf"]
+
+[[case]]
+name = "verify-success"
+mode = "verify"
+spec = "Flag table — verify (PASS line, decompile-derived, not runtime-verifiable on this host)"
+args = ["verify", "@fixture/minimal.hgn"]
+deferred = true
+reason = "hgn-format-not-reverse-engineered"
+
+# ---------------------------------------------------------------------------
+# ppl — usage, missing --ids, unreadable ids file (file checks precede
+# flag-value checks); scoring itself is GPU-gated
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "ppl-no-file"
+mode = "ppl"
+spec = "Flag table — ppl (missing FILE row, one-line usage exit 2 [RV]); Observed behaviours #2"
+args = ["ppl"]
+
+[[case]]
+name = "ppl-no-ids"
+mode = "ppl"
+spec = "Flag table — ppl (--ids required → `ppl: --ids IDS.bin is required (a text front end is not built yet)` exit 2 [RV]); Observed behaviours #5"
+args = ["ppl", "/nonexistent"]
+
+[[case]]
+name = "ppl-file-dash"
+mode = "ppl"
+spec = "Flag table — ppl (FILE starting with `-` → one-line usage [D]; probed live in Phase 4)"
+args = ["ppl", "--ids", "y"]
+
+[[case]]
+name = "ppl-ids-unreadable"
+mode = "ppl"
+spec = "Observed behaviours #7 (file-open checks precede flag-value checks [RV]; probed live: ppl x --ids y)"
+args = ["ppl", "x", "--ids", "y"]
+
+[[case]]
+name = "ppl-ids-chunk"
+mode = "ppl"
+spec = "Flag table — ppl (--chunk parsed but the ids file check fires first [RV]); probed live: ppl x --ids y --chunk 7"
+args = ["ppl", "x", "--ids", "y", "--chunk", "7"]
+
+[[case]]
+name = "ppl-ids-chunk-out"
+mode = "ppl"
+spec = "Flag table — ppl (--out accepted; ids file check still first [RV]); probed live: ppl x --ids y --chunk 8 --out /dev/null"
+args = ["ppl", "x", "--ids", "y", "--chunk", "8", "--out", "/dev/null"]
+
+[[case]]
+name = "ppl-success"
+mode = "ppl"
+spec = "Flag table — ppl (scoring is GPU-gated; engine path not exercised on this host, spec \"Runtime messages\")"
+args = ["ppl", "@fixture/minimal.hgn", "--ids", "@fixture/junk.bin"]
+deferred = true
+reason = "hgn-format-not-reverse-engineered"
+
+# ---------------------------------------------------------------------------
+# niah — usage, missing --manifest, unreadable manifest
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "niah-no-file"
+mode = "niah"
+spec = "Flag table — niah (missing FILE row, one-line usage exit 2 [RV]); Observed behaviours #2"
+args = ["niah"]
+
+[[case]]
+name = "niah-no-manifest"
+mode = "niah"
+spec = "Flag table — niah (--manifest required → `niah: --manifest CASES.tsv is required (the battery builder is not in the image yet)` exit 2 [RV]); Observed behaviours #5"
+args = ["niah", "/nonexistent"]
+
+[[case]]
+name = "niah-file-dash"
+mode = "niah"
+spec = "Flag table — niah (FILE starting with `-` → one-line usage [D]; probed live in Phase 4)"
+args = ["niah", "--manifest", "y"]
+
+[[case]]
+name = "niah-manifest-unreadable"
+mode = "niah"
+spec = "Observed behaviours #7 (file-open checks precede flag-value checks [RV]; probed live: niah x --manifest y)"
+args = ["niah", "x", "--manifest", "y"]
+
+[[case]]
+name = "niah-manifest-maxtok"
+mode = "niah"
+spec = "Flag table — niah (--max-tok parsed but the manifest check fires first [RV]); probed live: niah x --manifest y --max-tok x"
+args = ["niah", "x", "--manifest", "y", "--max-tok", "x"]
+
+[[case]]
+name = "niah-manifest-pintrunk"
+mode = "niah"
+spec = "Flag table — niah (--pin-trunk parsed but the manifest check fires first [RV]); probed live: niah x --manifest y --pin-trunk 2"
+args = ["niah", "x", "--manifest", "y", "--pin-trunk", "2"]
+
+[[case]]
+name = "niah-success"
+mode = "niah"
+spec = "Flag table — niah (execution is GPU-gated; engine path not exercised on this host)"
+args = ["niah", "@fixture/minimal.hgn", "--manifest", "@fixture/junk.bin"]
+deferred = true
+reason = "hgn-format-not-reverse-engineered"
+
+# ---------------------------------------------------------------------------
+# paired — usage rows, cannot-open path (stderr, exit 2 — differs from verify)
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "paired-no-files"
+mode = "paired"
+spec = "Flag table — paired (fewer than two files → usage exit 2 [RV]); Observed behaviours #6"
+args = ["paired"]
+
+[[case]]
+name = "paired-one-file"
+mode = "paired"
+spec = "Flag table — paired (one file → usage exit 2 [RV]); Observed behaviours #6"
+args = ["paired", "/nonexistent-a.bin"]
+
+[[case]]
+name = "paired-two-unreadable"
+mode = "paired"
+spec = "Flag table — paired (unreadable A.bin → `cannot open <A.bin>` stderr exit 2 [RV]); Observed behaviours #6"
+args = ["paired", "/nonexistent-a.bin", "/nonexistent-b.bin"]
+
+[[case]]
+name = "paired-two-unreadable-json"
+mode = "paired"
+spec = "Flag table — paired (--json variant, same cannot-open output [RV]); Observed behaviours #6"
+args = ["paired", "/nonexistent-a.bin", "/nonexistent-b.bin", "--json"]
+
+[[case]]
+name = "paired-dangling-label"
+mode = "paired"
+spec = "Flag table — paired (--label-a without a value keeps the default and never errors [D]; probed live: paired a.bin b.bin --label-a)"
+args = ["paired", "a.bin", "b.bin", "--label-a"]
+
+[[case]]
+name = "paired-success"
+mode = "paired"
+spec = "Flag table — paired (prose/JSON output formats are decompile-derived; needs .bin score fixtures the reference accepts)"
+args = ["paired", "@fixture/junk.bin", "@fixture/junk.bin"]
+deferred = true
+reason = "hgn-format-not-reverse-engineered"
