@@ -107,12 +107,12 @@ Rust work never happens outside Nix (R2 ordering requirement).
 ### Phase 2 — REA reverse engineering
 **Objective:** produce the per-binary contracts that everything else is tested
 against, with committed evidence (R9).
-- [ ] Load the `reverse-engineer-anything` skill and follow it for each of the four ELF binaries (opened from the `nix build .#halogen-flash-server` result path).
-- [ ] Per binary: extract strings/symbols/imports, decompile `main` and CLI argument parsing, export evidence to `docs/analysis/evidence/<binary>/`.
-- [ ] Launcher contract needs **no REA** — it is plain source: `deploy/entrypoint.sh` + the makeWrapper env defaults (Appendix A). Transcribe it into `docs/analysis/specs/launcher.md`.
-- [ ] HTTP route table comes from the upstream Python front-end source (`share/halogen/tools`); transcribe routes/schemas into `docs/analysis/specs/api.md`.
-- [ ] Write `docs/analysis/specs/<binary>.md` per binary using the spec template: entry points · complete flag table (name, type, default, validation, exact error wording) · env-var table · exit codes · verbatim help text · subcommands · observed behaviours · links to evidence files.
-- [ ] **Gate:** specs are internally consistent and reviewed (review agent sign-off; ambiguities raised with the user). Specs become the frozen contract for Phase 3.
+- [x] Load the `reverse-engineer-anything` skill and follow it for each of the four ELF binaries (opened from the `nix build .#halogen-flash-server` result path). *(healthcheck is a shell script — transcribed instead; see decision log 2026-11-03.)*
+- [x] Per binary: extract strings/symbols/imports, decompile `main` and CLI argument parsing, export evidence to `docs/analysis/evidence/<binary>/`.
+- [x] Launcher contract needs **no REA** — it is plain source: `deploy/entrypoint.sh` + the makeWrapper env defaults (Appendix A). Transcribe it into `docs/analysis/specs/launcher.md`.
+- [x] HTTP route table comes from the upstream Python front-end source (`share/halogen/tools`); transcribe routes/schemas into `docs/analysis/specs/api.md`.
+- [x] Write `docs/analysis/specs/<binary>.md` per binary using the spec template: entry points · complete flag table (name, type, default, validation, exact error wording) · env-var table · exit codes · verbatim help text · subcommands · observed behaviours · links to evidence files.
+- [x] **Gate:** specs are internally consistent and reviewed (review agent sign-off; ambiguities raised with the user). Specs become the frozen contract for Phase 3. *(all five specs signed off 2026-11-03; flash_serve review approve-with-nits, remaining-specs review PASS — reports in `.tmp/`.)*
 
 ### Phase 3 — Differential test harness (tests before implementation)
 **Objective:** the harness exists and runs **red** against the stub binaries
@@ -335,3 +335,9 @@ the binary/tool that serves it.
 | 2026-11-03 | `packages/halogen-flash-server/default.nix` reconstructed from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734`; fidelity verified by drv-path match | nix-config source path no longer exists on this machine |
 | 2026-11-03 | Flake nixpkgs pin `3ec636362e1816bc2f0888fa0fa2c69f1bc9e504` confirmed to match the live system nixpkgs (`BUILD_ID 26.11.20261023.3ec6363`) | store inspection; keeps the binary cache reusable |
 | 2026-11-03 | Execution focus this round: server component (`flash_serve` → `cc-flash-serve`) first; Phase 1 and the flash_serve REA run in parallel (disjoint file ownership) | user instruction to reverse and rebuild the server component; coordination skill: maximise concurrency |
+| 2026-11-03 | Phase 2 gate passed: all five specs signed off (`flash_serve` `4134bd2`, `halogen-tools` `71bf903`, `halogen-npu` `bf641c7`, `halogen-healthcheck` + `launcher` `47dafa6`, `api` `1de5084`) | review agent sign-off (`.tmp/review-report*.md`) |
+| 2026-11-03 | `halogen-healthcheck` is a 937-byte shell script, not an ELF (R4 wording assumed four ELF binaries); contract derived by transcription | live store inspection; spec notes the discrepancy |
+| 2026-11-03 | HTTP surface lives on port 8731 only; 8730 is the flash_serve line protocol (PING/PONG), 8740 the NPU protocol — §4/§5 wording predates the finding, `api.md` is authoritative | review adjudication 5c |
+| 2026-11-03 | Phase 3 HTTP tests will stub the engine with a fixed fake engine-INFO fixture (makes `/health`, auth gate and §3 error vocabulary testable without GPU) | review adjudication 5d |
+| 2026-11-03 | `.hgn` format caveat accepted (HGN1 layout decompiled, writer unverified); npu XRT-stub-based probes accepted (`libxrt_coreutil.so.2` absent on host) | review adjudications 5a/5b |
+| 2026-11-03 | REA MCP provider gap (`GHIDRA_INSTALL_DIR` unset; `ps`/`JAVA_HOME` missing in MCP env) — workaround: REA CLI with Ghidra 12.1.4; permanent fix at MCP launch env | flash_serve/halogen-tools/halogen-npu analyses all hit it |
