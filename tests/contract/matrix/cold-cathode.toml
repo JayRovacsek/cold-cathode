@@ -1,0 +1,227 @@
+# cold-cathode (launcher) contract matrix — Phase 4 (plan §5).
+#
+# Every entry cites the spec section it proves:
+#   docs/analysis/specs/launcher.md (frozen contract, commit 47dafa6).
+#
+# Ground truth: the spec's "Ground truth (this host, 2026-11-03)" table plus
+# a Phase 4 re-probe of every live case below against both binaries (the
+# reference makeWrapper via the HALOGEN_COLD_CATHODE override and the subject
+# via CARGO_BIN_EXE_cold-cathode), with HALOGEN_OOM_SCORE_ADJ=0 in every
+# case env for determinism (spec open question 3 recommendation).
+#
+# The server-launching modes (all, engine, api, bench, sweep) and the Python
+# tool modes (ppl, niah) are deferred: they spawn the stack or exec the
+# Python front end (side effects, GPU). The `npu` mode is retired and fully
+# encoded.
+#
+# Modes: dispatch | convert | inspect | verify | env.
+
+# ---------------------------------------------------------------------------
+# dispatch — banner rule, retired npu mode, usage, and the `${1:-all}`
+# normalisation; the launching/tool modes are deferred.
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "bogus-mode"
+mode = "dispatch"
+spec = "The dispatch table (anything-else row, entrypoint lines 1822–1823); Ground truth (`bogus` row)"
+args = ["bogus"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "npu-retired"
+mode = "dispatch"
+spec = "The dispatch table (npu row, entrypoint line 1822: retirement line + general usage, exit 2); Ground truth (`npu` row)"
+args = ["npu"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "help-flag"
+mode = "dispatch"
+spec = "The dispatch table (anything-else row: `--help` is not a launcher flag, it takes the usage path); Ground truth (usage text verbatim)"
+args = ["--help"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "version-flag"
+mode = "dispatch"
+spec = "The dispatch table (anything-else row: `--version` is not a launcher flag, it takes the usage path)"
+args = ["--version"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "empty-mode-defaults-to-all"
+mode = "dispatch"
+spec = "The dispatch table (banner rule, lines 1666–1669: `${1:-all}` — an empty argv[1] selects `all`); the `all` path itself is deferred below"
+args = [""]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "all-mode"
+mode = "dispatch"
+spec = "The dispatch table (all row, lines 1674–1720)"
+args = ["all"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "engine-mode"
+mode = "dispatch"
+spec = "The dispatch table (engine row, lines 1017–1059)"
+args = ["engine"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "api-mode"
+mode = "dispatch"
+spec = "The dispatch table (api row, lines 1069–1080: exec serve_api.py)"
+args = ["api"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "bench-mode"
+mode = "dispatch"
+spec = "The dispatch table (bench row, lines 1721–1775)"
+args = ["bench"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "sweep-mode"
+mode = "dispatch"
+spec = "The dispatch table (sweep row, lines 1721–1775)"
+args = ["sweep"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "ppl-mode"
+mode = "dispatch"
+spec = "The dispatch table (ppl row, lines 1810–1819: exec halogen_tools.py ppl)"
+args = ["ppl"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+[[case]]
+name = "niah-mode"
+mode = "dispatch"
+spec = "The dispatch table (niah row, lines 1810–1819: exec halogen_tools.py niah)"
+args = ["niah"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+deferred = true
+reason = "side-effecting-launch"
+
+# ---------------------------------------------------------------------------
+# convert — usage path and input validation (the repack itself is the
+# deferred `all`-class launch; the checks before it are side-effect-free).
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "convert-no-args"
+mode = "convert"
+spec = "The dispatch table (convert row, lines 1776–1784); Exact usage strings (convert usage, three lines, exit 2); Ground truth (`convert` row)"
+args = ["convert"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "convert-missing-out"
+mode = "convert"
+spec = "The dispatch table (convert row, line 1779: empty IN or OUT → convert usage, exit 2)"
+args = ["convert", "/nonexistent.gguf"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "convert-input-missing"
+mode = "convert"
+spec = "The dispatch table (convert row, line 1785: missing IN file → `is not there`, exit 1)"
+args = ["convert", "/nonexistent.gguf", "@tmp/cold-cathode-out.hgn"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "convert-input-not-gguf"
+mode = "convert"
+spec = "The dispatch table (convert row, line 1786: first four bytes not GGUF → `is not a GGUF`, exit 1)"
+args = ["convert", "@fixture/junk.bin", "@tmp/cold-cathode-out.hgn"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+# ---------------------------------------------------------------------------
+# inspect / verify — FILE resolution, the missing-file check, and the exec
+# of halogen-tools (the reference launcher execs the reference tools, the
+# subject execs its sibling tools; both agree byte-for-byte).
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "inspect-default-checkpoint"
+mode = "inspect"
+spec = "The dispatch table (inspect row, lines 1801–1820: FILE defaults to $HALOGEN_CHECKPOINT); Layer 2 item 6 (default_checkpoint); Ground truth (`inspect` row)"
+args = ["inspect"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "inspect-nonexistent"
+mode = "inspect"
+spec = "The dispatch table (inspect row, line 1809: missing FILE → `is not there`, exit 1)"
+args = ["inspect", "/nonexistent.hgn"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "inspect-junk-fixture"
+mode = "inspect"
+spec = "The dispatch table (inspect row, line 1820: exec halogen-tools with the mode and FILE — the tools' `shorter than a header` path, cross-proven in tests/contract/matrix/halogen-tools.toml)"
+args = ["inspect", "@fixture/junk.bin"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "verify-nonexistent"
+mode = "verify"
+spec = "The dispatch table (verify row, line 1809: same as inspect, mode word `verify`)"
+args = ["verify", "/nonexistent.hgn"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+[[case]]
+name = "verify-junk-fixture"
+mode = "verify"
+spec = "The dispatch table (verify row, line 1820: exec halogen-tools verify with FILE — the tools' `FAIL … shorter than a header` path, cross-proven in tests/contract/matrix/halogen-tools.toml)"
+args = ["verify", "@fixture/junk.bin"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0" }
+
+# ---------------------------------------------------------------------------
+# env — the pinned image version and the Layer 2 derivations observable
+# without launching (max-token cap note, YaRN gate and warning).
+# ---------------------------------------------------------------------------
+
+[[case]]
+name = "pinned-image-version"
+mode = "env"
+spec = "Layer 1 (HALOGEN_IMAGE_VERSION 0.18.21 is a hard assignment, not overridable); Ground truth (HALOGEN_IMAGE_VERSION=9.9 row)"
+args = ["bogus"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0", HALOGEN_IMAGE_VERSION = "9.9" }
+
+[[case]]
+name = "yarn-gate-exits-2"
+mode = "env"
+spec = "Layer 2 item 9 (max-token capping note, lines 59–71) + item 10 (YaRN gate, lines 73–77: exit 2 before the banner)"
+args = ["bogus"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0", HALOGEN_CTX = "524288" }
+
+[[case]]
+name = "yarn-set-caps-max-tok"
+mode = "env"
+spec = "Layer 2 item 9 (HALOGEN_CTX > 262144 caps HALOGEN_MAX_TOK at 16384 with the exact note) with HALOGEN_ROPE_YARN set (gate passes, dispatch proceeds)"
+args = ["bogus"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0", HALOGEN_CTX = "524288", HALOGEN_ROPE_YARN = "2" }
+
+[[case]]
+name = "yarn-warning-at-native-ctx"
+mode = "env"
+spec = "Layer 2 item 10 (HALOGEN_ROPE_YARN set with HALOGEN_CTX ≤ 262144 → WARNING line, continues)"
+args = ["bogus"]
+env = { HALOGEN_OOM_SCORE_ADJ = "0", HALOGEN_ROPE_YARN = "4" }
