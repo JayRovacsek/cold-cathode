@@ -897,7 +897,10 @@ fn start_all(eng: &Engine, checkpoint: &str) -> i32 {
     let _ = std::io::stdout().flush();
     let api = resolve_python().map(|python| {
         let tokenizer = env::var("HALOGEN_TOKENIZER").unwrap_or_else(|_| "/tokenizer".to_string());
-        let api_args = eng.api_args(&tokenizer, "0.0.0.0", &format!("127.0.0.1:{}", eng.port));
+        // The script path comes first (entrypoint: `python3 "$_hg_serve_api"
+        // "${API_ARGS[@]}" &`), matching the `api` and `bench` modes.
+        let mut api_args = vec![share_file("serve_api.py").display().to_string()];
+        api_args.extend(eng.api_args(&tokenizer, "0.0.0.0", &format!("127.0.0.1:{}", eng.port)));
         let api_args: Vec<&str> = api_args.iter().map(String::as_str).collect();
         spawn(&python, &api_args, &[])
     });
