@@ -181,6 +181,14 @@ develop shell); `/models` absent.
    nothing on failure; the Rust port must likewise print nothing).
 5. The `WAIT` value gates both the PONG read timeout and (in the upstream
    script) the HTTP request timeout.
+6. **Accepted divergence — `/dev/tcp` service names** (Phase 4 batch-2
+   review, S1): bash resolves a non-numeric port in
+   `/dev/tcp/127.0.0.1/$PORT` via `getservbyname` (e.g. `HALOGEN_PORT=http`
+   connects to port 80); the Rust port accepts numeric ports only and
+   treats any non-numeric value as a connect failure (exit 1). The matrix
+   cannot test the service-name case without pinning and the practical
+   impact is negligible; the divergence is accepted and also documented in
+   the port's `socket_addr` doc comment.
 
 ## Open questions (escalate to the orchestrator)
 

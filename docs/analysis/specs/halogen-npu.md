@@ -25,7 +25,7 @@ Fact markers used throughout: **[RV]** = runtime-verified (probe transcript),
 **Loadability caveat [RV]:** invoked directly on this host the binary exits
 **127** with `error while loading shared libraries: libxrt_coreutil.so.2`.
 All runtime probes below were executed with a purpose-built stub
-`libxrt_coreutil.so.2` (no-op definitions for the 23 imported XRT/`_ITM`
+`libxrt_coreutil.so.2` (no-op definitions for the 22 imported XRT/`_ITM`
 symbols) supplied via `LD_LIBRARY_PATH`, so the ELF loads and the real CLI
 paths execute. XRT-dependent behaviour beyond argument parsing (actual NPU
 execution, engine I/O) is therefore **not** runtime-verified (see
@@ -51,10 +51,10 @@ normalisation for this binary, unlike `flash_serve`).
 | `serve` | yes | `serve` (requires ≥2 further args) |
 | `listen` | yes | `listen` (requires ≥3 further args, i.e. `argc >= 5`) **[D]** |
 | `probe` | yes | `probe` (requires ≥1 further arg) |
-| `convert` | yes | `convert` (requires ≥2 further args) |
+| `convert` | yes | `convert` (requires ≥3 further args, i.e. `argc >= 5`) **[D]** |
 | `flux` | **hidden** | `flux` (requires ≥1 further arg) |
 | `gemma` | **hidden** | `gemma` (requires ≥1 further arg) |
-| `tts` | **hidden** | `tts` (requires ≥3 further args) |
+| `tts` | **hidden** | `tts` (requires ≥4 further args, i.e. `argc >= 6`) **[D]** |
 | `asr` | **hidden** | `asr` (any further arg; `bogus` defaults to the `feat` grammar) |
 | `vis` | **hidden** | `vis encode` only (`vis` alone or `vis decode` → main usage) |
 | `cache` | **hidden** | `cache ecopy` only (`cache` alone or `cache bogus` → cache usage) |
@@ -330,7 +330,7 @@ listed verbatim in the flag tables above and captured in
   `openjdk-21.0.12.1+1`).
 - **The binary cannot execute on this host without AMD XRT**: the upstream
   derivation ignores the missing `libxrt_coreutil.so.2`, so all runtime
-  probes used a stub shared object providing its 23 imported symbols. The
+  probes used a stub shared object providing its 22 imported symbols. The
   stub exercises the real argument-parsing/validation paths (which precede
   XRT use), but XRT-dependent behaviour (device enumeration, engine I/O,
   inference output, `serve`/`listen` success paths) remains unverified —

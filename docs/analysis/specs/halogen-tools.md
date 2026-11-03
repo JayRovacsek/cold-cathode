@@ -148,6 +148,7 @@ Grammar (one-line usage, **[RV]**):
 | Flag | Type | Default | Validation | Exact error wording | Provenance |
 |---|---|---|---|---|---|
 | `FILE` (positional) | string path | — | next argv word verbatim | — | [RV] |
+| `FILE` starting with `-` | — | — | `main` rejects a dash-leading FILE before the verb runs (`ppl --ids y` → FILE is `--ids`) | one-line usage above → exit 2 | [D] (probed live in Phase 4) |
 | `--ids IDS.bin` | string path | — | **required** (no text front end) | `ppl: --ids IDS.bin is required (a text front end is not built yet)` → exit 2 | [RV] |
 | `--chunk N` | integer (`strtol`) | `1024` | `>= 1`; `<= --seq` | `need >= 2 ids and chunk >= 1`; `ppl: --chunk %d is larger than the sequence (--seq %d)` | [D] |
 | `--out NLL.bin` | string path | empty | — | — | [D] |
@@ -176,6 +177,7 @@ temporary file`, `ppl: reference %s: %llu positions, top-%u, sequences of
 | Flag | Type | Default | Validation | Exact error wording | Provenance |
 |---|---|---|---|---|---|
 | `FILE` (positional) | string path | — | next argv word verbatim | — | [RV] |
+| `FILE` starting with `-` | — | — | `main` rejects a dash-leading FILE before the verb runs (`niah --manifest y` → FILE is `--manifest`) | one-line usage above → exit 2 | [D] (probed live in Phase 4) |
 | `--manifest CASES.tsv` | string path | — | **required** | `niah: --manifest CASES.tsv is required (the battery builder is not in the image yet)` → exit 2 | [RV] |
 | `--out DIR` | string path | empty | — | — | [D] |
 | `--max-tok N` | integer (`strtol`) | `0` | per-case cap; per-case `> 65536` rejected | `%s: %d tokens to generate; 0 to 65536` | [D] |
