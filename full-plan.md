@@ -1,6 +1,6 @@
 # Cold Cathode — full implementation plan
 
-> **Status:** approved for execution · written 2026-10-30 · **branch:** `init`
+> **Status:** approved for execution · written 2026-10-30 · updated 2026-11-03 · **branch:** `init`
 > **Source prompt:** `task.md` (this document supersedes it for execution).
 > **Audience:** the long-running agent executing the work. Every rule here is
 > binding; anything left open is resolved by asking the user, never by assuming.
@@ -12,7 +12,7 @@
 **Cold Cathode** is a Rust reimplementation of the `halogen-flash-server`
 binary blobs published by
 [peonist-ai/halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
-(v0.18.18), produced by reverse-engineering the vendored ELF binaries with
+(v0.18.21), produced by reverse-engineering the vendored ELF binaries with
 [REA](https://github.com/morluto/rea) and validated by differential testing
 against the originals.
 
@@ -33,7 +33,7 @@ and outcome** (§5 defines "matches" precisely).
 |---|-------------|--------|
 | R1 | The reimplementation language **MUST be Rust** (stable, from nixpkgs). | task.md |
 | R2 | The repository **MUST be driven by a Nix flake** that provides all development tools and tests. The flake stays **as simple as possible**: a single `nixpkgs` input pinned to `github:nixos/nixpkgs/3ec636362e1816bc2f0888fa0fa2c69f1bc9e504` (the nix-config pin, so the copied halogen derivation's hashes stay valid and its binary cache is reused). Extra Rust-tooling inputs (e.g. `crane`, `rust-bin`) are added only when a documented need arises. | task.md + user guidance |
-| R3 | The flake **offers two packages**: `packages.x86_64-linux.halogen-flash-server` — copied verbatim from `/home/jay/dev/personal/nix-config/packages/other/halogen-flash-server/default.nix` — and `packages.x86_64-linux.cold-cathode`, built from the Rust workspace. | task.md |
+| R3 | The flake **offers two packages**: `packages.x86_64-linux.halogen-flash-server` (v0.18.21) — reconstructed from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734-halogen-flash-server-0.18.21.drv`; the nix-config source path no longer exists on this machine (decision log 2026-11-03) — and `packages.x86_64-linux.cold-cathode`, built from the Rust workspace. | task.md + user guidance |
 | R4 | **Scope:** the four upstream binaries (`flash_serve`, `halogen-tools`, `halogen-npu`, `halogen-healthcheck`) **plus** the `halogen-flash-server` launcher (the makeWrapper'd entrypoint). The Python front-end (`share/halogen/tools`) and data assets (`flash-tune.plan`, `draft-vocab.lists`, `npu/models.txt`) are reused as data, **not rewritten**. | clarification Q1 |
 | R5 | **Definition of "matches":** for every CLI invocation — identical stdout, stderr and exit codes (help text, version output, argument validation, error wording). For the server — identical HTTP API surface (routes, request/response schemas, error bodies). GPU-dependent inference outputs are compared **structurally, not token-for-token**. | clarification Q2 |
 | R6 | **Unsafe Rust** is permitted only where porting C++ patterns demands it: minimised, isolated in dedicated modules behind safe APIs, annotated with `// SAFETY:` comments, and covered by tests. Policy in §7. | task.md |
@@ -99,7 +99,7 @@ this document doubles as the progress ledger.
 **Objective:** the flake exists and builds *before* implementation starts, so
 Rust work never happens outside Nix (R2 ordering requirement).
 - [ ] Write `flake.nix`: single `nixpkgs` input (R2 pin); `packages.x86_64-linux.halogen-flash-server` via `callPackage packages/halogen-flash-server/default.nix`; `packages.x86_64-linux.cold-cathode` via `rustPlatform.buildRustPackage`; `devShells.x86_64-linux.default` with `rustc`, `cargo`, `clippy`, `rustfmt`, `cargo-nextest`, `nixfmt-rfc-style`, and the halogen package on `PATH` (needed by the §5 harness).
-- [ ] Copy `default.nix` from nix-config **verbatim** (no hash edits unless `nix build` proves one stale).
+- [ ] Reconstruct `packages/halogen-flash-server/default.nix` from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734` (v0.18.21); fidelity verified by drv-path match (`nix eval .#halogen-flash-server.drvPath` equals the store drv).
 - [ ] Add `.gitignore` (`.tmp/`, `tmp/`, `target/`).
 - [ ] Create the Cargo workspace skeleton: all six crates compile as stubs (`fn main() {}`); `Cargo.lock` committed.
 - [ ] **Gate:** `nix flake check` green · `nix build .#halogen-flash-server` green · `nix build .#cold-cathode` green (stubs) · `nix develop` provides the full toolchain.
@@ -285,21 +285,23 @@ Sections, in order:
 ## Appendix A — Launcher env contract (from the makeWrapper)
 
 The Rust launcher (`cold-cathode`) must reproduce these defaults, each
-overridable from the environment (`${VAR:-default}` semantics):
+overridable from the environment (`${VAR:-default}` semantics). Table revised
+2026-11-03 to the v0.18.21 makeWrapper (per the store drv):
 
 | Variable | Default | Variable | Default |
 |---|---|---|---|
 | `HALOGEN_ARCH` | `gfx1151` | `HALOGEN_MATMUL_ALGOS` | `1` |
 | `HIP_FORCE_DEV_KERNARG` | `1` | `HALOGEN_MATMUL_BUCKET` | `1` |
-| `HALOGEN_ATTN_FA` | `64` | `HALOGEN_MATMUL_TUNING_FILE` | `$out/opt/halogen/flash-tune.plan` |
-| `HALOGEN_PROMPT_CACHE` | `2` | `HALOGEN_DRAFT_VOCAB_FILE` | `$out/opt/halogen/draft-vocab.lists` |
+| `HALOGEN_ATTN_FA` | `64` | `HALOGEN_MATMUL_TUNING_FILE` | `/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9/opt/halogen/flash-tune.plan` |
+| `HALOGEN_PROMPT_CACHE` | `2` | `HALOGEN_DRAFT_VOCAB_FILE` | `/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9/opt/halogen/draft-vocab.lists` |
 | `HALOGEN_PREFILL_CHUNK` | `32768` | `HALOGEN_TOKENIZER` | `/tokenizer` |
 | `HALOGEN_KV_SLOTS` | `4` | `HALOGEN_PORT` | `8730` |
 | `HALOGEN_CTX` | `262144` | `HALOGEN_BIND` | `127.0.0.1` |
 | `HALOGEN_MAX_TOK` | `32768` | `HALOGEN_API_PORT` | `8731` |
 | `HALOGEN_MAX_TOKENS_CAP` | `65536` | `HALOGEN_QUEUE_TIMEOUT` | `3600` |
-| `HALOGEN_IMAGE_VERSION` | `0.18.18` | `HALOGEN_IMAGE_MODES` | `all engine api bench sweep convert inspect verify ppl niah` |
+| `HALOGEN_IMAGE_VERSION` | `0.18.21` (pinned, not overridable) | `HALOGEN_IMAGE_MODES` | `all engine api bench sweep convert inspect verify ppl niah` |
 | `PYTHONUNBUFFERED` | `1` | `TRANSFORMERS_VERBOSITY` | `error` |
+| `HF_HUB_OFFLINE` | `1` | `_hg_hf` | `${python3-env}/bin/hf` |
 
 The supported mode list (`all engine api bench sweep convert inspect verify
 ppl niah`) defines the launcher's dispatch table; Phase 2 maps each mode to
@@ -310,12 +312,12 @@ the binary/tool that serves it.
 | Fact | Value |
 |---|---|
 | Upstream repo | `github.com/peonist-ai/halogen-flash-server` |
-| Version | `0.18.18` |
-| OCI image digest | `sha256:d6cb2a7d20211da675cd1f104a02f4bf4cb60e29afffbaadf8b0d495d332cc8a` |
+| Version | `0.18.21` |
+| OCI image digest | `sha256:21006e5347f974241fd11e7bac5fc31759a4187f8267f7b52d8b564986b69821` |
 | Upstream licence | Peonist EULA (`lib.licenses.unfreeRedistributable`) |
 | Vendored binaries | `flash_serve`, `halogen-tools`, `halogen-npu`, `halogen-healthcheck` |
 | cold-cathode licence | GPL-3.0 (existing `LICENSE`) |
-| Reference derivation | `/home/jay/dev/personal/nix-config/packages/other/halogen-flash-server/default.nix` |
+| Reference derivation | reconstructed from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734-halogen-flash-server-0.18.21.drv` (nix-config path unavailable as of 2026-11-03) |
 
 ---
 
@@ -329,3 +331,7 @@ the binary/tool that serves it.
 | 2026-10-30 | REA evidence committed to `docs/analysis/` | user clarification Q4 |
 | 2026-10-30 | Flake kept minimal: single nixpkgs input (nix-config pin); extra Rust tooling inputs only when needed | user guidance |
 | 2026-10-30 | Rust binaries keep upstream bin names; launcher installs as `cold-cathode` | §3 naming decision |
+| 2026-11-03 | Target halogen v0.18.21 (newest available); version not pinned to 0.18.18 | user instruction: version doesn't matter, prefer newer |
+| 2026-11-03 | `packages/halogen-flash-server/default.nix` reconstructed from store drv `3mjvnvg02h6xs4lp9qp4ym5pmyz7k734`; fidelity verified by drv-path match | nix-config source path no longer exists on this machine |
+| 2026-11-03 | Flake nixpkgs pin `3ec636362e1816bc2f0888fa0fa2c69f1bc9e504` confirmed to match the live system nixpkgs (`BUILD_ID 26.11.20261023.3ec6363`) | store inspection; keeps the binary cache reusable |
+| 2026-11-03 | Execution focus this round: server component (`flash_serve` → `cc-flash-serve`) first; Phase 1 and the flash_serve REA run in parallel (disjoint file ownership) | user instruction to reverse and rebuild the server component; coordination skill: maximise concurrency |
