@@ -29,6 +29,11 @@
           pkgs.rustfmt
           self.packages.x86_64-linux.halogen-flash-server
         ];
+        # The reference launcher installs as `halogen-flash-server`, not
+        # `cold-cathode`, so the cold-cathode matrix needs the override the
+        # harness looks up (review L2); the other matrices resolve their
+        # stems on PATH.
+        env.HALOGEN_COLD_CATHODE = "${self.packages.x86_64-linux.halogen-flash-server}/bin/halogen-flash-server";
       };
     };
 }
