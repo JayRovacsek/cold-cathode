@@ -2,3 +2,7 @@
 name = "cc-launcher"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "cold-cathode"
+path = "src/main.rs"
