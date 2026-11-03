@@ -1,0 +1,275 @@
+=== PROBE: 
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: --help
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: --version
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: -h
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: -v
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: --bogus-flag
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: help
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: --model x
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: --repack
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: selftest
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: selftest bogus
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: replay
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: serve
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: listen
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: probe
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]
+
+=== PROBE: convert
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]
+
+=== PROBE: cache
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu cache ecopy IN OUT CAP
+
+=== PROBE: cache bogus
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu cache ecopy IN OUT CAP
+
+=== PROBE: cache ecopy
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu cache ecopy IN OUT CAP
+
+=== PROBE: flux
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu flux noise SEED RES OUT | taef2 TAEF2 Z H W OUT_RGB [OUT_F32] | dit DEVDIR WEIGHTS RES STEP X CTX OUT [REPS] | image DEVDIR WEIGHTS RES SEED CTX OUT_RGB [OUT_LATENTS] [REPS] | enc TAEF2 RGB W H OUT_Z | edit DEVDIR WEIGHTS SIZE SEED CTX OUT_RGB [options]
+
+=== PROBE: flux bogus
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu flux noise SEED RES OUT | taef2 TAEF2 Z H W OUT_RGB [OUT_F32] | dit DEVDIR WEIGHTS RES STEP X CTX OUT [REPS] | image DEVDIR WEIGHTS RES SEED CTX OUT_RGB [OUT_LATENTS] [REPS] | enc TAEF2 RGB W H OUT_Z | edit DEVDIR WEIGHTS SIZE SEED CTX OUT_RGB [options]
+
+=== PROBE: flux noise
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu flux noise SEED RES OUT | taef2 TAEF2 Z H W OUT_RGB [OUT_F32] | dit DEVDIR WEIGHTS RES STEP X CTX OUT [REPS] | image DEVDIR WEIGHTS RES SEED CTX OUT_RGB [OUT_LATENTS] [REPS] | enc TAEF2 RGB W H OUT_Z | edit DEVDIR WEIGHTS SIZE SEED CTX OUT_RGB [options]
+
+=== PROBE: gemma
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu gemma DEVDIR WEIGHTS IDS OUT [REPS [BATCH [MASK|- [SOFT|- [IMG|- [AUD]]]]]]
+
+=== PROBE: gemma a
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu gemma DEVDIR WEIGHTS IDS OUT [REPS [BATCH [MASK|- [SOFT|- [IMG|- [AUD]]]]]]
+
+=== PROBE: tts
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu tts SET MODEL REQS OUT [--tf] [--stream N] [--threads N] [--greedy] [--reps N]
+
+=== PROBE: tts a b
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu tts SET MODEL REQS OUT [--tf] [--stream N] [--threads N] [--greedy] [--reps N]
+
+=== PROBE: tts a b c
+exit=2
+--- stdout:
+--- stderr:
+usage: halogen-npu tts SET MODEL REQS OUT [--tf] [--stream N] [--threads N] [--greedy] [--reps N]
+
+=== PROBE: vis
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: vis bogus
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: vis encode
+exit=2
+--- stdout:
+--- stderr:
+usage: vis encode DEVDIR WEIGHTS IN.rgb H W OUT.f32 [REPS]
+
+=== PROBE: asr
+exit=2
+--- stdout:
+--- stderr:
+usage: asr feat IN.wav OUTDIR [STEM.safetensors [PREFIX]]
+
+=== PROBE: asr bogus
+exit=2
+--- stdout:
+--- stderr:
+usage: asr feat IN.wav OUTDIR [STEM.safetensors [PREFIX]]
+
+=== PROBE: asr feat
+exit=2
+--- stdout:
+--- stderr:
+usage: asr feat IN.wav OUTDIR [STEM.safetensors [PREFIX]]
+
+=== PROBE: edit
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: enc
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: /nonexistent
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: probe /nonexistent
+exit=2
+--- stdout:
+--- stderr:
+halogen-npu: /nonexistent holds no config.json (a Hugging Face checkpoint directory); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)
+
+=== PROBE: convert /nonexistent
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]
+
+=== PROBE: convert /nonexistent /nonexistent /nonexistent
+exit=2
+--- stdout:
+--- stderr:
+halogen-npu: /nonexistent holds no config.json (a Hugging Face checkpoint directory); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)
+
+=== PROBE: serve /nonexistent /nonexistent
+exit=1
+--- stdout:
+--- stderr:
+halogen-npu: cannot open /nonexistent/devices.hnpm
+
+=== PROBE: listen /nonexistent /nonexistent 127.0.0.1:9999
+exit=1
+--- stdout:
+--- stderr:
+halogen-npu: cannot open /nonexistent/devices.hnpm
+
+=== PROBE: replay /nonexistent
+exit=1
+--- stdout:
+--- stderr:
+halogen-npu: cannot open /nonexistent/replay.hnpm
+
+=== PROBE: renamed binary (argv[0]=.tmp/renamed-bin), no args
+exit=1
+--- stdout:
+--- stderr:
+usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]
+
+=== PROBE: probe .tmp/fake-model (config.json = {})
+exit=2
+--- stdout:
+--- stderr:
+halogen-npu: .tmp/fake-model is a unknown checkpoint (model_type unknown); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)
+
+=== PROBE: probe .tmp/fake-model (config.json model_type=qwen3_dense)
+exit=2
+--- stdout:
+--- stderr:
+halogen-npu: .tmp/fake-model is a qwen3_dense checkpoint (model_type qwen3_dense); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)
+
+=== PROBE: probe .tmp/fake-model (config.json model_type=qwen35_hybrid)
+exit=2
+--- stdout:
+--- stderr:
+halogen-npu: .tmp/fake-model is a qwen35_hybrid checkpoint (model_type qwen35_hybrid); the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)

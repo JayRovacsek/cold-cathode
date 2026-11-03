@@ -1,0 +1,38 @@
+{
+  "generated": "2026-11-03",
+  "tool": "rea-agents 6.8.0 CLI decompile-all",
+  "provider": {
+    "id": "ghidra",
+    "name": "Ghidra",
+    "version": "12.1.4"
+  },
+  "analysis_profile_digest": "ae80ece8c83379eddabbdf379bbffca5da84c7df7fa7c159f45fa810468f85d9",
+  "target_sha256": "2bdd4ffeb9c6cd23a5c37a3e656d192bda83a565f598b5ff015a75bc3b132786",
+  "total_functions": 3720,
+  "exported": [
+    {
+      "address": "0x13c2f0",
+      "ghidra_name": "FUN_0013c2f0",
+      "exported_as": "main-FUN_0013c2f0.c",
+      "body_sha256": "f4b5f43a0d17aa270505b4a8429606ae3b587c2a0dbad91710921021fceb0a26"
+    },
+    {
+      "address": "0x13cc30",
+      "ghidra_name": "entry",
+      "exported_as": "entry-0x13cc30.c",
+      "body_sha256": "7fb5420e5501e0f6d22954fa26193e7fd5ce11ec56e1dfb159280b51c82cc25c"
+    },
+    {
+      "address": "0x170740",
+      "ghidra_name": "FUN_00170740",
+      "exported_as": "cli-dispatch-FUN_00170740.c",
+      "body_sha256": "fe6cd46b9b2ea9eecb221baff179acfdbde4d1ac74dfb33963a57b3a0198b440"
+    },
+    {
+      "address": "0x22f180",
+      "ghidra_name": "FUN_0022f180",
+      "exported_as": "probe-convert-FUN_0022f180.c",
+      "body_sha256": "14bbb92f5dcea478d7c5d230cb203abab73a2130664eca432136866560447d13"
+    }
+  ]
+}
