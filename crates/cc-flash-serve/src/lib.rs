@@ -10,9 +10,11 @@
 
 #![warn(unsafe_op_in_unsafe_fn)]
 
+pub mod forward;
 pub mod gguf;
 pub mod hgn;
 pub mod protocol;
+pub mod sampling;
 
 use std::env;
 use std::fs;
@@ -253,7 +255,7 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     // weight load is deferred (repack-only) while the reference's server
     // reads GGUFs directly.
     log_info(&format!("halogen: loading checkpoint {}", opts.ck));
-    let info = match hgn::load(&opts.ck) {
+    let (info, checkpoint) = match hgn::load(&opts.ck) {
         Ok(ck) => {
             log_info(&format!(
                 "halogen: {} tensors, {} bytes mapped",
@@ -262,11 +264,16 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
             if let Some(anomaly) = ck.payload_anomaly(&opts.ck) {
                 log_warn(&format!("halogen: {anomaly}"));
             }
-            protocol::EngineInfo::from_serve_args(&opts)
+            // The loaded checkpoint is shared with the protocol (Arc) so
+            // GEN requests can answer from it via `forward`/`sampling`.
+            (
+                protocol::EngineInfo::from_serve_args(&opts),
+                Some(std::sync::Arc::new(ck)),
+            )
         }
         Err(err) if hgn::format_of(&opts.ck) == Some("gguf") => {
             log_warn(&format!("halogen: {err}"));
-            protocol::EngineInfo::from_serve_args(&opts)
+            (protocol::EngineInfo::from_serve_args(&opts), None)
         }
         Err(err) => {
             eprintln!("{err}");
@@ -275,13 +282,14 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     };
     log_info(&format!("halogen: checkpoint resident, binding {addr}"));
     // Socket setup (spec "Observed behaviours" #7): bind + listen(fd, 64),
-    // then serve the engine's line protocol (PING/INFO, port 8730 per
+    // then serve the engine's line protocol (PING/INFO/GEN, port 8730 per
     // docs/analysis/specs/api.md §1). The protocol itself lives in
-    // `protocol`; the HTTP surface (port 8731) is specified separately and
-    // served by the Python front-end, not this binary.
+    // `protocol` (the loaded checkpoint backs its GEN path through
+    // `forward`/`sampling`); the HTTP surface (port 8731) is specified
+    // separately and served by the Python front-end, not this binary.
     match TcpListener::bind(addr) {
         Ok(listener) => {
-            protocol::serve_forever(&listener, &info);
+            protocol::serve_forever(&listener, &info, checkpoint.as_ref());
             0
         }
         Err(err) => {

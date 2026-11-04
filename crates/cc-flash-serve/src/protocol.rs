@@ -21,16 +21,31 @@
 //!    answers INFO itself, so the harness can probe a live ported engine
 //!    instead of the fixed fake fixture (decision log 2026-11-03, review
 //!    adjudication 5d).
+//! 4. The `GEN` grammar and the `T`/`D`/`P`/`G`/`C` response lines,
+//!    [`flash_serve-engine.md`](../../../docs/analysis/specs/flash_serve-engine.md)
+//!    §8 (the `GEN` case `bcmp`-verified in the connection-handler
+//!    decompile; the response formats from serve_api.py's parsers —
+//!    `t_line_logprob` :1066–1074, `_done_dict` :1799–1852 instantiated
+//!    through the reference's `D` format string
+//!    [binutils-strings.txt:1620](../../../docs/analysis/evidence/flash_serve/binutils-strings.txt),
+//!    `p_line_progress` :1062–1065 and `g_line` :1337–1348).
 //!
 //! The whole module is pure except for `serve_connection`/`serve_forever`
 //! (which only move bytes) and `EngineInfo::from_serve_args` (which reads
 //! the `--ck` file's 4-byte magic via `hgn::format_of` to report the real
-//! `checkpoint_format`); `handle_line` is unit-testable without a socket.
+//! `checkpoint_format`); `handle_line` is unit-testable without a socket
+//! (its `GEN` path reads the loaded checkpoint through `crate::forward`,
+//! whose stub contract lives there, and samples through
+//! `crate::sampling`).
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
+use crate::forward;
+use crate::sampling::{self, SampleParams};
 use crate::{env_strtod, env_var, fmt_g, hgn, sscanf_ints, ServeArgs};
 
 /// Everything INFO reports that the port can derive from the parsed serve
@@ -158,41 +173,244 @@ pub fn info_line(info: &EngineInfo) -> String {
     )
 }
 
+/// A parsed `GEN` request (spec flash_serve-engine.md §8 grammar,
+/// serve_api.py:1952–1990). The port acts on the core fields plus the
+/// optional `SAMPLE` clause and `PROGRESS` flag; the remaining optional
+/// clauses (`drafter`, `PENALTY`, `SNAP`/`SNAP2`/`SNAP3`, `LEAD3`, `IMG`,
+/// `SCHEMA`, `AFTER`, `ESCAPE`, `TOOLS`, `THINK`, `GUARD`, `AGUARD`,
+/// `SEG`, `AGENT`, `NOSTORE`, `KEEP`, `KEPEND`) belong to subsystems the
+/// port defers (MTP §4, grammar, vision, composable context §5) and are
+/// accepted and ignored — the front-end only emits most of them when the
+/// INFO reply advertises those capabilities, which `info_line` reports
+/// off.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenRequest {
+    /// The front-end's monotonically increasing request id (`req`).
+    pub req: i64,
+    /// Tokens to generate (already clamped by the front-end).
+    pub max_tokens: i64,
+    /// The eos token ids (`n_eos` + list).
+    pub eos: Vec<i64>,
+    /// The prompt token ids (`n_ids` + list).
+    pub ids: Vec<i64>,
+    /// The `SAMPLE %.9g %d %.9g %.9g %d` clause (greedy when absent).
+    pub sample: Option<SampleParams>,
+    /// The `PROGRESS` flag: request `P` progress lines.
+    pub progress: bool,
+}
+
+/// Parse a `GEN` line ([`GenRequest`] for the grammar). `None` when the
+/// core fields (req, max_tokens, eos list, ids list) or a present
+/// `SAMPLE` clause are malformed — the port then closes the connection
+/// rather than guessing (the reference has no error-reply string for
+/// requests it cannot parse).
+pub fn parse_gen(line: &str) -> Option<GenRequest> {
+    let mut words = line.split_whitespace();
+    if words.next()? != "GEN" {
+        return None;
+    }
+    let req = words.next()?.parse::<i64>().ok()?;
+    let max_tokens = words.next()?.parse::<i64>().ok()?;
+    let n_eos = words.next()?.parse::<i64>().ok()?;
+    if max_tokens < 0 || n_eos < 0 {
+        return None;
+    }
+    let eos = count_ids(&mut words, n_eos as usize)?;
+    let n_ids = words.next()?.parse::<i64>().ok()?;
+    if n_ids < 0 {
+        return None;
+    }
+    let ids = count_ids(&mut words, n_ids as usize)?;
+    // Optional clauses in the grammar's emission order: the port acts on
+    // SAMPLE and PROGRESS and ignores the rest (GenRequest docs).
+    let mut sample = None;
+    let mut progress = false;
+    while let Some(word) = words.next() {
+        if word == "SAMPLE" {
+            let fields = [
+                words.next()?,
+                words.next()?,
+                words.next()?,
+                words.next()?,
+                words.next()?,
+            ];
+            sample = Some(SampleParams::parse_sample(fields)?);
+        } else if word == "PROGRESS" {
+            progress = true;
+        }
+    }
+    Some(GenRequest {
+        req,
+        max_tokens,
+        eos,
+        ids,
+        sample,
+        progress,
+    })
+}
+
+/// Read exactly `count` whitespace-separated token ids (`None` when the
+/// line ends early or a field is not an integer).
+fn count_ids<'a>(words: &mut impl Iterator<Item = &'a str>, count: usize) -> Option<Vec<i64>> {
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(words.next()?.parse::<i64>().ok()?);
+    }
+    Some(ids)
+}
+
+/// The `D` (done) line, field-for-field the reference's format string
+/// ([binutils-strings.txt:1620](../../../docs/analysis/evidence/flash_serve/binutils-strings.txt),
+/// field names per serve_api `_done_dict` :1799–1852):
+///
+/// ```text
+/// D %ld %s %d %d %.1f %.1f %d %ld %ld %d %ld %ld %ld %ld %d %d %d %d %d %d %d %d %d %d %.1f %ld %ld %ld %ld %ld %ld %ld
+/// ```
+///
+/// The port fills `req`, `reason`, `n_prompt`, `n_gen`, `decode_ms` and
+/// `max_tokens` from the request and its output; `prefill_ms` is 0.0 (the
+/// stub performs no separate prefill pass) and the drafter, speculative,
+/// PLD, composable, think, disk, draft-vocab and grammar counters are 0 —
+/// their subsystems are the deferred phases, matching the honest zeros
+/// `info_line` reports.
+fn done_line(
+    req: i64,
+    reason: &str,
+    n_prompt: i64,
+    n_gen: usize,
+    max_tokens: i64,
+    decode_ms: f64,
+) -> String {
+    format!(
+        "D {req} {reason} {n_prompt} {n_gen} 0.0 {decode_ms:.1} \
+         0 0 0 0 0 0 0 0 0 0 {max_tokens} 0 0 0 0 0 0 0 0.0 0 0 0 0 0 0 0"
+    )
+}
+
+/// Run one parsed `GEN` request against the loaded checkpoint and frame
+/// the full streamed reply: the optional `P` progress line, one `T` line
+/// per generated token and the closing `D` line (all newline-separated, no
+/// trailing newline — `serve_connection` writes the terminator).
+///
+/// The generation loop is the port's forward entry point plus sampling
+/// layer (`crate::forward`, `crate::sampling`): it draws up to
+/// `min(max_tokens, ctx − prompt)` tokens — the reference reserves
+/// prompt plus max_tokens inside the context (spec §3 banner) — stopping
+/// early with reason `stop` when a drawn token is in the request's eos
+/// set and with reason `length` when the budget runs out. A prompt longer
+/// than `--ctx` answers the reference's empty-message refusal shape
+/// (`D <req> error …`; serve_api `engine_refusal` :1350–1363 renders its
+/// documented wording from the missing message). The `G` grammar line is
+/// only emitted by the reference's grammar subsystem (off here, per
+/// `info_line`), and `C` lines answer `CSTAT`, not `GEN`.
+fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Checkpoint) -> String {
+    let n_prompt = request.ids.len() as i64;
+    if n_prompt > info.ctx {
+        return format!("D {} error {n_prompt} 0 0.0 0.0", request.req);
+    }
+    let params = request.sample.clone().unwrap_or_else(SampleParams::greedy);
+    let limit = request.max_tokens.min(info.ctx - n_prompt) as usize;
+    let forward = forward::Forward::new(checkpoint);
+    let mut rng = sampling::Rng::new(params.seed);
+    let mut lines = Vec::with_capacity(limit + 2);
+    if request.progress {
+        // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
+        // p_line_progress :1062–1065): the stub's prefill is the prompt
+        // itself — processed/total carry its length, cache and time 0.
+        lines.push(format!("P {} {n_prompt} {n_prompt} 0 0", request.req));
+    }
+    let started = Instant::now();
+    let mut context = request.ids.clone();
+    let mut n_gen = 0usize;
+    let mut reason = "length";
+    for _ in 0..limit {
+        let logits = forward.logits(&context);
+        let Some(token) = sampling::sample(&logits, &params, &mut rng) else {
+            break;
+        };
+        // `T <req> <token> <logprob>` (serve_api t_line_logprob
+        // :1066–1074); no top-k pairs — the port requests none.
+        let token_id = token.index as i64;
+        lines.push(format!(
+            "T {} {} {}",
+            request.req,
+            token.index,
+            fmt_g(token.logprob)
+        ));
+        context.push(token_id);
+        n_gen += 1;
+        if request.eos.contains(&token_id) {
+            reason = "stop";
+            break;
+        }
+    }
+    let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+    lines.push(done_line(
+        request.req,
+        reason,
+        n_prompt,
+        n_gen,
+        limit as i64,
+        decode_ms,
+    ));
+    lines.join("\n")
+}
+
 /// Answer one protocol line; `Some(reply)` (without the trailing newline)
-/// is written back and the connection stays open, `None` closes it.
+/// is written back and the connection stays open, `None` closes it. A
+/// `GEN` reply carries the whole streamed response (`T` lines plus the
+/// `D` line, newline-separated) in one write.
 ///
 /// Commands, per the reference's verb set (the `<$PING`/`<$INFO` compare
-/// strings, binutils-strings.txt:282377–282378, and serve_api's own verb
-/// usage: `PING`, `INFO`, `GEN`, `HREL`, `VOCAB`, `MERGES`):
+/// strings, binutils-strings.txt:282377–282378, the `GEN` case
+/// `bcmp`-verified in the connection-handler decompile, spec
+/// flash_serve-engine.md §8, and serve_api's own verb usage: `PING`,
+/// `INFO`, `GEN`, `HREL`, `VOCAB`, `MERGES`):
 ///
 /// * `PING` → `PONG` (serve_api `probe_live` accepts only `PONG`).
 /// * `INFO` → the capability line (see [`info_line`]).
-/// * `GEN …` — deferred, not faked: the reference answers from loaded
-///   weights and the port's checkpoint load is the GPU-gated deferred path.
-///   The port closes the connection instead of returning an error line:
-///   serve_api's `_demux` (:1659–1679) only consumes lines starting with
-///   `T`/`D`/`P`/`G`/`C`, so an error line would be ignored and the
-///   request would hang until timeout, while EOF ends every stream cleanly
-///   (`_demux` pushes `None`, failing the request immediately).
+/// * `GEN …` → the generation response (see [`gen_response`]): the
+///   request grammar is parsed ([`parse_gen`]), the forward entry point
+///   and sampling layer produce the tokens from `checkpoint`, and the
+///   reply is framed as the `T`/`P`/`D` lines serve_api's `_demux`
+///   (:1659–1679) consumes. With `checkpoint == None` (a GGUF served
+///   repack-only — the port's deferred weight load) the previous
+///   deferred behaviour stands and the connection closes; a malformed
+///   `GEN` line closes too.
 /// * `HREL`, `VOCAB`, `MERGES` and every unknown verb → close. The
 ///   reference has no error-reply string for unrecognised verbs (it logs
 ///   `queued connection closed without a request`, :3761, when a connection
 ///   dies without one), so closing is the evidenced default; the front-end
 ///   reconnects via `_ensure` (:1774–1779).
-pub fn handle_line(request: &str, info: &EngineInfo) -> Option<String> {
+pub fn handle_line(
+    request: &str,
+    info: &EngineInfo,
+    checkpoint: Option<&hgn::Checkpoint>,
+) -> Option<String> {
     let line = request.trim_end_matches(['\r', '\n']);
     let verb = line.split_whitespace().next()?;
     match verb {
         "PING" => Some("PONG".to_string()),
         "INFO" => Some(info_line(info)),
+        "GEN" => {
+            let request = parse_gen(line)?;
+            let checkpoint = checkpoint?;
+            Some(gen_response(&request, info, checkpoint))
+        }
         _ => None,
     }
 }
 
 /// Serve one connection to completion: answer lines until the protocol
 /// closes it (or EOF). The reply framing is one line per request with a
-/// trailing `\n`, matching the reference's line-based protocol.
-pub fn serve_connection(stream: TcpStream, info: &EngineInfo) {
+/// trailing `\n` (a `GEN` reply is the multi-line streamed response,
+/// written as one buffer); `checkpoint` is the loaded checkpoint the
+/// `GEN` path reads, `None` when the serve path has no resident weights.
+pub fn serve_connection(
+    stream: TcpStream,
+    info: &EngineInfo,
+    checkpoint: Option<&hgn::Checkpoint>,
+) {
     let mut writer = match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return,
@@ -204,7 +422,7 @@ pub fn serve_connection(stream: TcpStream, info: &EngineInfo) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let Some(reply) = handle_line(&line, info) else {
+        let Some(reply) = handle_line(&line, info, checkpoint) else {
             break;
         };
         if writer.write_all(reply.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
@@ -242,7 +460,9 @@ pub fn is_transient_accept_error(kind: ErrorKind) -> bool {
 /// The accept loop behind `run_serve`: bind succeeded, so answer every
 /// connection on its own thread (the reference serves `--slots` concurrent
 /// sessions; one thread per connection keeps a persistent probe connection
-/// from blocking new clients). Blocks until `incoming()` fails fatally.
+/// from blocking new clients). `checkpoint` (shared via `Arc`) is the
+/// loaded checkpoint the `GEN` path reads; `None` when the serve path has
+/// no resident weights. Blocks until `incoming()` fails fatally.
 ///
 /// Transient accept errors must not end the loop: on Linux `accept()`
 /// returns `ECONNABORTED` when a peer resets a queued connection before
@@ -257,7 +477,11 @@ pub fn is_transient_accept_error(kind: ErrorKind) -> bool {
 /// exited silently — the observed symptom was the 66 GB weight `Vec`
 /// disappearing with no panic or error line after the front-end's first
 /// reconnect cycle.
-pub fn serve_forever(listener: &TcpListener, info: &EngineInfo) {
+pub fn serve_forever(
+    listener: &TcpListener,
+    info: &EngineInfo,
+    checkpoint: Option<&Arc<hgn::Checkpoint>>,
+) {
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(stream) => stream,
@@ -265,7 +489,8 @@ pub fn serve_forever(listener: &TcpListener, info: &EngineInfo) {
             Err(_) => break,
         };
         let info = info.clone();
-        thread::spawn(move || serve_connection(stream, &info));
+        let checkpoint = checkpoint.cloned();
+        thread::spawn(move || serve_connection(stream, &info, checkpoint.as_deref()));
     }
 }
 
@@ -290,15 +515,41 @@ mod tests {
         }
     }
 
+    /// A small `.hgn` fixture whose only tensor is `embed_tokens.weight`
+    /// with `dims [vocab, 4]` (layout per `hgn::TensorEntry`), giving the
+    /// forward stub a checkpoint-derived vocab of `vocab`.
+    fn fixture_checkpoint(vocab: u64) -> hgn::Checkpoint {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HGN1");
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // entry_count
+        bytes.extend_from_slice(&104u64.to_le_bytes()); // table_offset
+        bytes.extend_from_slice(&264u64.to_le_bytes()); // data_offset
+        bytes.extend_from_slice(&264u64.to_le_bytes()); // declared size
+        bytes.extend_from_slice(&[0u8; 64]); // model_id
+        let mut entry = [0u8; hgn::ENTRY_BYTES];
+        entry[..19].copy_from_slice(b"embed_tokens.weight");
+        entry[96..100].copy_from_slice(&0u32.to_le_bytes()); // dtype
+        entry[100..104].copy_from_slice(&2u32.to_le_bytes()); // kind
+        entry[104..112].copy_from_slice(&vocab.to_le_bytes());
+        entry[112..120].copy_from_slice(&4u64.to_le_bytes());
+        entry[136..144].copy_from_slice(&264u64.to_le_bytes());
+        bytes.extend_from_slice(&entry);
+        hgn::load_prefix("ccfs-protocol-fixture.hgn", bytes, 264).expect("fixture loads")
+    }
+
     #[test]
     fn ping_answers_pong() {
         let info = fixture_info();
-        assert_eq!(handle_line("PING", &info).as_deref(), Some("PONG"));
-        assert_eq!(handle_line("PING\n", &info).as_deref(), Some("PONG"));
-        assert_eq!(handle_line("PING\r\n", &info).as_deref(), Some("PONG"));
+        assert_eq!(handle_line("PING", &info, None).as_deref(), Some("PONG"));
+        assert_eq!(handle_line("PING\n", &info, None).as_deref(), Some("PONG"));
+        assert_eq!(
+            handle_line("PING\r\n", &info, None).as_deref(),
+            Some("PONG")
+        );
         // The reference compares the verb exactly (serve_api sends `PING\n`).
-        assert_eq!(handle_line("ping", &info), None);
-        assert_eq!(handle_line("PINGO", &info), None);
+        assert_eq!(handle_line("ping", &info, None), None);
+        assert_eq!(handle_line("PINGO", &info, None), None);
     }
 
     #[test]
@@ -307,7 +558,7 @@ mod tests {
         // (binutils-strings.txt:3752) produces for the fixture state;
         // token 17 (the `%s`) carries the version.
         let info = fixture_info();
-        let reply = handle_line("INFO", &info).expect("INFO answers");
+        let reply = handle_line("INFO", &info, None).expect("INFO answers");
         assert_eq!(
             reply,
             "I 0 0 32768 0 8192 0 0 0 0 4 32768 1 1 1 0 0 0.18.21 0 0 hgn 0 0 0 0 0 - 2048 0 bf16 0 0"
@@ -368,18 +619,193 @@ mod tests {
     }
 
     #[test]
-    fn gen_and_unknown_verbs_close_the_connection() {
-        // GEN is deferred (real inference, GPU-gated): close, never fake.
+    fn gen_without_resident_weights_closes() {
+        // The GGUF serve path (repack-only, no resident weights) keeps the
+        // deferred behaviour: close, never fake.
         let info = fixture_info();
-        assert_eq!(handle_line("GEN {\"prompt\":\"hi\"}", &info), None);
-        assert_eq!(handle_line("GEN", &info), None);
-        // The rest of the generation protocol and unknown verbs close too.
-        assert_eq!(handle_line("HREL 1", &info), None);
-        assert_eq!(handle_line("VOCAB", &info), None);
-        assert_eq!(handle_line("MERGES 2 aGk=", &info), None);
-        assert_eq!(handle_line("BOGUS", &info), None);
-        assert_eq!(handle_line("", &info), None);
-        assert_eq!(handle_line("\n", &info), None);
+        assert_eq!(handle_line("GEN 1 1 0 0", &info, None), None);
+    }
+
+    #[test]
+    fn unknown_verbs_close_the_connection() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        assert_eq!(handle_line("HREL 1", &info, Some(&ck)), None);
+        assert_eq!(handle_line("VOCAB", &info, Some(&ck)), None);
+        assert_eq!(handle_line("MERGES 2 aGk=", &info, Some(&ck)), None);
+        assert_eq!(handle_line("BOGUS", &info, Some(&ck)), None);
+        assert_eq!(handle_line("", &info, Some(&ck)), None);
+        assert_eq!(handle_line("\n", &info, Some(&ck)), None);
+    }
+
+    #[test]
+    fn gen_request_parses_the_reference_grammar() {
+        // The exact shape serve_api.py:1952–1990 emits: core fields, then
+        // the drafter, SAMPLE clause, penalty and PROGRESS flag.
+        let request = parse_gen(
+            "GEN 12 8 2 151645 151643 3 1 2 3 7 SAMPLE 0.7 20 0.95 0.05 42 PENALTY 1.1 0.6 1.05 PROGRESS",
+        )
+        .expect("parses");
+        assert_eq!(request.req, 12);
+        assert_eq!(request.max_tokens, 8);
+        assert_eq!(request.eos, vec![151645, 151643]);
+        assert_eq!(request.ids, vec![1, 2, 3]);
+        assert_eq!(
+            request.sample,
+            Some(SampleParams {
+                temperature: 0.7,
+                top_k: 20,
+                top_p: 0.95,
+                min_p: 0.05,
+                seed: 42,
+            })
+        );
+        assert!(request.progress);
+        // The bare core (no optional clauses) parses too.
+        let request = parse_gen("GEN 1 1 0 0").expect("minimal GEN parses");
+        assert_eq!(request.req, 1);
+        assert_eq!(request.max_tokens, 1);
+        assert!(request.eos.is_empty());
+        assert!(request.ids.is_empty());
+        assert_eq!(request.sample, None);
+        assert!(!request.progress);
+    }
+
+    #[test]
+    fn malformed_gen_lines_close() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        for line in [
+            "GEN",
+            "GEN {\"prompt\":\"hi\"}",
+            "GEN x 1 0 0",
+            "GEN 1",
+            "GEN 1 5",
+            "GEN 1 5 0",
+            "GEN 1 5 1 0",
+            "GEN 1 -1 0 0",
+            "GEN 1 5 -1 0",
+            // A malformed SAMPLE clause (temperature > 2) fails the request.
+            "GEN 1 1 0 0 SAMPLE 3 20 0.95 0.05 42",
+        ] {
+            assert_eq!(
+                handle_line(line, &info, Some(&ck)),
+                None,
+                "{line} must close"
+            );
+        }
+    }
+
+    #[test]
+    fn gen_reply_streams_t_lines_and_a_done_line() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let reply = handle_line("GEN 7 3 0 2 10 20", &info, Some(&ck)).expect("GEN answers");
+        let lines: Vec<&str> = reply.split('\n').collect();
+        assert_eq!(lines.len(), 4, "3 T lines + the D line: {reply:?}");
+        // The T lines carry the greedy tokens the forward stub produces,
+        // each with the sampling layer's logprob.
+        let mut context = vec![10, 20];
+        for line in &lines[..3] {
+            let logits = forward.logits(&context);
+            let expected =
+                sampling::sample(&logits, &SampleParams::greedy(), &mut sampling::Rng::new(0))
+                    .expect("sampled");
+            assert_eq!(
+                *line,
+                format!("T 7 {} {}", expected.index, fmt_g(expected.logprob))
+            );
+            context.push(expected.index as i64);
+        }
+        // The D line matches the reference's 33-token format string
+        // (binutils-strings.txt:1620, fields per serve_api _done_dict).
+        let done: Vec<&str> = lines[3].split_whitespace().collect();
+        assert_eq!(done.len(), 33, "D line {reply:?}");
+        assert_eq!(done[0], "D");
+        assert_eq!(done[1], "7"); // req
+        assert_eq!(done[2], "length"); // reason: budget exhausted, no eos
+        assert_eq!(done[3], "2"); // n_prompt
+        assert_eq!(done[4], "3"); // n_gen
+        assert_eq!(done[17], "3"); // max_tokens
+    }
+
+    #[test]
+    fn gen_reply_stops_at_an_eos_token() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let logits = forward.logits(&[10, 20]);
+        let first_token =
+            sampling::sample(&logits, &SampleParams::greedy(), &mut sampling::Rng::new(0))
+                .expect("sampled")
+                .index;
+        let line = format!("GEN 1 5 1 {first_token} 2 10 20");
+        let reply = handle_line(&line, &info, Some(&ck)).expect("GEN answers");
+        let lines: Vec<&str> = reply.split('\n').collect();
+        assert_eq!(lines.len(), 2, "one T line then the D line: {reply:?}");
+        let done: Vec<&str> = lines[1].split_whitespace().collect();
+        assert_eq!(done[2], "stop"); // reason: eos drawn
+        assert_eq!(done[4], "1"); // n_gen
+    }
+
+    #[test]
+    fn gen_reply_reports_a_progress_line_when_requested() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let reply = handle_line("GEN 1 1 0 0 PROGRESS", &info, Some(&ck)).expect("GEN answers");
+        let lines: Vec<&str> = reply.split('\n').collect();
+        assert_eq!(lines.len(), 3, "P + T + D: {reply:?}");
+        // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
+        // p_line_progress :1062–1065).
+        assert_eq!(lines[0], "P 1 0 0 0 0");
+    }
+
+    #[test]
+    fn gen_reply_refuses_a_prompt_over_the_context() {
+        // The reference reserves prompt + max_tokens inside the context;
+        // a longer prompt answers the empty-message refusal shape
+        // (serve_api engine_refusal :1350–1363 renders its documented
+        // wording from the missing message).
+        let info = EngineInfo {
+            ctx: 16,
+            slot_ctx: 16,
+            ..fixture_info()
+        };
+        let ck = fixture_checkpoint(8);
+        let ids = (0..17).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+        let reply =
+            handle_line(&format!("GEN 4 1 0 17 {ids}"), &info, Some(&ck)).expect("GEN answers");
+        let parts: Vec<&str> = reply.split_whitespace().collect();
+        assert_eq!(parts.len(), 7, "refusal {reply:?}");
+        assert_eq!(parts[0], "D");
+        assert_eq!(parts[1], "4"); // req
+        assert_eq!(parts[2], "error");
+        assert_eq!(parts[3], "17"); // n_prompt
+        assert_eq!(parts[4], "0"); // n_gen
+    }
+
+    #[test]
+    fn gen_reply_honours_the_sample_clause() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let reply = handle_line("GEN 2 1 0 1 5 SAMPLE 0.7 20 0.95 0.05 42", &info, Some(&ck))
+            .expect("GEN answers");
+        let lines: Vec<&str> = reply.split('\n').collect();
+        // The sampled token matches the sampling layer run directly with
+        // the clause's seed (the port's determinism contract).
+        let expected = sampling::sample(
+            &forward.logits(&[5]),
+            &SampleParams::new(0.7, 20, 0.95, 0.05, 42).expect("valid"),
+            &mut sampling::Rng::new(42),
+        )
+        .expect("sampled");
+        assert_eq!(
+            lines[0],
+            format!("T 2 {} {}", expected.index, fmt_g(expected.logprob))
+        );
+        assert_eq!(lines[1].split_whitespace().nth(2), Some("length"));
     }
 
     #[test]
@@ -455,7 +881,7 @@ mod tests {
         let expected_info = info_line(&info);
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        thread::spawn(move || serve_forever(&listener, &info));
+        thread::spawn(move || serve_forever(&listener, &info, None));
         let mut client = TcpStream::connect(addr).expect("connect");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -469,6 +895,30 @@ mod tests {
         reader.read_line(&mut info_reply).expect("read INFO reply");
         assert_eq!(info_reply, format!("{expected_info}\n"));
         // The client dropping below gives the server thread EOF.
+        drop(client);
+    }
+
+    #[test]
+    fn serve_connection_streams_a_gen_reply_over_a_socket() {
+        // The wired-up GEN path: one GEN request answers its whole streamed
+        // response (T line + D line) on the same connection.
+        let info = fixture_info();
+        let checkpoint = Arc::new(fixture_checkpoint(8));
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || serve_forever(&listener, &info, Some(&checkpoint)));
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"GEN 1 1 0 0\n").expect("write");
+        let mut reader = BufReader::new(client.try_clone().expect("clone"));
+        let mut token_line = String::new();
+        reader.read_line(&mut token_line).expect("read T line");
+        assert!(token_line.starts_with("T 1 "), "{token_line:?}");
+        let mut done_line = String::new();
+        reader.read_line(&mut done_line).expect("read D line");
+        assert!(done_line.starts_with("D 1 length "), "{done_line:?}");
         drop(client);
     }
 }
