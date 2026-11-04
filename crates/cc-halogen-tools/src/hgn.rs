@@ -61,9 +61,10 @@ impl TensorEntry {
         cstr(&self.raw[0..96])
     }
 
-    /// Quantisation type code (`u32` @96; the reference's dtype→name table
-    /// `PTR_DAT_020baa68` is still a spec gap — real checkpoints carry at
-    /// least codes 0 (f32), 5 and 24, plus 0x10 per `FUN_020bdc70`).
+    /// Quantisation type code (`u32` @96; names resolved from the
+    /// reference's `PTR_DAT_020baa68` table — see `dtype_name`; real
+    /// checkpoints carry codes 0 (bf16), 5 (q4c) and 24 (q6g64), plus
+    /// 0x10 (ht) per `FUN_020bdc70`).
     pub fn dtype(&self) -> u32 {
         self.u32_at(96)
     }
@@ -251,14 +252,33 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
-/// Dtype code → name; the reference resolves names from a table
-/// (`PTR_DAT_020baa68`) whose full contents are unverified, so only the
-/// common codes are named and the rest render as `t<code>`.
+/// Dtype code → name, from the reference's `PTR_DAT_020baa68` table
+/// (dumped from `.rodata`, spec `flash_serve-engine.md` §1). The NULL
+/// slots (codes 9, 17, 18, 19 — matching the validity mask `0x1f1fdff`)
+/// and any code beyond the table render as `t<code>`.
 fn dtype_name(code: u32) -> String {
     match code {
-        0 => "f32",
-        1 => "f16",
-        2 => "bf16",
+        0 => "bf16",
+        1 => "f32",
+        2 => "f16",
+        3 => "i32",
+        4 => "i64",
+        5 => "q4c",
+        6 => "fp8r",
+        7 => "q8g64",
+        8 => "i4l",
+        10 => "fp8g",
+        11 => "q8s32",
+        12 => "q6k",
+        13 => "iq4nl",
+        14 => "q4a",
+        15 => "q5a",
+        16 => "ht",
+        20 => "q8_0",
+        21 => "q5_0",
+        22 => "q5_1",
+        23 => "i4r",
+        24 => "q6g64",
         _ => return format!("t{code}"),
     }
     .to_string()
@@ -341,6 +361,27 @@ mod tests {
             load(&path).unwrap_err(),
             format!("{path}: the table does not fit in the file")
         );
+    }
+
+    #[test]
+    fn dtype_name_matches_the_reference_table() {
+        // Authoritative table: flash_serve-engine.md §1
+        // (PTR_DAT_020baa68 dumped from .rodata). The port previously
+        // mapped 0=f32, 1=f16, 2=bf16 — the reference maps 0=bf16,
+        // 1=f32, 2=f16.
+        assert_eq!(dtype_name(0), "bf16");
+        assert_eq!(dtype_name(1), "f32");
+        assert_eq!(dtype_name(2), "f16");
+        // Quant / other codes seen in the real checkpoint or named by
+        // the table.
+        assert_eq!(dtype_name(5), "q4c");
+        assert_eq!(dtype_name(16), "ht");
+        assert_eq!(dtype_name(24), "q6g64");
+        // NULL slots (validity mask 0x1f1fdff) and unknown codes render
+        // as `t<code>`.
+        assert_eq!(dtype_name(9), "t9");
+        assert_eq!(dtype_name(17), "t17");
+        assert_eq!(dtype_name(25), "t25");
     }
 
     #[test]
