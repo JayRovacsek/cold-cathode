@@ -1,0 +1,31 @@
+{
+  "source": "docs/analysis/evidence/halogen-npu/xrt-stub/libxrt_coreutil-stub.c (rebuilt 2026-11-03, extracted from the reference binary via readelf -W --dyn-syms) + docs/analysis/evidence/halogen-npu/binutils-elf-info.txt DT_NEEDED",
+  "binary": "/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-npu",
+  "binary_sha256": "2bdd4ffeb9c6cd23a5c37a3e656d192bda83a565f598b5ff015a75bc3b132786",
+  "note": "The XRT integration surface of the cold-cathode product lives in the sibling halogen-npu binary, not in flash_serve (flash_serve links AMD HIP instead - see npu/hip-imported-symbols.json). halogen-npu DT_NEEDEDs libxrt_coreutil.so.2 (AMD XRT). The symbol set below is the complete xrt:: import surface (20 xrt:: symbols + 2 _ITM clone-table hooks) and defines the integration surface a Rust port must target.",
+  "xrt_symbols": [
+    "xrt::device::device(unsigned int)",
+    "xrt::device::~device()",
+    "xrt::device::get_info_std(xrt::info::device, xrt::detail::abi const&) const",
+    "xrt::elf::elf(std::string const&)",
+    "xrt::hw_context::hw_context(xrt::device const&, xrt::elf const&)",
+    "xrt::hw_context::~hw_context()",
+    "xrt::ext::kernel::kernel(xrt::hw_context const&, std::string const&)",
+    "xrt::kernel::~kernel()",
+    "xrt::run::run(xrt::kernel const&)",
+    "xrt::run::~run()",
+    "xrt::run::set_arg_at_index(int, xrt::bo const&)",
+    "xrt::run::start()",
+    "xrt::run::wait(std::chrono::duration<long, std::ratio<1l, 1000l>> const&) const",
+    "xrt::run::state() const",
+    "xrt::bo::bo(xrt::device const&, unsigned long, xrt::bo::flags, unsigned int)",
+    "xrt::bo::bo(xrt::bo const&, unsigned long, unsigned long)",
+    "xrt::bo::~bo()",
+    "xrt::bo::map()",
+    "xrt::bo::sync(xclBOSyncDirection, unsigned long, unsigned long)",
+    "xrt::bo::size() const"
+  ],
+  "itm_symbols": ["_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable"],
+  "lifecycle": "xrt::device(index) -> xrt::elf(kernel-elf-path) -> xrt::hw_context(device, elf) -> xrt::ext::kernel(hw_context, kernel-name) -> xrt::run(kernel); weights/activations move through xrt::bo(device, size, flags, bank) with bo::map() for host access and bo::sync(HOST_TO_DEVICE / DEVICE_TO_HOST, size, offset) for transfers, plus the sub-buffer constructor xrt::bo(existing_bo, offset, size) for slicing; launch = run::set_arg_at_index(i, bo) per argument, then run::start(), then run::wait(timeout_ms) / run::state().",
+  "observed_usage_example": "FUN_001afec0 (halogen-npu, npu/halogen-npu-xrt-run-launcher-FUN_001afec0.json): iterates a vector of bound argument objects, calls FUN_001af340 per argument (set_arg binding), timestamps, calls xrt::run::start(), records the launch duration and bumps global launch counters (DAT_003e7ef0, DAT_003e7e04)."
+}
