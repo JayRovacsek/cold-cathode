@@ -29,33 +29,65 @@ against the raw binary bytes).
 
 ## 1. `.hgn` weight layout
 
-- **[D]** Reference header (from `FUN_020be0a0`, newly decompiled,
-  [engine/fun-020be0a0.json](../evidence/flash_serve/engine/fun-020be0a0.json)):
+- **[RV]** Reference header (from `FUN_020be0a0`,
+  [engine/fun-020be0a0.json](../evidence/flash_serve/engine/fun-020be0a0.json),
+  confirmed round 2 against the real checkpoint
+  `qwen38-flash-next-v2-abliterated.hgn` — repo root, 66,687,678,432 bytes,
+  sha256 of the first 4 KiB
+  `0ccfefcdb01b67708b05865be5f5778828f2f7027377313616c48bc8b9ce62a0`):
   `pread(fd, buf, 0x68, 0)` — a **104-byte header**; magic bytes
   `0x314e4748` = `HGN1` (exact compare); `u64` entry_count @8 (must be
   ≤ `0x100000`); `u64` table_offset @16 (the entry table is read from this
-  offset). The port's header
-  ([`crates/cc-halogen-tools/src/hgn.rs`](../../crates/cc-halogen-tools/src/hgn.rs):
-  `HGN1` + `u32` version @4 + `u64` entry_count @8 + `u64` table_offset
-  @16 + 2 reserved `u64`s + 64-byte `model_id`) matches on magic,
-  entry_count and table_offset.
-- **[D]** **New contradiction — entry layout:** `FUN_020be0a0` iterates
-  entries with stride `0xa0` (160 B, matching the port) but reads the name
-  via `strnlen(entry, 0x60)` (96-byte name field), the dtype as `u32`
-  @**96** and a second `u32` @**100** (queried values: dtype `0x10`,
-  kind `2`), whereas the port's `hgn.rs` reads `name[0..32]`, `u32` dtype
-  @32, `u64` nbytes @40. The port's entry layout (derived from the
-  `halogen-tools` binary) does not match flash_serve's loader.
-- **[D]** **New contradiction — version gate:** the reference accepts only
+  offset; `104` in the real file). The two further `u64`s are now resolved:
+  @24 is the **payload-region start** (`322,560` = `0x4ec00` in the real
+  file — 512-byte aligned, 56 bytes past the table end, and exactly entry
+  0's data offset) and @32 is the **declared file size** (`66,687,678,432`
+  — matches the real file byte-exactly; this is what
+  `checkpoint: truncated file %s (size mismatch)` compares against `fstat`).
+  The 64-byte `model_id` @40 reads `qwen3.8-flash-next-v2`. The port's
+  header
+  ([`crates/cc-halogen-tools/src/hgn.rs`](../../crates/cc-halogen-tools/src/hgn.rs)
+  and [`crates/cc-flash-serve/src/hgn.rs`](../../crates/cc-flash-serve/src/hgn.rs))
+  now matches the full layout including @24/@32.
+- **[RV]** **Entry layout (resolved round 2):** `FUN_020be0a0` iterates
+  entries with stride `0xa0` (160 B) reading the name via `strnlen(entry,
+  0x60)` (96-byte name field), the dtype as `u32` @**96** and a second `u32`
+  @**100** (the keep-trunk query matches dtype `0x10` + kind `2` on
+  `.mlp.experts.` names). The real checkpoint confirms the full entry:
+  name `0..96` (NUL-padded), `u32` dtype @96, `u32` kind @100, four `u64`
+  dims @104/@112/@120/@128 (unused trailing dims 0), `u64` payload
+  data_offset @136, `u64` nbytes @144, and an uninterpreted `u64` @152
+  (candidate per-tensor checksum — the tools' `verify` checks "checksums";
+  hash-like values in the real file, e.g. `0x25ddbae32` for
+  `embed_tokens.weight`). The @136/@144 pair is chain-verified in the real
+  bytes: entry 0 (`embed_tokens.weight`, dtype 5, kind 2, dims
+  `[248320, 2560, 0, 0]`) `322,560 + 357,580,864` equals entry 1's
+  data_offset (`layers.0.attn_hyper_connection.block_inject_weight.weight`,
+  dtype 24, kind 2, dims `[4, 10240, 0, 0]`, nbytes 33,280), and entry 1 +
+  its nbytes equals entry 2's data_offset
+  (`layers.0.attn_hyper_connection.hc_norm.weight`, dtype 0, kind 1, dims
+  `[10240, 0, 0, 0]`, nbytes 20,480). The port's earlier accessors (name
+  `0..32` / dtype @32 / nbytes @40) matched neither source — they were
+  copied from the tools' 96-byte *in-memory* entries (name `0..32`, dtype
+  @32, nbytes @80), not the on-disk entries — and are corrected in both
+  `cc-flash-serve` and `cc-halogen-tools` (round-2 fix; the tools' matrix
+  stays green because its `.hgn` success cases are deferred and its live
+  error cases don't read entries).
+- **[RV]** **Version gate (resolved round 2):** the reference accepts only
   versions where `(uint)(version − 3) > 0xfffffffd`, i.e. version ∈ {1, 2}
   (Ghidra renders this from the header's `u32` @4; type-propagation warning
-  present, so re-verify). The port's `write_hgn` writes version **1** in
-  every git revision (7 appears only in test fixtures — round-1 review
-  correction); the actual cause of the review-F3 rejection of
+  present — the real checkpoint's version `2` confirms the gate reads the
+  header `u32` @4 as documented). The port's `write_hgn` writes version
+  **1** in every git revision (7 appears only in test fixtures — round-1
+  review correction); the actual cause of the review-F3 rejection of
   subject-written `.hgn` files is the 32-byte written file failing the
-  reference's `pread == 0x68` header-size check. The port's reader is
-  currently ungated; adding the {1, 2} gate is bundled with the
-  entry-layout fix (see §1 gap register).
+  reference's `pread == 0x68` header-size check. The port's `cc-flash-serve`
+  reader now implements the {1, 2} gate (round-2 fix) with the engine's
+  wording `checkpoint: unsupported version in %s` ([D], `FUN_020bea30`
+  error set — `FUN_020be0a0` itself rejects silently and the tools spec has
+  no version error, so this is the only derivable wording); the
+  `cc-halogen-tools` reader stays ungated (its spec error table has no
+  version entry and its v7 fixtures are pinned by the matrix).
 - **[RV]** Review F3 caveat (carried from the frozen spec): the reference
   **rejects** a subject-written `.hgn` (`--resident-gib sub.hgn` → exit 1,
   no output).
@@ -102,6 +134,15 @@ against the raw binary bytes).
   confirmed (port `dtype_name`, hgn.rs:216–224). Dtype code `0x10` exists
   in real checkpoints (queried by `FUN_020bdc70`, §7) but its name is a
   documented gap — revisit by dumping the table at `PTR_DAT_020baa68`.
+  **Round-2 observation (real checkpoint):** entries carry at least codes
+  `0` (`layers.0.attn_hyper_connection.hc_norm.weight`, kind 1), `5`
+  (`embed_tokens.weight`, kind 2) and `24`
+  (`layers.0.attn_hyper_connection.block_inject_weight.weight`, kind 2);
+  the payload sizes contradict the port's `0=f32` mapping (dtype 0 with
+  2 B/element, not 4) and give fixed bytes-per-element per code (code 24 →
+  0.8125 B/elem on two tensors, code 5 → ≈0.5625 B/elem + 64 B), so the
+  on-disk dtype numbering likely differs from the tools' in-memory one —
+  the table dump at `PTR_DAT_020baa68` remains the revisit path.
 - **[RV]** The MTP head is a *separate* `.hgn` file —
   `qwen38-flash-next-mtp.hgn` from the weights repo, named by
   `HALOGEN_MTP_HEAD`; a llama.cpp MTP draft GGUF is not read
@@ -413,8 +454,9 @@ Exact algorithm, from
 
 | § | Gap | Revisit address / source |
 |---|---|---|
-| 1 | dtype code `0x10` name | table `PTR_DAT_020baa68` |
-| 1 | reference `.hgn` entry layout vs port `hgn.rs` (name 96 B/dtype @96 vs name 32 B/dtype @32) | `FUN_020be0a0` (staged) vs port reader; confirm with a reference-produced checkpoint |
+| 1 | dtype code `0x10` name; codes `5`/`24` observed in the real checkpoint (round 2) also unnamed, and the real `hc_norm.weight` (dtype 0, 2 B/elem) contradicts the port's `0=f32` mapping | table `PTR_DAT_020baa68` |
+| 1 | ~~reference `.hgn` entry layout vs port `hgn.rs`~~ **resolved round 2 [RV]:** on-disk entry = name `0..96` / dtype u32 @96 / kind u32 @100 / dims u64×4 @104..@136 / data_offset u64 @136 / nbytes u64 @144 / uninterpreted u64 @152; confirmed against `qwen38-flash-next-v2-abliterated.hgn` (66,687,678,432 B, first-4 KiB sha256 `0ccfefcdb01b67708b05865be5f5778828f2f7027377313616c48bc8b9ce62a0`) and `FUN_020be0a0`; port readers in `cc-flash-serve` + `cc-halogen-tools` corrected (the old name `0..32`/dtype @32/nbytes @40 accessors were the tools' in-memory layout, not on-disk) | — |
+| 1 | ~~version gate {1, 2} vs the port's ungated reader~~ **resolved round 2:** `cc-flash-serve` reader gates to {1, 2} (wording `checkpoint: unsupported version in %s` per `FUN_020bea30`); real file is version 2; `cc-halogen-tools` stays ungated (no version error in its spec table, v7 fixtures pinned by the matrix) | — |
 | 1 | `FUN_020bd2d0` full decompile | decompile pending |
 | 2 | attention head count / head dim / GQA | model-config ctor; `k_attn_*`/`k_rope_*` kernels |
 | 4 | MTP-head loader function (`FUN_01f24c10`/`FUN_01f24d00` resolved as composable-context instead) | `FUN_01f24580`/`FUN_01f24690` ctor steps |

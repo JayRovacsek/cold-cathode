@@ -5,18 +5,28 @@
 //! `FUN_01eec4a0` (evidence `docs/analysis/evidence/halogen-tools/decompile/`):
 //! `HGN1` magic + u32 version + u64 entry count + u64 table offset + two
 //! further u64 table fields + a 64-byte NUL-padded `model_id` (104 bytes,
-//! `0x68`), followed by 160-byte (`0xa0`) tensor-table entries. The full
-//! entry layout remains unverified on this host (spec limitation
-//! `hgn-format-not-reverse-engineered`); the accessors below mirror the
-//! field offsets the `inspect` handler (`FUN_01eed5d0`) reads.
+//! `0x68`), followed by 160-byte (`0xa0`) tensor-table entries.
+//!
+//! The entry layout is now confirmed ([RV] round 2) against the real
+//! reference checkpoint `qwen38-flash-next-v2-abliterated.hgn` (repo root,
+//! 66,687,678,432 bytes) and flash_serve's loader `FUN_020be0a0` (spec
+//! `flash_serve-engine.md` §1): name `0..96` (NUL-padded), `u32` dtype
+//! @96, `u32` kind @100, four `u64` dims @104/@112/@120/@128, `u64`
+//! payload data_offset @136, `u64` nbytes @144, uninterpreted `u64` @152
+//! (candidate per-tensor checksum). The earlier accessors (name `0..32` /
+//! dtype @32 / nbytes @40) mirrored the `inspect` handler's 96-byte
+//! *in-memory* entries (name `0..32`, dtype @32, nbytes @80), not the
+//! on-disk entries, and are corrected here; the full field table lives in
+//! `crates/cc-flash-serve/src/hgn.rs` (same layout, self-contained-crate
+//! pattern).
 
 /// Size of the fixed header in bytes (`0x68`).
 pub const HEADER_BYTES: usize = 104;
 /// Size of one tensor-table entry in bytes (`0xa0`).
 pub const ENTRY_BYTES: usize = 160;
 
-/// One tensor-table entry, kept as raw bytes with the accessors the
-/// decompiled `inspect` handler uses.
+/// One tensor-table entry, kept as raw bytes with the confirmed on-disk
+/// accessors (module docs).
 #[derive(Debug, Clone)]
 pub struct TensorEntry {
     raw: [u8; ENTRY_BYTES],
@@ -39,19 +49,50 @@ impl TensorEntry {
         )
     }
 
-    /// Tensor name: bytes 0..32, NUL-padded.
+    /// Build an entry from 160 raw bytes (`None` if the slice is short).
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self {
+            raw: bytes.get(..ENTRY_BYTES)?.try_into().ok()?,
+        })
+    }
+
+    /// Tensor name: bytes 0..96, NUL-padded (reference `strnlen(_, 0x60)`).
     pub fn name(&self) -> &str {
-        cstr(&self.raw[0..32])
+        cstr(&self.raw[0..96])
     }
 
-    /// Quantisation type code (byte 32 in the decompiled handler).
+    /// Quantisation type code (`u32` @96; the reference's dtype→name table
+    /// `PTR_DAT_020baa68` is still a spec gap — real checkpoints carry at
+    /// least codes 0 (f32), 5 and 24, plus 0x10 per `FUN_020bdc70`).
     pub fn dtype(&self) -> u32 {
-        self.u32_at(32)
+        self.u32_at(96)
     }
 
-    /// Payload size in bytes (byte 40 in the decompiled handler).
+    /// Entry kind (`u32` @100; observed: 1 for norm weights, 2 for
+    /// matrices).
+    pub fn kind(&self) -> u32 {
+        self.u32_at(100)
+    }
+
+    /// Tensor shape: four `u64` dims @104/@112/@120/@128; unused trailing
+    /// dims are 0.
+    pub fn dims(&self) -> [u64; 4] {
+        [
+            self.u64_at(104),
+            self.u64_at(112),
+            self.u64_at(120),
+            self.u64_at(128),
+        ]
+    }
+
+    /// Byte offset of this tensor's payload (`u64` @136).
+    pub fn data_offset(&self) -> u64 {
+        self.u64_at(136)
+    }
+
+    /// Payload size in bytes (`u64` @144).
     pub fn nbytes(&self) -> u64 {
-        self.u64_at(40)
+        self.u64_at(144)
     }
 }
 
@@ -304,17 +345,27 @@ mod tests {
 
     #[test]
     fn entries_are_read_from_the_table_offset() {
+        // Entry fixture uses the confirmed on-disk layout (name 0..96,
+        // dtype @96, kind @100, dims @104..@136, data_offset @136,
+        // nbytes @144) — see module docs.
         let mut bytes = header(3, 1, 104, "m");
         let mut entry = [0u8; ENTRY_BYTES];
         entry[..8].copy_from_slice(b"blk.0.q\0");
-        entry[32..36].copy_from_slice(&2u32.to_le_bytes());
-        entry[40..48].copy_from_slice(&1024u64.to_le_bytes());
+        entry[96..100].copy_from_slice(&2u32.to_le_bytes());
+        entry[100..104].copy_from_slice(&2u32.to_le_bytes());
+        entry[104..112].copy_from_slice(&4u64.to_le_bytes());
+        entry[112..120].copy_from_slice(&10_240u64.to_le_bytes());
+        entry[136..144].copy_from_slice(&(104u64 + ENTRY_BYTES as u64).to_le_bytes());
+        entry[144..152].copy_from_slice(&1024u64.to_le_bytes());
         bytes.extend_from_slice(&entry);
         let path = write_scratch("one-entry.hgn", &bytes);
         let ck = load(&path).expect("loads");
         assert_eq!(ck.entries.len(), 1);
         assert_eq!(ck.entries[0].name(), "blk.0.q");
         assert_eq!(ck.entries[0].dtype(), 2);
+        assert_eq!(ck.entries[0].kind(), 2);
+        assert_eq!(ck.entries[0].dims(), [4, 10_240, 0, 0]);
+        assert_eq!(ck.entries[0].data_offset(), 104 + ENTRY_BYTES as u64);
         assert_eq!(ck.entries[0].nbytes(), 1024);
     }
 }

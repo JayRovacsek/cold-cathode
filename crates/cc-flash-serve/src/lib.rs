@@ -256,7 +256,7 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         Ok(ck) => {
             log_info(&format!(
                 "halogen: {} tensors, {} bytes mapped",
-                ck.entry_count, ck.weight_bytes
+                ck.header.entry_count, ck.weight_bytes
             ));
             if let Some(anomaly) = ck.payload_anomaly(&opts.ck) {
                 log_warn(&format!("halogen: {anomaly}"));
