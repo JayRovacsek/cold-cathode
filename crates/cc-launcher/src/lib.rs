@@ -43,15 +43,23 @@
 //!   stdout/stderr/exit codes.
 //! * The deep pre-dispatch helpers (`maybe_download`, `check_gguf`,
 //!   `check_sidecar`, `legacy_note`, `check_ngram_table`, `check_vision`,
-//!   `kv_budget_note`, `gtt_note`, `wait_for_engine`, `engine_watchdog`,
-//!   `stop_engine`, `wd_gtt_after_exit`, the NPU helpers) are ported
-//!   structurally: the host preflight, checkpoint/tokenizer/draft-head
-//!   checks and their exact messages are reproduced; the GPU-dependent
-//!   orchestration (engine wait, watchdog, NPU restart, signal traps) and
-//!   the `memlock_note` weights-lock probe (whose reference body needs
-//!   `ckpt_facts`, which execs `flash_serve --resident-gib`) are not. Those
-//!   modes are `deferred` in the contract matrix
-//!   (`side-effecting-launch`).
+//!   `kv_budget_note`, `gtt_note`, `engine_watchdog`, `stop_engine`,
+//!   `wd_gtt_after_exit`, the NPU helpers) are ported structurally: the
+//!   host preflight, checkpoint/tokenizer/draft-head checks and their exact
+//!   messages are reproduced; the GPU-dependent orchestration (watchdog,
+//!   NPU restart, signal traps) and the `memlock_note` weights-lock probe
+//!   (whose reference body needs `ckpt_facts`, which execs `flash_serve
+//!   --resident-gib`) are not. Those modes are `deferred` in the contract
+//!   matrix (`side-effecting-launch`).
+//! * `wait_for_engine` (entrypoint lines 749–776, invoked by the spec's
+//!   `all` row at lines 1674–1720) is ported in full: a 2s TCP-connect poll
+//!   to `127.0.0.1:$ENG_PORT`, the `HALOGEN_ENGINE_WAIT_S` timeout (0 or
+//!   unset waits forever), the exact success / engine-exit / timeout
+//!   wordings and the 60s heartbeat with its `wd_state` / `wd_gtt_gib`
+//!   probes. The reference's optional log tail (`tail -30 "$log"`, line
+//!   760) applies only when the caller redirects the engine's output
+//!   (bench/sweep pass `/tmp/halogen-engine.log`); `all` has no log, so
+//!   the port omits the argument.
 //! * `exec` is emulated with `Command::status` (std has no `execve`): the
 //!   child's exit code is returned through `main`; a missing program yields
 //!   exit 127 and a non-executable one 126, matching bash.
@@ -61,8 +69,11 @@
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -866,6 +877,164 @@ fn text_only_mode(mode: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Engine wait (entrypoint `wait_for_engine`, lines 749–776)
+// ---------------------------------------------------------------------------
+
+/// The entrypoint's connect probe (line 754,
+/// `(exec 3<>"/dev/tcp/127.0.0.1/$port")`): a TCP connection to `addr`
+/// succeeds exactly when the engine socket accepts.
+fn socket_accepts(addr: &str) -> bool {
+    TcpStream::connect(addr).is_ok()
+}
+
+/// `${HALOGEN_ENGINE_WAIT_S:-0}` (line 751): unset or set-but-empty takes
+/// the default 0 (wait forever); a non-numeric value makes bash's
+/// `[ -gt 0 ]` fail, so the `if` branch is not taken and bash also waits
+/// forever — the port maps any unparseable value to 0 likewise.
+fn parse_wait_limit(raw: Option<String>) -> u64 {
+    raw.and_then(|value| value.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// `wait_for_engine` (entrypoint lines 749–776; the spec's dispatch table
+/// `all` row, lines 1674–1720, documents the exit code "1 if the engine
+/// never comes up"): poll `127.0.0.1:port` every 2s (the entrypoint's
+/// `sleep 2`, line 770), honouring `HALOGEN_ENGINE_WAIT_S` (0/unset waits
+/// forever), and print the exact success (line 755), engine-exit (line 759)
+/// and timeout (lines 764–766) wordings plus the 60s heartbeat (lines
+/// 771–773). The caller exits 1 when this returns false (lines 1688–1693).
+fn wait_for_engine(port: &str, engine: &mut Child) -> bool {
+    let limit = parse_wait_limit(env::var("HALOGEN_ENGINE_WAIT_S").ok());
+    let mut elapsed: u64 = 0;
+    let mut beat: u64 = 0;
+    loop {
+        if socket_accepts(&format!("127.0.0.1:{port}")) {
+            println!("halogen: engine listening after {elapsed}s");
+            return true;
+        }
+        // bash `kill -0 "$pid"` (line 758) succeeds while the child is
+        // alive; `try_wait` reaps and reports the same fact.
+        if engine.try_wait().ok().flatten().is_some() {
+            eprintln!("halogen: the engine exited after {elapsed}s without listening.");
+            return false;
+        }
+        if limit > 0 && elapsed >= limit {
+            eprintln!(
+                "halogen: HALOGEN_ENGINE_WAIT_S={limit} expired after {elapsed}s and the engine is STILL LOADING (pid {} is alive).",
+                engine.id()
+            );
+            eprintln!("  Nothing is wrong with it yet. Raise or unset HALOGEN_ENGINE_WAIT_S to keep waiting;");
+            eprintln!("  0 or unset means wait as long as the load takes.");
+            return false;
+        }
+        sleep(Duration::from_secs(2));
+        elapsed += 2;
+        beat += 2;
+        if beat >= 60 {
+            beat = 0;
+            println!(
+                "halogen: still loading, {elapsed}s elapsed (the engine is alive, state {}; GTT in use {} GiB; the startup lines above name the step)",
+                wd_state(engine.id()),
+                wd_gtt_gib()
+            );
+        }
+    }
+}
+
+/// `wd_stat_state` (entrypoint lines 778–783): the state character of a
+/// `/proc/<pid>/task/<tid>/stat` content — bash reads the first line,
+/// strips the longest prefix up to the last `") "` (the comm field may
+/// contain spaces and parentheses) and prints the next field.
+fn wd_stat_state(content: &str) -> String {
+    let line = content.lines().next().unwrap_or_default();
+    let rest = match line.rfind(") ") {
+        Some(index) => &line[index + 2..],
+        None => line,
+    };
+    rest.split(' ').next().unwrap_or(rest).to_string()
+}
+
+/// `wd_state` (entrypoint lines 791–800): `D` if any thread of `pid` is
+/// uninterruptible, else the main thread's state; `?` when nothing is
+/// readable (bash's default when the glob matches no readable file).
+fn wd_state(pid: u32) -> String {
+    let proc = env::var("_hg_proc")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/proc".to_string());
+    let tasks = Path::new(&proc).join(pid.to_string()).join("task");
+    let mut main = "?".to_string();
+    if let Ok(entries) = fs::read_dir(&tasks) {
+        for entry in entries.flatten() {
+            // bash `[ -r "$f" ] || continue` — probed by reading.
+            let Ok(content) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let state = wd_stat_state(&content);
+            if state == "D" {
+                return "D".to_string();
+            }
+            if entry.file_name().to_string_lossy() == pid.to_string() {
+                main = state;
+            }
+        }
+    }
+    main
+}
+
+/// `wd_gtt_tenths` (entrypoint lines 809–823) as a pure function of the
+/// bytes a readable `mem_info_gtt_used` holds: GiB×10 with bash's
+/// round-half-to-even (`r` over half, or exactly half with `q` odd, bumps
+/// `q`).
+fn gtt_tenths_from_bytes(bytes: u64) -> u64 {
+    let scaled = bytes.saturating_mul(10);
+    let mut q = scaled / 1_073_741_824;
+    let r = scaled % 1_073_741_824;
+    if r > 536_870_912 || (r == 536_870_912 && q % 2 == 1) {
+        q += 1;
+    }
+    q
+}
+
+/// `wd_gtt_gib` (entrypoint lines 824–827): the first readable
+/// `$sys/class/drm/card*/device/mem_info_gtt_used` (bash's sorted glob)
+/// formatted as `X.Y` GiB; `?` when the sysfs has none (the reference's own
+/// fallback, also covered by the `_hg_sys` override).
+fn wd_gtt_gib() -> String {
+    let sys = env::var("_hg_sys")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/sys".to_string());
+    gtt_gib_under(Path::new(&sys))
+}
+
+/// The `wd_gtt_gib` body rooted at `sys` (split out for unit testing).
+fn gtt_gib_under(sys: &Path) -> String {
+    let drm = sys.join("class/drm");
+    let mut cards: Vec<_> = fs::read_dir(&drm)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with("card"))
+                .collect()
+        })
+        .unwrap_or_default();
+    cards.sort(); // bash expands the glob in sorted order
+    for card in cards {
+        let Ok(raw) = fs::read_to_string(drm.join(card).join("device/mem_info_gtt_used")) else {
+            continue; // bash `[ -r "$f" ] || continue`
+        };
+        // bash `read -r u < "$f"` then `case "$u" in ''|*[!0-9]*) u=0`:
+        // any non-numeric content becomes 0.
+        let first_line = raw.lines().next().unwrap_or_default().trim();
+        let bytes = first_line.parse::<u64>().unwrap_or(0);
+        let tenths = gtt_tenths_from_bytes(bytes);
+        return format!("{}.{}", tenths / 10, tenths % 10);
+    }
+    "?".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Mode implementations (spec: "The dispatch table")
 // ---------------------------------------------------------------------------
 
@@ -895,6 +1064,15 @@ fn start_all(eng: &Engine, checkpoint: &str) -> i32 {
         eng.port
     );
     let _ = std::io::stdout().flush();
+    // `wait_for_engine` (entrypoint lines 1688–1693): spawn the API only
+    // once the engine socket accepts; if the engine never comes up, kill
+    // and reap it and exit 1 (the dispatch table's "1 if the engine never
+    // comes up").
+    if !wait_for_engine(&eng.port, &mut engine) {
+        let _ = engine.kill();
+        let _ = engine.wait();
+        return 1;
+    }
     let api = resolve_python().map(|python| {
         let tokenizer = env::var("HALOGEN_TOKENIZER").unwrap_or_else(|_| "/tokenizer".to_string());
         // The script path comes first (entrypoint: `python3 "$_hg_serve_api"
@@ -1173,5 +1351,128 @@ fn split_file<'a>(rest: &'a [String], checkpoint: &str) -> (String, &'a [String]
         Some(first) if !first.starts_with('-') => (first.clone(), &rest[1..]),
         _ if !checkpoint.is_empty() => (checkpoint.to_string(), rest),
         _ => (String::new(), rest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A port nothing listens on: bind an ephemeral listener and drop it,
+    /// so a connect to it is refused (the state `wait_for_engine` polls).
+    fn closed_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("ephemeral bind")
+            .local_addr()
+            .expect("ephemeral address")
+            .port()
+    }
+
+    #[test]
+    fn socket_accepts_true_for_a_listening_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        let addr = listener.local_addr().expect("listener address");
+        assert!(socket_accepts(&addr.to_string()));
+    }
+
+    #[test]
+    fn socket_accepts_false_for_a_closed_port() {
+        assert!(!socket_accepts(&format!("127.0.0.1:{}", closed_port())));
+    }
+
+    #[test]
+    fn wait_for_engine_returns_true_once_the_socket_accepts() {
+        // The engine child stays alive and the socket accepts on the first
+        // probe, so the helper returns true at t=0 without sleeping.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let mut engine = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("spawn sh");
+        assert!(wait_for_engine(&port.to_string(), &mut engine));
+        let _ = engine.kill();
+        let _ = engine.wait();
+    }
+
+    #[test]
+    fn wait_for_engine_reports_an_exited_engine_on_a_closed_port() {
+        // bash's `kill -0` fails once the engine child is gone (line 758);
+        // `try_wait` reports the same fact and the helper returns false —
+        // the dispatch table's "1 if the engine never comes up". The
+        // pre-wait reaps the child so the test never depends on scheduling.
+        let mut engine = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn sh");
+        engine.wait().expect("sh exits");
+        assert!(!wait_for_engine(&closed_port().to_string(), &mut engine));
+    }
+
+    #[test]
+    fn wait_for_engine_times_out_while_the_engine_stays_alive() {
+        // HALOGEN_ENGINE_WAIT_S=1 with the 2s poll: the first probe runs at
+        // t=0 (below the limit), the second at t=2 — the expiry wording and
+        // false (entrypoint lines 763–769). Takes ~2s (the poll interval).
+        let previous = env::var("HALOGEN_ENGINE_WAIT_S").ok();
+        env::set_var("HALOGEN_ENGINE_WAIT_S", "1");
+        let mut engine = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("spawn sh");
+        let result = wait_for_engine(&closed_port().to_string(), &mut engine);
+        match previous {
+            Some(value) => env::set_var("HALOGEN_ENGINE_WAIT_S", value),
+            None => env::remove_var("HALOGEN_ENGINE_WAIT_S"),
+        }
+        let _ = engine.kill();
+        let _ = engine.wait();
+        assert!(!result);
+    }
+
+    #[test]
+    fn wait_limit_follows_the_reference_default_semantics() {
+        assert_eq!(parse_wait_limit(None), 0); // unset → 0 (wait forever)
+        assert_eq!(parse_wait_limit(Some(String::new())), 0); // `:-` semantics
+        assert_eq!(parse_wait_limit(Some("45".to_string())), 45);
+        // bash's `[ abc -gt 0 ]` errors, so the branch is not taken → wait
+        // forever; the port maps unparseable values to 0 likewise.
+        assert_eq!(parse_wait_limit(Some("abc".to_string())), 0);
+    }
+
+    #[test]
+    fn wd_stat_state_extracts_the_state_character() {
+        assert_eq!(wd_stat_state("123 (sh) S 1 123 123 0 -1 65536"), "S");
+        // the comm field may contain spaces and parentheses:
+        assert_eq!(wd_stat_state("9 (my sh) D 1 9"), "D");
+        assert_eq!(wd_stat_state(""), "");
+    }
+
+    #[test]
+    fn gtt_tenths_matches_the_reference_arithmetic() {
+        assert_eq!(gtt_tenths_from_bytes(0), 0);
+        assert_eq!(gtt_tenths_from_bytes(1_073_741_824), 10); // exactly 1 GiB
+                                                              // 0.8 GiB: r = 1073741822 > half → rounds up to 8 tenths.
+        assert_eq!(gtt_tenths_from_bytes(858_993_459), 8);
+        // 0.5 GiB + 1 byte: r = 10 → no rounding.
+        assert_eq!(gtt_tenths_from_bytes(536_870_913), 5);
+    }
+
+    #[test]
+    fn gtt_gib_under_formats_a_sysfs_fixture_and_falls_back_to_question() {
+        // Fixture inside the crate's `.tmp/` (repo convention for scratch).
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("gtt-fixture-{}", process::id()));
+        let device = root.join("class/drm/card0/device");
+        fs::create_dir_all(&device).expect("fixture dirs");
+        fs::write(device.join("mem_info_gtt_used"), "1073741824\n").expect("fixture file");
+        assert_eq!(gtt_gib_under(&root), "1.0");
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+        // No drm sysfs at all → the reference's `?` fallback.
+        fs::create_dir_all(root.join("class")).expect("empty class dir");
+        assert_eq!(gtt_gib_under(&root), "?");
+        fs::remove_dir_all(&root).expect("fixture cleanup");
     }
 }
