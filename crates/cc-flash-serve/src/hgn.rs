@@ -18,6 +18,19 @@
 //! byte from the table offset on as table + payload; it is marked
 //! unverified at each use site.
 //!
+//! Round-1 engine-port review adjudication
+//! (`.tmp/review-report-engine-round1.md`, spec `flash_serve-engine.md`
+//! §1): flash_serve's own loader (`FUN_020be0a0`) reads the on-disk entry
+//! as name `0..96` / dtype `u32` @96 / kind `u32` @100, while the tools'
+//! inspect handler iterates 96-byte *in-memory* entries (name `0..32`,
+//! dtype @32, nbytes @80). The [`TensorEntry`] accessors below (name
+//! `0..32` / dtype @32 / nbytes @40) match neither source exactly —
+//! `nbytes` @40 is `dims[0]` in the tools' in-memory layout — and are
+//! unverified against reference-produced files until a reference-written
+//! `.hgn` is available to confirm. The reference also gates header version
+//! to {1, 2}; this reader is currently ungated (gate bundled with the
+//! entry-layout fix).
+//!
 //! Weight residency: [`load`] reads the whole file into one contiguous
 //! `Vec<u8>` (std-only — the crate takes no crates.io dependencies, so no
 //! `memmap2`). Memory-mapping the payload region is the eventual

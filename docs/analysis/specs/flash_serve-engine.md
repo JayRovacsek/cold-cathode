@@ -49,9 +49,13 @@ against the raw binary bytes).
 - **[D]** **New contradiction — version gate:** the reference accepts only
   versions where `(uint)(version − 3) > 0xfffffffd`, i.e. version ∈ {1, 2}
   (Ghidra renders this from the header's `u32` @4; type-propagation warning
-  present, so re-verify). The port writes version **7** — the likely
-  mechanical cause of the review-F3 rejection of subject-written `.hgn`
-  files.
+  present, so re-verify). The port's `write_hgn` writes version **1** in
+  every git revision (7 appears only in test fixtures — round-1 review
+  correction); the actual cause of the review-F3 rejection of
+  subject-written `.hgn` files is the 32-byte written file failing the
+  reference's `pread == 0x68` header-size check. The port's reader is
+  currently ungated; adding the {1, 2} gate is bundled with the
+  entry-layout fix (see §1 gap register).
 - **[RV]** Review F3 caveat (carried from the frozen spec): the reference
   **rejects** a subject-written `.hgn` (`--resident-gib sub.hgn` → exit 1,
   no output).
@@ -344,8 +348,10 @@ Exact algorithm, from
 
 - **[D]** Request verbs (connection handler
   [conn-handler-FUN_01ee0e20.json](../evidence/flash_serve/engine/conn-handler-FUN_01ee0e20.json),
-  `switch` on the first token's length, each case `bcmp`-verified against
-  the binary's string table):
+  `switch` on the first token's length; the `GEN`/`VIMG`/`PARK` cases are
+  `bcmp`-verified in the decompile, while `X`, `HREL`, `VOCAB`, `CSTAT`,
+  `MERGES` and `RESUME` are attested only by binutils strings — review
+  correction, round-1 review `.tmp/review-report-engine-round1.md`):
 
   | token length | verbs |
   |---|---|

@@ -137,7 +137,16 @@ before any real implementation — proving the harness works (TDD).
 ### Phase 6 — Final validation and review
 - [x] Full matrix run; `nix flake check`; both packages build. (2026-11-04: `nix flake check` all passed; `nix build .#cold-cathode .#halogen-flash-server --no-link` OK; `cargo test --workspace` 18 suites ok; contract tests 15 unit + 11 integration pass)
 - [x] Run a full-branch review (code-reviewer agent); resolve all findings. (2026-11-04: approve-with-nits, no critical findings; F1–F3 applied in this commit — report in `.tmp/review-report-full-branch.md`)
-- [ ] Present `init` → `main` merge to the user for approval. **Do not merge without it.**
+- [x] Present `init` → `main` merge to the user for approval. **Do not merge without it.** (approved 2026-11-04; `main` fast-forwarded to `d2c4551`)
+
+### Phase 7 — Full engine port (scope extension, 2026-11-04)
+**Objective:** port the flash_serve engine internals beyond the CLI contract — weights, generation, MTP speculative decoding, KV-cache management, NPU/XRT (user scoping decision, §12); every increment ships its own `HALOGEN_LOG`-gated verbose logging.
+- [x] Engine-internals blueprint spec (`docs/analysis/specs/flash_serve-engine.md`, `5a407bc`; round-1 review approve-with-nits, nits fixed in the review-fix commit).
+- [x] Checkpoint load into RAM (`crates/cc-flash-serve/src/hgn.rs` + serve-path wiring, `c836d0b`; round-1 review approve-with-nits — entry-accessor/version-gate caveats documented in the module, code fix bundled pending a reference-written `.hgn`).
+- [ ] Forward pass + sampling (real `GEN` output).
+- [ ] MTP speculative decoding.
+- [ ] KV-cache management.
+- [ ] NPU/XRT integration (`halogen-npu listen`).
 
 ---
 
@@ -346,3 +355,6 @@ the binary/tool that serves it.
 | 2026-11-04 | The port honours `_hg_flash_serve` in every launching mode; the reference honours it only in `all` (hard-codes the store path in engine/bench/convert) | launcher review adjudication: accepted superset — identical behaviour when the var is unset |
 | 2026-11-04 | The port omits the entrypoint's `ulimit -c 0` (line 6) | launcher review adjudication: accepted — std-only constraint (`setrlimit` needs libc); invisible on stdout/stderr/exit, the only channels the harness compares |
 | 2026-11-04 | Engine INFO stubbing (adjudication 5d / api.md §10.2) superseded: `cc-flash-serve` `80992e4` answers `PING`/`INFO` on the live line protocol (reply derived from the decompiled format string + `serve_api._parse_info`); the GPU-gated `serve_socket_probe` contract test replaces the fixed fake fixture | post-merge live run on the user host showed serve_api's probe failing against the stub; review `.tmp/review-report-80992e4.md` |
+| 2026-11-04 | Scope extended beyond the CLI contract: **full engine port** (weights + generation + MTP speculative decoding + KV-cache management + NPU/XRT), opened as Phase 7; logging folded into each increment (`HALOGEN_LOG` pattern) rather than a standalone pass | user scoping decision after observing the CLI-contract port does not load weights into RAM |
+| 2026-11-04 | `.hgn` entry-layout contradiction adjudicated: one shared format; the port's in-entry accessors (name 32 B / dtype @32 / nbytes @40) match neither the tools' in-memory entries (nbytes @80) nor flash_serve's on-disk entries (name 96 B / dtype @96 / kind @100); the reference gates header version to {1, 2} while the port reader is ungated — code fix bundled pending a reference-written `.hgn` fixture | engine round-1 review adjudications 1–2 (`.tmp/review-report-engine-round1.md`) |
+| 2026-11-04 | `HALOGEN_MTP_DEPTH` default: frozen spec says 3, decompile shows 2 (3 is only the `MTP_DEPTH_HI` default when `DEPTH` unset) — resolve before shipping generation | engine round-1 review adjudication 3 |
