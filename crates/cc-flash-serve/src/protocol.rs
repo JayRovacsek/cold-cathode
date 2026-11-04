@@ -250,9 +250,13 @@ pub fn parse_gen(line: &str) -> Option<GenRequest> {
 }
 
 /// Read exactly `count` whitespace-separated token ids (`None` when the
-/// line ends early or a field is not an integer).
+/// line ends early or a field is not an integer). No `with_capacity`: a
+/// malformed line declaring a huge count (past `isize::MAX` would panic,
+/// a multi-GB count would over-allocate before the parse fails) must
+/// close like the reference ("its GEN does not parse",
+/// binutils-strings.txt:1617), not abort the connection thread.
 fn count_ids<'a>(words: &mut impl Iterator<Item = &'a str>, count: usize) -> Option<Vec<i64>> {
-    let mut ids = Vec::with_capacity(count);
+    let mut ids = Vec::new();
     for _ in 0..count {
         ids.push(words.next()?.parse::<i64>().ok()?);
     }
@@ -273,6 +277,12 @@ fn count_ids<'a>(words: &mut impl Iterator<Item = &'a str>, count: usize) -> Opt
 /// PLD, composable, think, disk, draft-vocab and grammar counters are 0 —
 /// their subsystems are the deferred phases, matching the honest zeros
 /// `info_line` reports.
+///
+/// `message` (empty for normal completions) is appended after the numeric
+/// fields: the reference's refusal shape (`D <req> error <msg>`, spec §8)
+/// carries the reason text there — serve_api's `engine_refusal`
+/// (:1350–1363) skips the leading numeric fields of `parts[7:]` and
+/// renders `the engine refused this request: <message>`.
 fn done_line(
     req: i64,
     reason: &str,
@@ -280,39 +290,60 @@ fn done_line(
     n_gen: usize,
     max_tokens: i64,
     decode_ms: f64,
+    message: &str,
 ) -> String {
-    format!(
+    let line = format!(
         "D {req} {reason} {n_prompt} {n_gen} 0.0 {decode_ms:.1} \
          0 0 0 0 0 0 0 0 0 0 {max_tokens} 0 0 0 0 0 0 0 0.0 0 0 0 0 0 0 0"
-    )
+    );
+    if message.is_empty() {
+        line
+    } else {
+        format!("{line} {message}")
+    }
 }
+
+/// The refusal message the port appends to the `D <req> error …` line
+/// when a request cannot be admitted (spec §3: the engine reserves
+/// prompt plus max_tokens inside the context).
+const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 
 /// Run one parsed `GEN` request against the loaded checkpoint and frame
 /// the full streamed reply: the optional `P` progress line, one `T` line
 /// per generated token and the closing `D` line (all newline-separated, no
 /// trailing newline — `serve_connection` writes the terminator).
 ///
-/// The generation loop is the port's forward entry point plus sampling
-/// layer (`crate::forward`, `crate::sampling`): it draws up to
-/// `min(max_tokens, ctx − prompt)` tokens — the reference reserves
-/// prompt plus max_tokens inside the context (spec §3 banner) — stopping
-/// early with reason `stop` when a drawn token is in the request's eos
-/// set and with reason `length` when the budget runs out. A prompt longer
-/// than `--ctx` answers the reference's empty-message refusal shape
-/// (`D <req> error …`; serve_api `engine_refusal` :1350–1363 renders its
-/// documented wording from the missing message). The `G` grammar line is
-/// only emitted by the reference's grammar subsystem (off here, per
-/// `info_line`), and `C` lines answer `CSTAT`, not `GEN`.
+/// The reference reserves prompt plus max_tokens inside the context
+/// (spec §3 banner), so a request whose `n_prompt + max_tokens` exceeds
+/// `--ctx` answers the refusal shape ([`done_line`] with reason `error`
+/// and [`OVER_CONTEXT_MESSAGE`]) instead of generating. Otherwise the
+/// generation loop is the port's forward entry point plus sampling layer
+/// (`crate::forward`, `crate::sampling`) via [`generate_tokens`],
+/// stopping early with reason `stop` when a drawn token is in the
+/// request's eos set and with reason `length` when the budget runs out.
+/// The `G` grammar line is only emitted by the reference's grammar
+/// subsystem (off here, per `info_line`), and `C` lines answer `CSTAT`,
+/// not `GEN`.
 fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Checkpoint) -> String {
     let n_prompt = request.ids.len() as i64;
-    if n_prompt > info.ctx {
-        return format!("D {} error {n_prompt} 0 0.0 0.0", request.req);
+    if request
+        .max_tokens
+        .checked_add(n_prompt)
+        .is_none_or(|total| total > info.ctx)
+    {
+        return done_line(
+            request.req,
+            "error",
+            n_prompt,
+            0,
+            request.max_tokens,
+            0.0,
+            OVER_CONTEXT_MESSAGE,
+        );
     }
     let params = request.sample.clone().unwrap_or_else(SampleParams::greedy);
-    let limit = request.max_tokens.min(info.ctx - n_prompt) as usize;
     let forward = forward::Forward::new(checkpoint);
-    let mut rng = sampling::Rng::new(params.seed);
-    let mut lines = Vec::with_capacity(limit + 2);
+    let mut lines = Vec::new();
     if request.progress {
         // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
         // p_line_progress :1062–1065): the stub's prefill is the prompt
@@ -320,12 +351,43 @@ fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Check
         lines.push(format!("P {} {n_prompt} {n_prompt} 0 0", request.req));
     }
     let started = Instant::now();
+    let (token_lines, n_gen, reason) =
+        generate_tokens(request, &params, request.max_tokens as usize, &|context| {
+            forward.logits(context)
+        });
+    let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+    lines.extend(token_lines);
+    lines.push(done_line(
+        request.req,
+        reason,
+        n_prompt,
+        n_gen,
+        request.max_tokens,
+        decode_ms,
+        "",
+    ));
+    lines.join("\n")
+}
+
+/// The generation loop of [`gen_response`]: draws up to `limit` tokens
+/// using `logits` as the logits source — the forward pass in production,
+/// injectable so the `sample`-returns-`None` stop is testable. Returns
+/// the `T` lines, the generated-token count and the done reason (`stop`
+/// when a drawn token is in the request's eos set, `length` otherwise —
+/// also used when the logits source runs dry before the budget).
+fn generate_tokens(
+    request: &GenRequest,
+    params: &SampleParams,
+    limit: usize,
+    logits: &dyn Fn(&[i64]) -> Vec<f32>,
+) -> (Vec<String>, usize, &'static str) {
+    let mut rng = sampling::Rng::new(params.seed);
+    let mut lines = Vec::new();
     let mut context = request.ids.clone();
     let mut n_gen = 0usize;
     let mut reason = "length";
     for _ in 0..limit {
-        let logits = forward.logits(&context);
-        let Some(token) = sampling::sample(&logits, &params, &mut rng) else {
+        let Some(token) = sampling::sample(&logits(&context), params, &mut rng) else {
             break;
         };
         // `T <req> <token> <logprob>` (serve_api t_line_logprob
@@ -344,16 +406,7 @@ fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Check
             break;
         }
     }
-    let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
-    lines.push(done_line(
-        request.req,
-        reason,
-        n_prompt,
-        n_gen,
-        limit as i64,
-        decode_ms,
-    ));
-    lines.join("\n")
+    (lines, n_gen, reason)
 }
 
 /// Answer one protocol line; `Some(reply)` (without the trailing newline)
@@ -687,6 +740,8 @@ mod tests {
             "GEN 1 5 -1 0",
             // A malformed SAMPLE clause (temperature > 2) fails the request.
             "GEN 1 1 0 0 SAMPLE 3 20 0.95 0.05 42",
+            // A SAMPLE clause with fewer than five fields fails the request.
+            "GEN 1 1 0 0 SAMPLE 0.7 20",
         ] {
             assert_eq!(
                 handle_line(line, &info, Some(&ck)),
@@ -763,10 +818,11 @@ mod tests {
 
     #[test]
     fn gen_reply_refuses_a_prompt_over_the_context() {
-        // The reference reserves prompt + max_tokens inside the context;
-        // a longer prompt answers the empty-message refusal shape
-        // (serve_api engine_refusal :1350–1363 renders its documented
-        // wording from the missing message).
+        // The reference reserves prompt + max_tokens inside the context
+        // (spec §3); the refusal is the full D-line shape with reason
+        // `error` and the message appended — serve_api's engine_refusal
+        // (:1350–1363) skips the numeric fields and renders
+        // "the engine refused this request: <message>".
         let info = EngineInfo {
             ctx: 16,
             slot_ctx: 16,
@@ -777,12 +833,63 @@ mod tests {
         let reply =
             handle_line(&format!("GEN 4 1 0 17 {ids}"), &info, Some(&ck)).expect("GEN answers");
         let parts: Vec<&str> = reply.split_whitespace().collect();
-        assert_eq!(parts.len(), 7, "refusal {reply:?}");
+        assert_eq!(
+            parts.len(),
+            39,
+            "33 D-line fields + 6-word message: {reply:?}"
+        );
         assert_eq!(parts[0], "D");
         assert_eq!(parts[1], "4"); // req
         assert_eq!(parts[2], "error");
         assert_eq!(parts[3], "17"); // n_prompt
         assert_eq!(parts[4], "0"); // n_gen
+        assert_eq!(parts[17], "1"); // max_tokens echoed from the request
+        assert_eq!(
+            parts[33..].join(" "),
+            "prompt plus max_tokens exceed the context"
+        );
+    }
+
+    #[test]
+    fn gen_reply_refuses_when_max_tokens_overflows_the_context() {
+        // A huge max_tokens (i64::MAX) plus one prompt id overflows the
+        // i64 sum; the checked add must refuse, not panic or clamp.
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let reply =
+            handle_line("GEN 3 9223372036854775807 0 1 5", &info, Some(&ck)).expect("GEN answers");
+        let parts: Vec<&str> = reply.split_whitespace().collect();
+        assert_eq!(parts[2], "error");
+        assert_eq!(parts[3], "1"); // n_prompt
+        assert_eq!(parts[17], "9223372036854775807"); // max_tokens echoed
+    }
+
+    #[test]
+    fn gen_reply_with_zero_max_tokens_answers_done_only() {
+        let info = fixture_info();
+        let ck = fixture_checkpoint(8);
+        let reply = handle_line("GEN 9 0 0 2 10 20", &info, Some(&ck)).expect("GEN answers");
+        assert!(!reply.contains('\n'), "D-only reply: {reply:?}");
+        let parts: Vec<&str> = reply.split_whitespace().collect();
+        assert_eq!(parts.len(), 33, "D line {reply:?}");
+        assert_eq!(parts[0], "D");
+        assert_eq!(parts[1], "9"); // req
+        assert_eq!(parts[2], "length"); // reason: budget exhausted at once
+        assert_eq!(parts[3], "2"); // n_prompt
+        assert_eq!(parts[4], "0"); // n_gen
+        assert_eq!(parts[17], "0"); // max_tokens
+    }
+
+    #[test]
+    fn generate_tokens_stops_when_the_logits_source_is_empty() {
+        // The `sample`-returns-`None` stop (empty logits): no T lines,
+        // n_gen 0, reason stays `length`.
+        let request = parse_gen("GEN 1 3 0 0").expect("parses");
+        let (lines, n_gen, reason) =
+            generate_tokens(&request, &SampleParams::greedy(), 3, &|_| Vec::new());
+        assert!(lines.is_empty(), "T lines: {lines:?}");
+        assert_eq!(n_gen, 0);
+        assert_eq!(reason, "length");
     }
 
     #[test]

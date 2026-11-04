@@ -30,7 +30,7 @@
 //! the value the front-end's `t_line_logprob` (serve_api.py:1066–1074)
 //! parses from the `T` line.
 
-use crate::{parse_float_strict, strtol};
+use crate::{parse_float_strict, parse_int_strict};
 
 /// The five `SAMPLE` fields (temperature, top_k, top_p, min_p, seed).
 #[derive(Debug, Clone, PartialEq)]
@@ -79,14 +79,17 @@ impl SampleParams {
     }
 
     /// Parse the exact `SAMPLE %.9g %d %.9g %.9g %d` field tokens the
-    /// front-end emits after the keyword (C-library number semantics via
-    /// `crate::parse_float_strict`/`crate::strtol`).
+    /// front-end emits after the keyword. All five fields parse strictly
+    /// (`crate::parse_float_strict`/`crate::parse_int_strict`): a field
+    /// with trailing junk (`20x`) rejects the whole clause, matching the
+    /// reference's `malformed SAMPLE` rejection (spec §6) and
+    /// `protocol::parse_gen`'s strict integer fields.
     pub fn parse_sample(fields: [&str; 5]) -> Option<Self> {
         let temperature = parse_float_strict(fields[0])?;
-        let top_k = strtol(fields[1]);
+        let top_k = parse_int_strict(fields[1])?;
         let top_p = parse_float_strict(fields[2])?;
         let min_p = parse_float_strict(fields[3])?;
-        let seed = strtol(fields[4]);
+        let seed = parse_int_strict(fields[4])?;
         Self::new(temperature, top_k, top_p, min_p, seed)
     }
 }
@@ -188,7 +191,6 @@ pub fn sample(logits: &[f32], params: &SampleParams, rng: &mut Rng) -> Option<Sa
         .iter()
         .map(|(_, score)| (score - max).exp())
         .collect();
-    let total: f64 = exps.iter().sum();
 
     // top-k: keep the k highest scores (k = 0 keeps everything).
     let mut order: Vec<usize> = (0..scored.len()).collect();
@@ -202,17 +204,26 @@ pub fn sample(logits: &[f32], params: &SampleParams, rng: &mut Rng) -> Option<Sa
 
     // min-p: drop tokens below min_p × the best surviving probability.
     if params.min_p > 0.0 && !kept.is_empty() {
-        let best = exps[kept[0]];
-        kept.retain(|&index| exps[index] >= params.min_p * best);
+        let best = kept[0];
+        let threshold = params.min_p * exps[best];
+        kept.retain(|&index| exps[index] >= threshold);
+        // Degenerate min_p (e.g. > 1, where even the best token fails):
+        // always keep the best, per the module docs' keep-best rule.
+        if kept.is_empty() {
+            kept.push(best);
+        }
     }
 
-    // top-p: keep the shortest descending prefix with cumulative mass
-    // >= p (always at least one token).
+    // top-p: keep the shortest descending prefix whose cumulative mass
+    // reaches p (always at least one token). The mass is measured over
+    // the surviving (post top-k/min-p) distribution — the same one the
+    // roulette renormalises against below — not the full softmax.
     if params.top_p < 1.0 && !kept.is_empty() {
+        let surviving: f64 = kept.iter().map(|&index| exps[index]).sum();
         let mut cumulative = 0.0;
         let mut prefix = 0usize;
         for &index in &kept {
-            cumulative += exps[index] / total;
+            cumulative += exps[index] / surviving;
             prefix += 1;
             if cumulative >= params.top_p {
                 break;
@@ -398,6 +409,39 @@ mod tests {
             SampleParams::new(0.7, 0, 0.95, 0.0, 0).is_some(),
             "k == 0 (off)"
         );
+        assert!(
+            SampleParams::new(f64::NAN, 20, 0.95, 0.0, 0).is_none(),
+            "t NaN (neither 0 nor in (0, 2])"
+        );
+    }
+
+    #[test]
+    fn parse_sample_rejects_fields_with_trailing_junk() {
+        // Strict integer fields (matching `protocol::parse_gen`): a
+        // lenient `strtol`-style read would accept `20x` as 20.
+        assert_eq!(
+            SampleParams::parse_sample(["0.7", "20x", "0.95", "0.05", "42"]),
+            None,
+            "top_k 20x"
+        );
+        assert_eq!(
+            SampleParams::parse_sample(["0.7", "20", "0.95", "0.05", "4.5"]),
+            None,
+            "seed 4.5"
+        );
+    }
+
+    #[test]
+    fn min_p_above_one_degrades_to_keep_best() {
+        // Degenerate min_p > 1: even the best token fails the threshold,
+        // so the keep-best rule applies (module docs) instead of
+        // returning None.
+        let logits = [0.5f32, 2.0, 1.0];
+        let params = SampleParams::new(1.0, 0, 1.0, 2.0, 3).expect("valid");
+        let mut rng = Rng::new(3);
+        for _ in 0..20 {
+            assert_eq!(sample(&logits, &params, &mut rng).unwrap().index, 1);
+        }
     }
 
     #[test]
