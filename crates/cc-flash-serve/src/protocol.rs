@@ -27,7 +27,7 @@
 //! the `--ck` file's 4-byte magic via `hgn::format_of` to report the real
 //! `checkpoint_format`); `handle_line` is unit-testable without a socket.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
@@ -214,13 +214,56 @@ pub fn serve_connection(stream: TcpStream, info: &EngineInfo) {
     }
 }
 
+/// Classify an error returned by [`TcpListener::accept`] (and therefore by
+/// `incoming()`): `true` means the error is transient and the accept loop
+/// must keep running, `false` means the listening socket is gone and the
+/// loop should stop.
+///
+/// The contract source is the reference's accept loop
+/// ([`evidence/flash_serve/decompile/main-FUN_01ede7e0.json`](../../../docs/analysis/evidence/flash_serve/decompile/main-FUN_01ede7e0.json),
+/// decompiled `main`): after `accept()` returns -1 it reads `errno` and
+/// breaks only on `EINTR` (4) — every other errno, including
+/// `ECONNABORTED` (103), falls through and re-accepts. The reference
+/// breaks on `EINTR` because its SIGINT/SIGTERM handlers (installed in the
+/// same decompile) make `EINTR` the shutdown signal; the port installs no
+/// signal handlers, so `Interrupted` is treated as retryable here, while
+/// the genuinely fatal kinds (dead fd, wrong family, permission) end the
+/// loop as they would in the reference once its socket closes.
+pub fn is_transient_accept_error(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+    )
+}
+
 /// The accept loop behind `run_serve`: bind succeeded, so answer every
 /// connection on its own thread (the reference serves `--slots` concurrent
 /// sessions; one thread per connection keeps a persistent probe connection
-/// from blocking new clients). Blocks until `incoming()` errors.
+/// from blocking new clients). Blocks until `incoming()` fails fatally.
+///
+/// Transient accept errors must not end the loop: on Linux `accept()`
+/// returns `ECONNABORTED` when a peer resets a queued connection before
+/// `accept()` completes it, and `std::net::TcpListener::incoming()`
+/// surfaces that as `Err(io::Error)` (kind `ConnectionAborted`) instead of
+/// skipping it — [`is_transient_accept_error`] keeps the loop alive there,
+/// matching the reference (which re-accepts on every errno except the
+/// `EINTR` its signal handlers use for shutdown). The earlier
+/// break-on-any-error version killed the live engine: `serve_api`
+/// reconnects per request (open → INFO → GEN → close), the first
+/// ECONNABORTED ended the loop, `run_serve` returned 0 and the process
+/// exited silently — the observed symptom was the 66 GB weight `Vec`
+/// disappearing with no panic or error line after the front-end's first
+/// reconnect cycle.
 pub fn serve_forever(listener: &TcpListener, info: &EngineInfo) {
     for conn in listener.incoming() {
-        let Ok(stream) = conn else { break };
+        let stream = match conn {
+            Ok(stream) => stream,
+            Err(err) if is_transient_accept_error(err.kind()) => continue,
+            Err(_) => break,
+        };
         let info = info.clone();
         thread::spawn(move || serve_connection(stream, &info));
     }
@@ -361,6 +404,49 @@ mod tests {
         assert_eq!(pld_pair(None), (0, 0));
         assert_eq!(pld_pair(Some("bad".to_string())), (0, 0));
         assert_eq!(pld_pair(Some("1,2".to_string())), (1, 2));
+    }
+
+    #[test]
+    fn transient_accept_errors_keep_the_loop_alive() {
+        // ECONNABORTED (a peer resetting a queued connection) is the
+        // documented Linux case that std's incoming() surfaces as an Err;
+        // the reference re-accepts on it (main-FUN_01ede7e0: only EINTR
+        // breaks). The rest of the transient set is retried for the same
+        // reason.
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(is_transient_accept_error(kind), "{kind:?} must be retried");
+        }
+    }
+
+    #[test]
+    fn fatal_accept_errors_stop_the_loop() {
+        // A dead or unusable listening socket cannot recover by retrying.
+        // (The task's `BadFileDescriptor`/`AddressFamily`/`AddressInUse`
+        // names are not in this toolchain's std, so the fatal set is
+        // exercised through the variants it does have.)
+        for kind in [
+            ErrorKind::NotConnected,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotFound,
+            ErrorKind::InvalidInput,
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::AlreadyExists,
+            ErrorKind::TimedOut,
+            ErrorKind::WriteZero,
+        ] {
+            assert!(
+                !is_transient_accept_error(kind),
+                "{kind:?} must stop the loop"
+            );
+        }
     }
 
     #[test]
