@@ -129,20 +129,28 @@ against the raw binary bytes).
   `Q4C-P` (e.g. `mtp.layers.0.experts: the head's experts must be Q4C-P
   (got %s / %s)`,
   [`binutils-strings.txt:1488`](../evidence/flash_serve/binutils-strings.txt)).
-- **[D]** Dtype code → name resolves through a table at `PTR_DAT_020baa68`
-  whose full contents are unverified; only `0=f32`, `1=f16`, `2=bf16` are
-  confirmed (port `dtype_name`, hgn.rs:216–224). Dtype code `0x10` exists
-  in real checkpoints (queried by `FUN_020bdc70`, §7) but its name is a
-  documented gap — revisit by dumping the table at `PTR_DAT_020baa68`.
-  **Round-2 observation (real checkpoint):** entries carry at least codes
-  `0` (`layers.0.attn_hyper_connection.hc_norm.weight`, kind 1), `5`
-  (`embed_tokens.weight`, kind 2) and `24`
-  (`layers.0.attn_hyper_connection.block_inject_weight.weight`, kind 2);
-  the payload sizes contradict the port's `0=f32` mapping (dtype 0 with
-  2 B/element, not 4) and give fixed bytes-per-element per code (code 24 →
-  0.8125 B/elem on two tensors, code 5 → ≈0.5625 B/elem + 64 B), so the
-  on-disk dtype numbering likely differs from the tools' in-memory one —
-  the table dump at `PTR_DAT_020baa68` remains the revisit path.
+- **[D]** Dtype code → name table **resolved round 3**: the table at
+  `PTR_DAT_020baa68` lives in the shipped **`halogen-tools`** binary (the
+  same address in `flash_serve` holds code; the symbol came from the
+  tools' `inspect` handler,
+  [inspect-FUN_01eed5d0.json](../evidence/halogen-tools/decompile/inspect-FUN_01eed5d0.json));
+  dumped via `rea read-bytes`
+  ([dtype-table-PTR_DAT_020baa68.json](../evidence/flash_serve/engine/dtype-table-PTR_DAT_020baa68.json)
+  + the `.rodata` blob it indexes):
+  `0=bf16`, `1=f32`, `2=f16`, `3=i32`, `4=i64`, `5=q4c`, `6=fp8r`,
+  `7=q8g64`, `8=i4l`, `9=NULL`, `10=fp8g`, `11=q8s32`, `12=q6k`,
+  `13=iq4nl`, `14=q4a`, `15=q5a`, `16=ht`, `17–19=NULL`, `20=q8_0`,
+  `21=q5_0`, `22=q5_1`, `23=i4r`, `24=q6g64`.
+  The port's `dtype_name`
+  ([hgn.rs](../../crates/cc-halogen-tools/src/hgn.rs), `0=f32`, `1=f16`,
+  `2=bf16`) is wrong — the reference maps `0=bf16`, `1=f32`, `2=f16`; this
+  resolves the
+  round-2 contradiction (real `hc_norm.weight` dtype 0 with 2 B/element)
+  and names the codes seen in the real checkpoint: `5` → `q4c`
+  (`embed_tokens.weight`), `24` → `q6g64`
+  (`layers.0.attn_hyper_connection.block_inject_weight.weight`) and
+  `0x10` → `ht` (queried by `FUN_020bdc70`, §7). The validity mask
+  `0x1f1fdff` matches the NULL slots (codes 9, 17, 18, 19).
 - **[RV]** The MTP head is a *separate* `.hgn` file —
   `qwen38-flash-next-mtp.hgn` from the weights repo, named by
   `HALOGEN_MTP_HEAD`; a llama.cpp MTP draft GGUF is not read
@@ -184,12 +192,22 @@ against the raw binary bytes).
   `FUN_02018ae0`; max context `min(factor · 262144, 1048576)`; the error
   renders the allowed factors literally (`"(4 for 1048576, 2 for 524288)"`,
   [ctx-validator-FUN_01f24220.json](../evidence/flash_serve/decompile/ctx-validator-FUN_01f24220.json)).
-- **[D]** Attention head count, head dimension and GQA ratio are **not yet
-  extracted** — documented gap. Revisit: the model-config constructor
-  (reachable from the engine ctor chain, §3) and the attention kernel names
-  `k_attn_fa2`, `k_attn_qs`, `k_attn_fd`, `k_rope_blocks`,
-  `k_rope_w_mrope` (mrope ⇒ multi-resolution RoPE variants) in
-  `binutils-strings.txt`.
+- **[RV]** Attention head configuration **resolved round 3** (real
+  checkpoint tensor table + `FUN_01f82410`): `head_dim = 256`
+  (`self_attn.q_norm`/`k_norm` width), `num_heads = 48`
+  (`self_attn.q_proj.weight` `[12288, 2560]`), `num_kv_heads = 2`
+  (`self_attn.k_proj`/`v_proj.weight` `[512, 2560]`) → GQA ratio 24:1.
+  Full attention exists in 12 of the 48 main layers (indices 3, 7, …, 47 —
+  every 4th; the other 36 layers are `linear_attn`) plus the MTP head; the
+  KV-pool sizing function `FUN_01f82410` cross-checks this: per position it
+  returns `(K+V)·13 + 2880` with `K = V = 0x400` (512 × bf16) in bf16 mode
+  and `0x208`/`0x220` (512+8 / 512+32 — fp8 payloads with scale blocks) in
+  KV8 mode (`FUN_01f6ff70() == 1`); the `× 0xd` is the 12 main attention
+  layers + 1 MTP layer
+  ([fun-01f82410.json](../evidence/flash_serve/engine/fun-01f82410.json),
+  [fun-02019610.json](../evidence/flash_serve/engine/fun-02019610.json)).
+  Observed `self_attn.o_proj.weight` is `[2560, 6144]` — input 6144 =
+  24 × 256, half the `q_proj` output — noted for future investigation.
 
 ## 3. Forward pass
 
@@ -454,11 +472,11 @@ Exact algorithm, from
 
 | § | Gap | Revisit address / source |
 |---|---|---|
-| 1 | dtype code `0x10` name; codes `5`/`24` observed in the real checkpoint (round 2) also unnamed, and the real `hc_norm.weight` (dtype 0, 2 B/elem) contradicts the port's `0=f32` mapping | table `PTR_DAT_020baa68` |
+| 1 | ~~dtype code `0x10` name; codes `5`/`24` observed in the real checkpoint (round 2) also unnamed, and the real `hc_norm.weight` (dtype 0, 2 B/elem) contradicts the port's `0=f32` mapping~~ **resolved round 3 [D]:** full table dumped from `halogen-tools` `PTR_DAT_020baa68` (§1, [dtype-table-PTR_DAT_020baa68.json](../evidence/flash_serve/engine/dtype-table-PTR_DAT_020baa68.json)): `0=bf16`, `1=f32`, `2=f16`, `5=q4c`, `16=ht`, `24=q6g64`, …; port `dtype_name` mapping corrected in §1 (the same address in `flash_serve` holds code, not the table) | — |
 | 1 | ~~reference `.hgn` entry layout vs port `hgn.rs`~~ **resolved round 2 [RV]:** on-disk entry = name `0..96` / dtype u32 @96 / kind u32 @100 / dims u64×4 @104..@136 / data_offset u64 @136 / nbytes u64 @144 / uninterpreted u64 @152; confirmed against `qwen38-flash-next-v2-abliterated.hgn` (66,687,678,432 B, first-4 KiB sha256 `0ccfefcdb01b67708b05865be5f5778828f2f7027377313616c48bc8b9ce62a0`) and `FUN_020be0a0`; port readers in `cc-flash-serve` + `cc-halogen-tools` corrected (the old name `0..32`/dtype @32/nbytes @40 accessors were the tools' in-memory layout, not on-disk) | — |
 | 1 | ~~version gate {1, 2} vs the port's ungated reader~~ **resolved round 2:** `cc-flash-serve` reader gates to {1, 2} (wording `checkpoint: unsupported version in %s` per `FUN_020bea30`); real file is version 2; `cc-halogen-tools` stays ungated (no version error in its spec table, v7 fixtures pinned by the matrix) | — |
 | 1 | `FUN_020bd2d0` full decompile | decompile pending |
-| 2 | attention head count / head dim / GQA | model-config ctor; `k_attn_*`/`k_rope_*` kernels |
+| 2 | ~~attention head count / head dim / GQA~~ **resolved round 3 [RV]:** `num_heads = 48`, `head_dim = 256`, `num_kv_heads = 2` (GQA 24:1) from the real checkpoint's `self_attn` tensor dims + `FUN_01f82410`'s KV sizing (§2, [fun-01f82410.json](../evidence/flash_serve/engine/fun-01f82410.json)); 12 main attention layers (3, 7, …, 47) + 1 MTP layer = the `× 13` multiplier; `o_proj` input 6144 (half the `q_proj` output) noted for follow-up | — |
 | 4 | MTP-head loader function (`FUN_01f24c10`/`FUN_01f24d00` resolved as composable-context instead) | `FUN_01f24580`/`FUN_01f24690` ctor steps |
 | 5 | `FUN_020bdd90` (resident-gib `extra` field) | 3.1 MB function, re-run queued |
 | 4 | `HALOGEN_MTP_DEPTH` default 2 vs 3 contradiction | mode-dispatcher vs frozen spec |
