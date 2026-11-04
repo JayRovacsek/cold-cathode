@@ -6,3 +6,6 @@ edition = "2021"
 [[bin]]
 name = "flash_serve"
 path = "src/main.rs"
+
+[dependencies]
+memmap2 = "0.9"

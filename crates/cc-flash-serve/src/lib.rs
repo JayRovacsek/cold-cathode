@@ -245,9 +245,10 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     // Checkpoint load (after the GPU check, before binding): the reference
     // answers INFO from loaded weights; the port previously answered from
     // its configuration and never read the file (the user's observation
-    // that RAM never grew when serving). `hgn::load` reads the whole file
-    // into one contiguous Vec — std-only, mmap deferred per the module
-    // docs. Failure wordings come from `hgn` (the tools spec's exact
+    // that RAM never grew when serving). `hgn::load` mmaps the file by
+    // default (the reference's `Pin::None`); `HALOGEN_WEIGHTS_ANON=1`
+    // selects the pinned `fs::read` path per the module docs. Failure
+    // wordings come from `hgn` (the tools spec's exact
     // strings); a GGUF checkpoint only warns because the port's GGUF
     // weight load is deferred (repack-only) while the reference's server
     // reads GGUFs directly.

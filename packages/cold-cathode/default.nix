@@ -9,7 +9,7 @@ rustPlatform.buildRustPackage {
     "^crates(/.*)?$"
   ];
 
-  cargoHash = "sha256-kJgt08OfjDqoblquhq7P9hvMNa/APoFcNmNpgyTNBhM=";
+  cargoHash = "sha256-Z5dDZu+lBtpPrjIFyobzxacxYoz4eH+rT2hM3MITguo=";
 
   meta.mainProgram = "cold-cathode";
 }

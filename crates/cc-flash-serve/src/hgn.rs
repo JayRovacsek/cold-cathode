@@ -53,11 +53,15 @@
 //! lacks one) and `FUN_020be0a0` itself rejects bad versions silently, so
 //! the engine string is the only derivable reference wording.
 //!
-//! Weight residency: [`load`] reads the whole file into one contiguous
-//! `Vec<u8>` (std-only — the crate takes no crates.io dependencies, so no
-//! `memmap2`). Memory-mapping the payload region is the eventual
-//! optimisation, deferred until the dependency policy allows it; the
-//! contiguous read is what makes the process RSS grow when serving.
+//! Weight residency: [`load`] memory-maps the file by default (the
+//! reference's `Pin::None` behaviour — `checkpoint: mapped %.1f GB, NOT
+//! pinned`, `FUN_020bea30`): file-backed pages are reclaimable, so the
+//! kernel can evict them under memory pressure instead of OOM-killing the
+//! process. `HALOGEN_WEIGHTS_ANON=1` selects the reference's opt-in
+//! `std::fs::read` path instead (`checkpoint: HALOGEN_WEIGHTS_ANON=1:
+//! %.2f GiB of weights in anonymous memory, long-term pinned`), which
+//! costs an extra copy of the file in anonymous memory on top of the page
+//! cache.
 //!
 //! The `--resident-gib` query keeps its own inferred 32-byte header reader
 //! (`lib.rs::hgn_header`, review F3: falsified against the reference but
@@ -216,9 +220,25 @@ impl TensorEntry {
     }
 }
 
+/// Resident checkpoint bytes: either a file-backed mmap (the reference's
+/// default, `Pin::None`) or an owned anonymous buffer
+/// (`HALOGEN_WEIGHTS_ANON=1`).
+pub enum Data {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Data {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Data::Mapped(m) => m.as_ref(),
+            Data::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
 /// A parsed `.hgn` checkpoint: the header, the tensor table and the
 /// resident file contents.
-#[derive(Clone)]
 pub struct Checkpoint {
     pub header: Header,
     pub file_bytes: u64,
@@ -226,9 +246,8 @@ pub struct Checkpoint {
     /// Total declared weight payload (sum of entry `nbytes`) — the
     /// resident-weight size the `--resident-gib` query reports.
     pub weight_bytes: u64,
-    /// The file contents held as one contiguous resident buffer (the
-    /// mmap-deferred stand-in for the engine's mapped weights).
-    pub data: Vec<u8>,
+    /// The file contents, mapped or owned per [`Data`] (module docs).
+    pub data: Data,
 }
 
 impl fmt::Debug for Checkpoint {
@@ -243,40 +262,89 @@ impl fmt::Debug for Checkpoint {
     }
 }
 
-/// Read and validate the file at `path`, returning the reference's exact
-/// error wording (all [RV] except the format errors marked [D] in the
-/// tools spec).
-pub fn load(path: &str) -> Result<Checkpoint, String> {
-    let bytes = std::fs::read(path).map_err(|_| format!("cannot open {path}"))?;
-    let file_bytes = bytes.len() as u64;
-    load_prefix(path, bytes, file_bytes)
+/// True when `HALOGEN_WEIGHTS_ANON` is set to `1` — the reference's opt-in
+/// to anonymous pinned weights (otherwise the file is mmapped; see `load`).
+/// Kept pure so the env branch is unit-testable without mutating the
+/// process environment (which races under cargo test's parallel harness).
+fn anon_requested(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
-/// Parse from a leading prefix of the file at `path` (or of the bytes
-/// themselves) given the true `file_bytes`. `load` is the whole-file case;
-/// the env-gated real-checkpoint test uses this to validate the header and
-/// first entries without reading the full 66 GB. Entries are read only
-/// while fully present in the prefix.
-pub fn load_prefix(path: &str, prefix: Vec<u8>, file_bytes: u64) -> Result<Checkpoint, String> {
-    let header = Header::parse(path, &prefix, file_bytes)?;
-    let available = prefix.len().saturating_sub(header.table_offset as usize);
-    let present = (available / ENTRY_BYTES) as u64;
-    let mut entries = Vec::with_capacity(header.entry_count.min(present) as usize);
-    for index in 0..header.entry_count.min(present) as usize {
-        let offset = header.table_offset as usize + index * ENTRY_BYTES;
-        entries.push(TensorEntry {
-            raw: prefix[offset..offset + ENTRY_BYTES]
-                .try_into()
-                .expect("160-byte slice"),
-        });
-    }
-    let weight_bytes = entries.iter().map(TensorEntry::nbytes).sum();
+/// Read and validate the file at `path`, returning the reference's exact
+/// error wording (all [RV] except the format errors marked [D] in the
+/// tools spec). Maps the file by default; `HALOGEN_WEIGHTS_ANON=1`
+/// selects the reference's pinned `fs::read` path (module docs).
+pub fn load(path: &str) -> Result<Checkpoint, String> {
+    load_with(
+        path,
+        anon_requested(std::env::var("HALOGEN_WEIGHTS_ANON").ok().as_deref()),
+    )
+}
+
+/// Load `path` with an explicit residency choice: `anon == true` reads the
+/// file into an owned `Vec<u8>` (the reference's
+/// `HALOGEN_WEIGHTS_ANON=1` path), `anon == false` memory-maps it (the
+/// reference's default `Pin::None`).
+pub fn load_with(path: &str, anon: bool) -> Result<Checkpoint, String> {
+    let (data, file_bytes) = if anon {
+        let bytes = std::fs::read(path).map_err(|_| format!("cannot open {path}"))?;
+        let file_bytes = bytes.len() as u64;
+        (Data::Owned(bytes), file_bytes)
+    } else {
+        let file = std::fs::File::open(path).map_err(|_| format!("cannot open {path}"))?;
+        // SAFETY: the checkpoint is a static read-only file; the reference
+        // mmaps the same file (`FUN_020bea30`), and nothing else writes it.
+        // External truncation after mapping would SIGBUS on access
+        // (memmap2's documented contract); the reference's mmap carries the
+        // same risk.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|_| format!("checkpoint: mmap failed on {path}"))?;
+        let file_bytes = mmap.len() as u64;
+        (Data::Mapped(mmap), file_bytes)
+    };
+    let header = Header::parse(path, data.as_slice(), file_bytes)?;
+    let (entries, weight_bytes) = parse_entries(&header, data.as_slice());
     Ok(Checkpoint {
         header,
         file_bytes,
         entries,
         weight_bytes,
-        data: prefix,
+        data,
+    })
+}
+
+/// Read the tensor table described by `header` out of `bytes`, returning
+/// the entries (only those fully present) and their summed payload size.
+fn parse_entries(header: &Header, bytes: &[u8]) -> (Vec<TensorEntry>, u64) {
+    let available = bytes.len().saturating_sub(header.table_offset as usize);
+    let present = (available / ENTRY_BYTES) as u64;
+    let mut entries = Vec::with_capacity(header.entry_count.min(present) as usize);
+    for index in 0..header.entry_count.min(present) as usize {
+        let offset = header.table_offset as usize + index * ENTRY_BYTES;
+        entries.push(TensorEntry {
+            raw: bytes[offset..offset + ENTRY_BYTES]
+                .try_into()
+                .expect("160-byte slice"),
+        });
+    }
+    let weight_bytes = entries.iter().map(TensorEntry::nbytes).sum();
+    (entries, weight_bytes)
+}
+
+/// Parse from a leading prefix of the file at `path` (or of the bytes
+/// themselves) given the true `file_bytes`. The env-gated real-checkpoint
+/// test uses this to validate the header and first entries without reading
+/// the full 66 GB. Entries are read only while fully present in the
+/// prefix.
+pub fn load_prefix(path: &str, prefix: Vec<u8>, file_bytes: u64) -> Result<Checkpoint, String> {
+    let header = Header::parse(path, &prefix, file_bytes)?;
+    let (entries, weight_bytes) = parse_entries(&header, &prefix);
+    Ok(Checkpoint {
+        header,
+        file_bytes,
+        entries,
+        weight_bytes,
+        data: Data::Owned(prefix),
     })
 }
 
@@ -307,9 +375,10 @@ impl Checkpoint {
     /// actually present (defensive parsing per the prefix reader).
     pub fn tensor_bytes(&self, index: usize) -> Option<&[u8]> {
         let entry = self.entries.get(index)?;
-        let start = (entry.data_offset() as usize).min(self.data.len());
-        let len = (entry.nbytes() as usize).min(self.data.len() - start);
-        Some(&self.data[start..start + len])
+        let data = self.data.as_slice();
+        let start = (entry.data_offset() as usize).min(data.len());
+        let len = (entry.nbytes() as usize).min(data.len() - start);
+        Some(&data[start..start + len])
     }
 
     /// Warn-level anomaly for the serve log: the declared payloads run
@@ -583,6 +652,46 @@ mod tests {
         let junk = write_scratch("ccfs-junk-format.bin", b"junk");
         assert_eq!(format_of(&junk), None);
         assert_eq!(format_of("/nonexistent-checkpoint"), None);
+    }
+
+    #[test]
+    fn load_with_mmap_matches_the_anon_read_path() {
+        // Both residency modes must produce identical parsing results;
+        // exercised via load_with directly because the env var is
+        // process-global and races under cargo test's parallel harness.
+        let mut bytes = header(2, 1, 104, "qwen-mmap");
+        bytes.extend_from_slice(&entry(
+            "blk.0.q",
+            [1, 0, 0, 0],
+            0,
+            1,
+            104 + ENTRY_BYTES as u64,
+            4,
+        ));
+        bytes.extend_from_slice(&[0x5au8; 4]);
+        let path = write_scratch("ccfs-hgn-mmap-anon.hgn", &bytes);
+        let mapped = load_with(&path, false).expect("mmap load");
+        assert!(matches!(mapped.data, Data::Mapped(_)));
+        let owned = load_with(&path, true).expect("read load");
+        assert!(matches!(owned.data, Data::Owned(_)));
+        // The manual Debug impl omits `data`, so the whole struct compares.
+        assert_eq!(format!("{mapped:?}"), format!("{owned:?}"));
+        assert_eq!(mapped.file_bytes, bytes.len() as u64);
+        assert_eq!(mapped.header.model_id, "qwen-mmap");
+        assert_eq!(mapped.entries.len(), 1);
+        assert_eq!(mapped.entries[0].name(), "blk.0.q");
+        assert_eq!(mapped.weight_bytes, 4);
+        assert_eq!(mapped.tensor_bytes(0).expect("entry 0"), &[0x5au8; 4]);
+        assert_eq!(owned.tensor_bytes(0).expect("entry 0"), &[0x5au8; 4]);
+        assert_eq!(mapped.data.as_slice(), owned.data.as_slice());
+    }
+
+    #[test]
+    fn anon_requested_matches_the_reference_env_semantics() {
+        assert!(anon_requested(Some("1")));
+        assert!(!anon_requested(None));
+        assert!(!anon_requested(Some("0")));
+        assert!(!anon_requested(Some("1x")));
     }
 
     /// Parse the real reference checkpoint header without reading the full
