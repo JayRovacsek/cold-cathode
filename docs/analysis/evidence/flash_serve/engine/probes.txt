@@ -1,0 +1,23 @@
+# flash_serve engine runtime probes — 2026-11-04 (sandboxed shell, no GPU)
+# reference: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve (sha256 7c92fe3f8ac544c4fb690a69e9ce359fa7b8d453a8eab8e9a1289c6f2309c012)
+
+$ flash_serve --resident-gib crates/cc-contract-tests/fixtures/stub.gguf
+exit=1
+--- stdout:
+--- stderr:
+
+$ flash_serve --resident-gib crates/cc-contract-tests/fixtures/qwen4exp-minimal.gguf
+exit=1
+--- stdout:
+--- stderr:
+
+$ flash_serve --resident-gib /nix/store/.../bin/flash_serve (the ELF itself)
+exit=1
+--- stdout:
+--- stderr:
+
+$ flash_serve --help (serve usage, exit 2)
+exit=2
+--- stdout:
+--- stderr:
+usage: /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve [--ck FILE] [--port P] [--bind ADDR] [--slots B] [--ctx N] [--max-tok N] [--kv-pool POSITIONS]
