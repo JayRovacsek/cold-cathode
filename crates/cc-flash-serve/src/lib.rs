@@ -42,6 +42,7 @@ const DEFAULT_MAX_TOK: i64 = 8192;
 pub const DEFAULT_MTP_DEPTH: i64 = 2;
 /// `HALOGEN_MTP_DEPTH_HI` default (spec `flash_serve-mtp-kv-npu.md`
 /// §1.3: 3 when `HALOGEN_MTP_DEPTH` is unset).
+// TODO: implement the HI-forcing rule from MTP spec §1.3 (HI forced 0 unless DEPTH >= 2 and HI > DEPTH)
 pub const DEFAULT_MTP_DEPTH_HI: i64 = 3;
 /// `HALOGEN_SPEC_N` implied by the default MTP depth (`SPEC_N >= D + 1`,
 /// spec `flash_serve-mtp-kv-npu.md` §1.3).
@@ -332,7 +333,7 @@ fn validate_env() -> Result<(), String> {
         }
     }
     if let Some(v) = env_var("HALOGEN_MTP_DEPTH") {
-        if parse_int_strict(&v).is_none_or(|d| d < 1) {
+        if parse_int_strict(&v).is_none_or(|d| d < 1 || (d > DEFAULT_SPEC_N && d != 1)) {
             return Err(format!(
                 "flash_serve: HALOGEN_MTP_DEPTH={v} needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is {DEFAULT_SPEC_N})"
             ));
@@ -1007,6 +1008,11 @@ mod tests {
                 "HALOGEN_MTP_DEPTH",
                 "x",
                 "flash_serve: HALOGEN_MTP_DEPTH=x needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 3)",
+            ),
+            (
+                "HALOGEN_MTP_DEPTH",
+                "5",
+                "flash_serve: HALOGEN_MTP_DEPTH=5 needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 3)",
             ),
             (
                 "HALOGEN_MTP_DEPTH_HI",

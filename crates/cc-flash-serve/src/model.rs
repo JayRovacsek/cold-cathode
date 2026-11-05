@@ -385,6 +385,7 @@ fn load_attn(tensor: &dyn Fn(&str) -> Option<Tensor>, prefix: &str, h: usize) ->
     let k_norm = tensor(&format!("{prefix}.self_attn.k_norm.weight"))?.vector()?;
     let v = tensor(&format!("{prefix}.self_attn.v_proj.weight"))?.matrix()?;
     let o = tensor(&format!("{prefix}.self_attn.o_proj.weight"))?.matrix()?;
+    // revisit when the second-half consumer gap closes
     if q.cols != h || k.cols != h || v.cols != h || o.cols != q.rows / 2 || o.rows != h {
         return None;
     }
@@ -506,10 +507,14 @@ fn load_mlp(tensor: &dyn Fn(&str) -> Option<Tensor>, prefix: &str, h: usize) -> 
     if down.cols != ffn || down.rows != num_experts * h {
         return None;
     }
-    if shared_gate_proj.cols != h || shared_gate_proj.rows != ffn || shared_up_proj.rows != ffn {
+    // The shared expert's FFN width is its own (the real file's shared
+    // expert is narrower than the routed experts); only `ffn` belongs to
+    // the routed set.
+    let shared_ffn = shared_gate_proj.rows;
+    if shared_gate_proj.cols != h || shared_up_proj.rows != shared_ffn {
         return None;
     }
-    if shared_down_proj.rows != h || shared_down_proj.cols != ffn {
+    if shared_down_proj.rows != h || shared_down_proj.cols != shared_ffn {
         return None;
     }
     Some(Mlp {
@@ -541,24 +546,21 @@ impl Mlp {
         self.down.gemv_rows(expert * h, h, &act)
     }
 
-    /// The MoE forward for one token: router top-k softmax-weighted expert
-    /// sum plus the sigmoid-gated shared expert (spec §3 `FUN_01f9f8c0`;
-    /// the n=1 decode path treats the small-batch variant `FUN_01f98d30`
-    /// as the same math).
+    /// The MoE forward for one token: softmax over all router logits with
+    /// the top-k normalised weights (the Qwen3-Next convention), then the
+    /// expert sum plus the sigmoid-gated shared expert (spec §3
+    /// `FUN_01f9f8c0`; the n=1 decode path treats the small-batch variant
+    /// `FUN_01f98d30` as the same math).
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         let h = self.down.rows / self.gate.rows;
-        let router = self.gate.gemv(x);
-        let mut ranked: Vec<(f32, usize)> = router
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (v, i))
-            .collect();
+        let mut probs = self.gate.gemv(x);
+        ops::softmax(&mut probs);
+        let mut ranked: Vec<(f32, usize)> =
+            probs.into_iter().enumerate().map(|(i, p)| (p, i)).collect();
         ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
         let selected: Vec<(f32, usize)> = ranked.into_iter().take(self.top_k).collect();
-        let mut scores: Vec<f32> = selected.iter().map(|(logit, _)| *logit).collect();
-        ops::softmax(&mut scores);
         let mut out = vec![0.0; h];
-        for (weight, expert) in scores.iter().zip(selected.iter().map(|(_, e)| *e)) {
+        for (weight, expert) in selected {
             let expert_out = self.expert_out(expert, x);
             for (o, value) in out.iter_mut().zip(&expert_out) {
                 *o += weight * *value;
@@ -967,6 +969,41 @@ mod tests {
         bytes.extend_from_slice(&entry);
         let ck = hgn::load_prefix("ccfs-q4c.hgn", bytes, 264).expect("loads");
         assert!(load(&ck).is_none());
+    }
+
+    #[test]
+    fn mlp_forward_normalises_the_full_router_before_selecting_top_k() {
+        // Review fix #2 (Qwen3-Next convention): softmax runs over all
+        // router logits and the top-k probabilities are used as expert
+        // weights. Softmaxing only the selected subset (the previous
+        // behaviour) renormalised them to sum to 1 and inflated the
+        // routed output.
+        let s = ops::silu(1.0);
+        let mlp = Mlp {
+            gate: Matrix::new(3, 1, vec![0.0, 1.0, 2.0]).unwrap(),
+            // per expert: gate row 1.0, up row 1.0 → act = silu(1.0)
+            gate_up: Matrix::new(6, 1, vec![1.0; 6]).unwrap(),
+            // expert e's down row is e + 1 → expert_out(e) = (e + 1) · s
+            down: Matrix::new(3, 1, vec![1.0, 2.0, 3.0]).unwrap(),
+            // the shared expert contributes exactly 0 (silu(0) · 1
+            // through a zero down_proj)
+            shared_gate_proj: Matrix::new(1, 1, vec![0.0]).unwrap(),
+            shared_up_proj: Matrix::new(1, 1, vec![1.0]).unwrap(),
+            shared_down_proj: Matrix::new(1, 1, vec![0.0]).unwrap(),
+            shared_router: vec![0.0],
+            ffn: 1,
+            top_k: 2,
+        };
+        let mut probs = vec![0.0f32, 1.0, 2.0];
+        ops::softmax(&mut probs);
+        let expected = (3.0 * probs[2] + 2.0 * probs[1]) * s;
+        let out = mlp.forward(&[1.0]);
+        assert_eq!(out.len(), 1);
+        assert!(
+            (out[0] - expected).abs() <= expected.abs().max(1.0) * 1e-6,
+            "expected {expected}, got {}",
+            out[0]
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! rather than depending on the `half` crate, keeping the Cargo
 //! dependency set (and its `cargoHash`) unchanged.
 //!
-//! The dtype codes the reference table assigns to the resident formats are
+//! The dtype codes the reference table assigns to the resident *float* formats are
 //! `0=bf16`, `1=f32`, `2=f16`, `3=i32`, `4=i64`; the quantised codes
 //! (`5=q4c`, `16=ht`, `23=i4r`, `24=q6g64`, …) have no dequant codec
 //! specified yet (spec §1 resolved table, §3 `[D]` entries), so

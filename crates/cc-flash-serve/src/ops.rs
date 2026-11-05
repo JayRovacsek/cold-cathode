@@ -189,6 +189,8 @@ pub fn conv1d_step(
 ) -> Vec<f32> {
     debug_assert_eq!(x.len(), channels, "conv input width");
     debug_assert_eq!(weight.len(), channels * kernel, "conv weight shape");
+    // `kernel - 1` below would underflow when kernel == 0.
+    debug_assert!(kernel > 0, "conv kernel width");
     let hist_len = kernel - 1;
     debug_assert!(
         history.len().is_multiple_of(channels.max(1)) && history.len() <= hist_len * channels,
