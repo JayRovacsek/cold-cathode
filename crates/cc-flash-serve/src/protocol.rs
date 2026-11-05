@@ -315,12 +315,17 @@ fn done_line(
 /// prompt plus max_tokens inside the context).
 const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 
-/// The reference's generation progress interval in seconds: the double
-/// `0x403e000000000000` (30.0) in the decompiled `main`'s config
-/// initialisation
-/// ([`evidence/flash_serve/decompile/main-FUN_01ede7e0.json`](../../../docs/analysis/evidence/flash_serve/decompile/main-FUN_01ede7e0.json)),
-/// confirmed live by the reference journal emitting its generation lines
-/// at 30.0 s and 60.0 s of a request.
+/// The reference's generation progress interval in seconds: 30.0, pinned
+/// by the live reference journal (review 🟡-1): the journal excerpt
+/// archived at
+/// [`evidence/flash_serve/live-journal-excerpts.md`](../../../docs/analysis/evidence/flash_serve/live-journal-excerpts.md)
+/// shows the reference emitting its generation lines at 30.0 s and 60.0 s
+/// of one request (`req 2 generated 1748 tokens, 30.0 s` / `3383 tokens,
+/// 60.0 s`). The double `0x403e000000000000` (30.0) in the decompiled
+/// `main`'s config initialisation is *not* evidence for this constant:
+/// both occurrences assign `local_19a0`, the `HALOGEN_ADMIT_AGE_S`
+/// admission-age default (the earlier commit's attribution was wrong; the
+/// value itself is right).
 const GEN_PROGRESS_INTERVAL_SECS: f64 = 30.0;
 
 /// The reference's generation progress line, instantiated:
@@ -337,11 +342,17 @@ pub(crate) fn generated_line(req: i64, n_gen: usize, elapsed_s: f64) -> String {
 /// The reference's prompt-load progress line, instantiated:
 /// `flash_serve: req %ld prefill %d/%d tokens, 0.0 s%s`
 /// ([`evidence/flash_serve/binutils-strings.txt`](../../../docs/analysis/evidence/flash_serve/binutils-strings.txt):601).
-/// The port's prefill is the prompt itself (the same reading the `P`
-/// progress line takes in [`gen_response_with`]), so the line is emitted
-/// once with `processed == total` and the format string's fixed `0.0 s`
-/// time; the trailing `%s` suffix's variants are not pinned in the
-/// evidence, so the port emits it empty (flagged in the port notes).
+/// The binary carries a second prefill format string at :2400,
+/// `flash_serve: req %ld prefill %d/%d tokens, %.1f s` (measured time, no
+/// `%s`): :2400 is the right variant for cold/measured prefills, while
+/// :601's fixed `0.0 s` is presumably the cache-hit variant (review
+/// 💡-4). Both render identically for the port's instant prefill, so the
+/// port keeps the :601 shape. The port's prefill is the prompt itself (the
+/// same reading the `P` progress line takes in [`gen_response_with`]), so
+/// the line is emitted once with `processed == total` and the format
+/// string's fixed `0.0 s` time; the trailing `%s` suffix's variants are
+/// not pinned in the evidence, so the port emits it empty (flagged in the
+/// port notes).
 pub(crate) fn prefill_line(req: i64, processed: i64, total: i64) -> String {
     format!("flash_serve: req {req} prefill {processed}/{total} tokens, 0.0 s")
 }
@@ -987,8 +998,9 @@ mod tests {
             generated_line(2, 3383, 60.04),
             "flash_serve: req 2 generated 3383 tokens, 60.0 s"
         );
-        // Cadence (the double 30.0 in the decompiled main's config init):
-        // silent before 30 s, one line per elapsed 30 s interval after.
+        // Cadence (the live journal's 30.0 s / 60.0 s ticks, see
+        // GEN_PROGRESS_INTERVAL_SECS): silent before 30 s, one line per
+        // elapsed 30 s interval after.
         let mut progress = GenProgress::new(2);
         assert_eq!(progress.line_at(1, 0.0), None);
         assert_eq!(progress.line_at(1747, 29.99), None);
@@ -1036,6 +1048,34 @@ mod tests {
         );
         let lines: Vec<&str> = reply.split('\n').collect();
         assert_eq!(lines.len(), 3, "two T lines + the D line: {reply:?}");
+        // The exact T lines (the pattern of
+        // serve_connection_streams_a_gen_reply_over_a_socket and
+        // gen_reply_streams_t_lines_and_a_done_line): each carries the
+        // greedy token the forward stub produces for the running context,
+        // with the sampling layer's logprob.
+        let mut context = vec![5];
+        for line in &lines[..2] {
+            let logits = forward.logits(&context);
+            let expected =
+                sampling::sample(&logits, &SampleParams::greedy(), &mut sampling::Rng::new(0))
+                    .expect("sampled");
+            assert_eq!(
+                *line,
+                format!("T 2 {} {}", expected.index, fmt_g(expected.logprob))
+            );
+            context.push(expected.index as i64);
+        }
+        // The D line's fixed fields (decode_ms measures the wall clock, so
+        // the sibling test's field-by-field pattern rather than a full
+        // string match).
+        let done: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(done.len(), 33, "D line {reply:?}");
+        assert_eq!(done[0], "D");
+        assert_eq!(done[1], "2"); // req
+        assert_eq!(done[2], "length"); // reason: budget exhausted, no eos
+        assert_eq!(done[3], "1"); // n_prompt
+        assert_eq!(done[4], "2"); // n_gen
+        assert_eq!(done[17], "2"); // max_tokens
     }
 
     #[test]
@@ -1239,18 +1279,30 @@ mod tests {
 
     #[test]
     fn sequential_probes_are_answered_while_a_connection_is_open_but_idle() {
-        // Regression for the live startup INFO probe failure: the
-        // launcher's wait_for_engine probe and serve_api's capability
-        // probe each hold a connection while they wait for a reply, and
-        // the engine must answer every one of them. One open-but-idle
-        // connection (a probe that connected but has not sent its line —
-        // exactly what a connect-only readiness check leaves behind) must
-        // not stop two further sequential INFO probes from being served:
-        // serve_forever answers each connection on its own thread, so a
-        // connection that blocks in read_line never queues the next ones
-        // behind it (the single-threaded accept loop this replaced served
-        // one connection at a time, and the idle connection starved the
-        // probes behind it).
+        // Covers the probe pattern at the serve_forever level (review
+        // 🟡-2): the launcher's wait_for_engine probe and serve_api's
+        // capability probe each hold a connection while they wait for a
+        // reply, and the engine must answer every one of them. One
+        // open-but-idle connection (a probe that connected but has not
+        // sent its line — exactly what a connect-only readiness check
+        // leaves behind) must not stop two further sequential INFO probes
+        // from being served: serve_forever answers each connection on its
+        // own thread, so a connection that blocks in read_line never
+        // queues the next ones behind it (the single-threaded accept loop
+        // this replaced served one connection at a time, and the idle
+        // connection starved the probes behind it).
+        //
+        // Scope: this test spawns serve_forever directly, so it exercises
+        // the per-connection threading from the earlier refactor and
+        // passes equally on code before the run_serve bind-order fix — it
+        // does not cover that fix itself. The bind-order fix lives in
+        // `run_serve` (lib.rs), whose startup sequence is not cleanly
+        // extractable into a testable `build_state_then_bind` helper
+        // (ServeState borrows the Forward, which borrows the Checkpoint —
+        // returning the pair from a helper would need a self-referential
+        // struct — and the real load needs a GPU and the checkpoint file),
+        // so the ordering there is upheld by the code comment above the
+        // bind instead.
         let info = fixture_info();
         let expected_info = info_line(&info);
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
