@@ -202,7 +202,7 @@ if (iVar10 < 2 || uVar25 <= iVar10) uVar25 = 0;  /* HI only when DEPTH ≥ 2 and
   `K = V = 0x400` (512 elements × bf16 = the 2 KV heads × 256 dim) in
   bf16 mode → **29 504 B/position** (the frozen spec's "about 29.5 KiB a
   position, 262144 = 7.2 GiB"), and `K = 0x208` (512 B fp8 payload + 8 B
-  scales), `V = 0x220` (512 B + 32 B scales) in KV8 mode → 16 816
+  scales), `V = 0x220` (512 B + 32 B scales) in KV8 mode → 16 712
   B/position. The `× 13` is the 12 main attention layers + 1 MTP layer
   (engine spec §2).
 - **[D]** **KV8 mode — `FUN_01f6ff70`**

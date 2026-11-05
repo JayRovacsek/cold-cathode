@@ -23,7 +23,12 @@
 //! plus the [`SlotRecord::commit_window`] counter): a caller appends
 //! positions, then either commits them ([`SlotRecord::commit`]) or discards
 //! the last n ([`SlotRecord::rollback`]), restoring the exact prior state.
+//! The snapshot deque holds exactly one snapshot per uncommitted position
+//! ([`SlotRecord::uncommitted`]): appending pushes, committing prunes the
+//! now-unreachable snapshots from the front, and rolling back pops from the
+//! back, so the retained memory stays bounded by the uncommitted window.
 
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::process;
@@ -108,6 +113,12 @@ pub fn kv8_mode() -> Kv8Mode {
 /// 2 KV heads × 256 dim); KV8 rows are `K = 0x208` (512 B fp8 payload +
 /// 8 B scales) and `V = 0x220` (512 B + 32 B scales). Mode 2 sizes like
 /// bf16 (spec §2: the sizing branch only special-cases `1`).
+///
+/// The `0x214`-vs-`0x208` resolution: the `slots_alloc_pooled` banner
+/// maths quotes `0x104 + 0x110 = 0x214` per row (doubled to `0x428` for
+/// K+V), while the sizing function `FUN_01f82410` — the function that
+/// actually determines the pool size — uses `K = 0x208`. The port follows
+/// the sizing function (spec §2).
 pub fn kv_row_bytes(mode: Kv8Mode) -> (usize, usize) {
     match mode {
         Kv8Mode::Kv8 => (0x208, 0x220),
@@ -120,9 +131,9 @@ pub fn kv_row_bytes(mode: Kv8Mode) -> (usize, usize) {
 ///
 /// The decompile evaluates this to 29 504 B in bf16 mode (matching the
 /// frozen spec's "about 29.5 KiB a position") and 16 712 B in KV8 mode —
-/// the spec prose quotes 16 816 for KV8, an arithmetic slip in the prose
-/// (the formula and the `0x208`/`0x220` row sizes give 16 712); the port
-/// implements the decompile formula.
+/// the spec's original 16 816 figure for KV8 was an arithmetic slip,
+/// corrected in a spec erratum (the formula and the `0x208`/`0x220` row
+/// sizes give 16 712); the port implements the decompile formula.
 pub fn bytes_per_position(mode: Kv8Mode) -> usize {
     let (k, v) = kv_row_bytes(mode);
     (k + v) * 13 + 0xb40
@@ -185,6 +196,9 @@ impl Budget {
             weights_gib: checkpoint.weight_bytes as f64 / GIB,
             host_reserve_gib: host_reserve_gib(),
             slots,
+            // The port has no n-gram state yet; the reference derives the
+            // n-gram flag (param_7) from the engine's n-gram state, and
+            // the port defaults it off.
             ngram_on: false,
             max_tok,
             ..Budget::default()
@@ -290,7 +304,7 @@ const SMALL_CONTROL: usize = 0x300; // +0x078, 768 B
 const STATE_SMALL: usize = 0x10; // +0x090, 16 B
 const STATE_MAIN: usize = 0x2_d000; // +0x098, 184 KiB
 const KV_REGION: usize = 0xf_2800; // +0x0b8, 993 280 B
-const ALT_SMALL_CONTROL: usize = 0x300; // +0x0d0, 20 KiB block pair
+const ALT_SMALL_CONTROL: usize = 0x300; // +0x0d0, 768 B
 const ALT_STATE_BLOCK: usize = 0x5000; // +0x0e0
 
 /// Per-layer recurrent state: the accumulated (post-RoPE) keys/values for
@@ -358,7 +372,8 @@ pub struct SlotRecord {
     /// positions are staged but not yet committed. The port models it as
     /// `[uncommitted, 0, 0]` (see [`Self::commit`] and [`Self::rollback`]).
     pub commit_window: [u32; 3],
-    /// +0x119c — the MTP staging flag.
+    /// +0x119c — the MTP staging flag (the port: 1 while the commit window
+    /// holds uncommitted positions, 0 once it empties).
     pub mtp_staged: u8,
     /// +0x119d — the number of verify rings (sized by `spec_n`).
     pub verify_rings: u8,
@@ -370,10 +385,15 @@ pub struct SlotRecord {
     pub layers: Vec<LayerRuntime>,
     /// The logits produced by the last token step.
     pub logits: Vec<f32>,
-    /// Snapshots of every shorter prefix: index `i` holds the layer state
-    /// and logits after the first `i + 1` tokens. This is what
-    /// [`Self::rollback`] restores from.
-    pub prefixes: Vec<(Vec<LayerRuntime>, Vec<f32>)>,
+    /// Snapshots of the slot's shorter prefixes: entry `i` holds the layer
+    /// state and logits of the first `i` tokens (entry 0 is the empty
+    /// state captured by the first append). The deque holds exactly one
+    /// entry per uncommitted position ([`Self::uncommitted`]):
+    /// [`Self::append_step`] pushes, [`Self::commit`] prunes the front
+    /// (committed prefixes are no longer rollback targets) and
+    /// [`Self::rollback`] pops the back, bounding retained memory to the
+    /// uncommitted window.
+    pub prefixes: VecDeque<(Vec<LayerRuntime>, Vec<f32>)>,
 }
 
 impl Default for SlotRecord {
@@ -410,7 +430,7 @@ impl SlotRecord {
             context: Vec::new(),
             layers: Vec::new(),
             logits: Vec::new(),
-            prefixes: Vec::new(),
+            prefixes: VecDeque::new(),
         }
     }
 
@@ -424,23 +444,32 @@ impl SlotRecord {
     /// Run one token step on the slot (the `forward` token step over the
     /// slot's layer state) and record the position: the previous state
     /// becomes a prefix snapshot, the new logits become current, and the
-    /// row is marked kept and uncommitted.
-    pub fn append_step(&mut self, model: &Model, token: i64) -> Vec<f32> {
-        if !self.context.is_empty() {
-            // The outgoing current state is the snapshot for the prefix
-            // ending at the previous token.
-            self.prefixes
-                .push((self.layers.clone(), self.logits.clone()));
+    /// row is marked kept and uncommitted. Errors when the slot's
+    /// `max_seq` bound is exhausted (a `0` bound is unset, matching the
+    /// reference's `--max-seq` semantics).
+    pub fn append_step(&mut self, model: &Model, token: i64) -> Result<Vec<f32>, String> {
+        if self.max_seq > 0 && self.context.len() as u64 >= self.max_seq {
+            return Err(format!(
+                "append_step: the slot holds {} positions, max_seq is {}",
+                self.context.len(),
+                self.max_seq
+            ));
         }
+        // The outgoing current state is the snapshot for the prefix
+        // ending at the previous token (the empty state for the first
+        // append), keeping `prefixes.len() == uncommitted()`.
+        self.prefixes
+            .push_back((self.layers.clone(), self.logits.clone()));
         let position = self.context.len();
         let logits = crate::forward::forward_token(model, token, position, &mut self.layers);
         self.context.push(token);
         self.keep_flags.push(true);
         self.commit_window[0] = self.commit_window[0].saturating_add(1);
+        self.mtp_staged = 1;
         self.seq_len = self.context.len() as u64;
         self.position = self.context.len() as u64;
         self.logits = logits.clone();
-        logits
+        Ok(logits)
     }
 
     /// The number of appended positions not yet committed (the port's
@@ -449,10 +478,26 @@ impl SlotRecord {
         self.commit_window[0] as usize
     }
 
-    /// Commit the last `n` appended positions (spec §2: the commit-window
-    /// fields record how many speculative positions become committed).
-    pub fn commit(&mut self, n: usize) {
-        self.commit_window[0] = self.commit_window[0].saturating_sub(n as u32);
+    /// Commit `n` positions from the front of the commit window (the
+    /// oldest uncommitted positions, spec §2: the commit-window fields
+    /// record how many speculative positions become committed). The
+    /// snapshots of the newly committed prefixes become unreachable
+    /// (rollback can no longer target them) and are pruned from the front
+    /// of [`Self::prefixes`], bounding retained memory. Errors when `n`
+    /// exceeds the uncommitted positions (mirroring [`Self::rollback`]).
+    pub fn commit(&mut self, n: usize) -> Result<(), String> {
+        if n > self.uncommitted() {
+            return Err(format!(
+                "commit({n}): only {} positions are uncommitted",
+                self.uncommitted()
+            ));
+        }
+        self.commit_window[0] -= n as u32;
+        self.mtp_staged = u8::from(self.uncommitted() > 0);
+        for _ in 0..n {
+            self.prefixes.pop_front();
+        }
+        Ok(())
     }
 
     /// Discard the last `n` appended positions, restoring the exact layer
@@ -479,14 +524,15 @@ impl SlotRecord {
         for _ in 0..n {
             let (layers, logits) = self
                 .prefixes
-                .pop()
-                .expect("n <= context.len() - 1 == prefixes.len()");
+                .pop_back()
+                .expect("n <= uncommitted() == prefixes.len()");
             self.layers = layers;
             self.logits = logits;
             self.context.pop();
             self.keep_flags.pop();
         }
         self.commit_window[0] -= n as u32;
+        self.mtp_staged = u8::from(self.uncommitted() > 0);
         self.seq_len = self.context.len() as u64;
         self.position = self.context.len() as u64;
         Ok(())
@@ -707,13 +753,18 @@ mod tests {
             budget.pool_positions(Kv8Mode::Kv8),
             positions_from_bytes(available, Kv8Mode::Kv8)
         );
-        // Without the KV8 extra the pool is larger (the extra is only
-        // charged in mode 1).
+        // The absolute count, pinned from the formula: available
+        // 34 590 592 861 B ÷ 16 712 B/position = 2 069 805 positions,
+        // rounded down to 256 units = 2 069 760 (below the 0x1000000 cap).
+        assert_eq!(budget.pool_positions(Kv8Mode::Kv8), 2_069_760);
+        // Without the KV8 extra the pool is strictly larger (the extra is
+        // only charged in mode 1; the 1 GiB extra costs ~64 249 positions,
+        // so `>` is provable where `>=` would also pass a deleted gate).
         let plain = Budget {
             kv8_extra_gib: 0.0,
             ..budget
         };
-        assert!(plain.pool_positions(Kv8Mode::Kv8) >= budget.pool_positions(Kv8Mode::Kv8));
+        assert!(plain.pool_positions(Kv8Mode::Kv8) > budget.pool_positions(Kv8Mode::Kv8));
     }
 
     #[test]
@@ -747,33 +798,113 @@ mod tests {
         let m = crate::model::load(&ck).expect("the mini fixture loads the real path");
         let mut slot = SlotRecord::with_model(&m);
         for token in [1i64, 2, 3, 4, 5] {
-            slot.append_step(&m, token);
+            slot.append_step(&m, token)
+                .expect("the unset max_seq accepts every append");
         }
         assert_eq!(slot.context, vec![1, 2, 3, 4, 5]);
         assert_eq!(slot.uncommitted(), 5);
+        assert_eq!(slot.prefixes.len(), slot.uncommitted());
         // Roll the last three positions back.
         slot.rollback(3)
             .expect("three uncommitted positions roll back");
         assert_eq!(slot.context, vec![1, 2]);
         assert_eq!(slot.uncommitted(), 2);
+        assert_eq!(slot.prefixes.len(), slot.uncommitted());
         // The restored state must equal a fresh two-token recompute.
         let mut fresh = SlotRecord::with_model(&m);
         for token in [1i64, 2] {
-            fresh.append_step(&m, token);
+            fresh.append_step(&m, token).expect("unset max_seq");
         }
         assert_eq!(slot.logits, fresh.logits);
         assert_eq!(slot.layers, fresh.layers);
         // Committing the remaining positions leaves nothing to roll back.
-        slot.commit(2);
+        slot.commit(2).expect("two positions commit");
         assert_eq!(slot.uncommitted(), 0);
+        assert_eq!(slot.prefixes.len(), 0);
         assert!(slot.rollback(1).is_err());
         // And a further append continues from the restored state.
-        let logits3 = slot.append_step(&m, 3);
+        let logits3 = slot.append_step(&m, 3).expect("unset max_seq");
         let mut fresh3 = fresh.clone();
         assert_eq!(
             logits3,
-            fresh3.append_step(&m, 3),
+            fresh3.append_step(&m, 3).expect("unset max_seq"),
             "appending after a rollback matches the unbroken context"
         );
+    }
+
+    #[test]
+    fn commit_prunes_snapshots_to_the_uncommitted_count() {
+        // The snapshot deque holds exactly one entry per uncommitted
+        // position: appending 5, committing 3 and appending 2 more keeps
+        // 5 → 2 → 4 snapshots, never the O(N²) unbounded growth of an
+        // unpruned history.
+        let ck = crate::model::mini_checkpoint();
+        let m = crate::model::load(&ck).expect("the mini fixture loads the real path");
+        let mut slot = SlotRecord::with_model(&m);
+        for token in [1i64, 2, 3, 4, 5] {
+            slot.append_step(&m, token).expect("unset max_seq");
+        }
+        assert_eq!(slot.prefixes.len(), 5);
+        assert_eq!(slot.mtp_staged, 1, "positions staged while uncommitted");
+        slot.commit(3).expect("three positions commit");
+        assert_eq!(slot.prefixes.len(), 2);
+        assert_eq!(slot.prefixes.len(), slot.uncommitted());
+        assert_eq!(slot.mtp_staged, 1, "still staged while uncommitted");
+        // The pruned snapshots are exactly the committed prefixes: the
+        // front entry is now the state of the three-token committed
+        // prefix. Appending two more and rolling them back restores the
+        // five-token state and keeps the boundary snapshot.
+        let committed = slot.prefixes.front().expect("front snapshot").0.clone();
+        let after_five = slot.layers.clone();
+        for token in [6i64, 7] {
+            slot.append_step(&m, token).expect("unset max_seq");
+        }
+        assert_eq!(slot.prefixes.len(), 4);
+        assert_eq!(slot.prefixes.len(), slot.uncommitted());
+        slot.rollback(2)
+            .expect("all uncommitted positions roll back");
+        assert_eq!(slot.context, vec![1, 2, 3, 4, 5]);
+        assert_eq!(slot.layers, after_five);
+        assert_eq!(slot.prefixes.len(), 2);
+        assert_eq!(slot.prefixes.len(), slot.uncommitted());
+        assert_eq!(slot.prefixes.front().expect("front snapshot").0, committed);
+        // Committing the rest empties the window and clears the staging
+        // flag; committing more than the window holds errors (symmetry
+        // with rollback's over-attempt error).
+        slot.commit(2).expect("two positions commit");
+        assert_eq!(slot.prefixes.len(), 0);
+        assert_eq!(
+            slot.mtp_staged, 0,
+            "the flag clears once the window empties"
+        );
+        assert_eq!(
+            slot.commit(1).unwrap_err(),
+            "commit(1): only 0 positions are uncommitted"
+        );
+    }
+
+    #[test]
+    fn append_step_enforces_the_max_seq_bound() {
+        // A slot with a set max_seq accepts appends up to the bound and
+        // errors past it (a positions=0 slot region would otherwise accept
+        // unbounded appends); the unset 0 bound is tested in
+        // `append_and_rollback_round_trip_matches_a_fresh_recompute`.
+        let ck = crate::model::mini_checkpoint();
+        let m = crate::model::load(&ck).expect("the mini fixture loads the real path");
+        let mut slot = SlotRecord::with_model(&m);
+        slot.max_seq = 2;
+        slot.append_step(&m, 1)
+            .expect("first position within bound");
+        slot.append_step(&m, 2)
+            .expect("second position within bound");
+        assert_eq!(
+            slot.append_step(&m, 3).unwrap_err(),
+            "append_step: the slot holds 2 positions, max_seq is 2"
+        );
+        assert_eq!(slot.context, vec![1, 2]);
+        // After rolling one position back the bound has room again.
+        slot.rollback(1).expect("one position rolls back");
+        slot.append_step(&m, 9).expect("append within bound again");
+        assert_eq!(slot.context, vec![1, 9]);
     }
 }

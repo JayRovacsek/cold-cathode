@@ -100,13 +100,16 @@ impl<'a> Forward<'a> {
         }
     }
 
-    /// Commit the last `n` appended positions of the cached sequence (the
-    /// port's counterpart of the reference's commit-window mechanics,
-    /// spec §2: drafted rows whose K/V were written speculatively become
-    /// committed). No-op wording-wise when nothing is cached.
-    pub fn commit(&self, n: usize) {
-        if let Some(pool) = self.pool.borrow_mut().as_mut() {
-            pool.slots_mut()[0].commit(n);
+    /// Commit `n` positions from the front of the cached sequence's commit
+    /// window (the port's counterpart of the reference's commit-window
+    /// mechanics, spec §2: drafted rows whose K/V were written
+    /// speculatively become committed). Errors when nothing is cached or
+    /// `n` exceeds the uncommitted positions (mirroring [`Self::rollback`]).
+    pub fn commit(&self, n: usize) -> Result<(), String> {
+        let mut pool = self.pool.borrow_mut();
+        match pool.as_mut() {
+            Some(pool) => pool.slots_mut()[0].commit(n),
+            None => Err(format!("commit({n}): no cached sequence to commit")),
         }
     }
 
@@ -142,9 +145,13 @@ impl<'a> Forward<'a> {
             // (the historical cache behaviour).
             *slot = SlotRecord::with_model(model);
         }
-        let mut logits = slot.logits.clone();
+        // The loop always runs at least once here (the equal-context case
+        // returned above), so the loop's logits are the result.
+        let mut logits = Vec::new();
         for &token in context.iter().skip(slot.context.len()) {
-            logits = slot.append_step(model, token);
+            logits = slot
+                .append_step(model, token)
+                .expect("extending a cached context stays within the slot's max-seq bound");
         }
         logits
     }
@@ -455,7 +462,7 @@ mod tests {
         let fresh = Forward::new(&ck);
         assert_eq!(fresh.logits(&[1, 2]), forward.logits(&[1, 2]));
         // Committing the remaining positions leaves nothing to roll back.
-        forward.commit(2);
+        forward.commit(2).expect("two positions commit");
         assert!(forward.rollback(1).is_err());
         // Extending past the committed prefix still matches a fresh run.
         assert_eq!(five, forward.logits(&[1, 2, 3, 4, 5]));
