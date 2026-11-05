@@ -206,8 +206,21 @@ against the raw binary bytes).
   layers + 1 MTP layer
   ([fun-01f82410.json](../evidence/flash_serve/engine/fun-01f82410.json),
   [fun-02019610.json](../evidence/flash_serve/engine/fun-02019610.json)).
-  Observed `self_attn.o_proj.weight` is `[2560, 6144]` — input 6144 =
-  24 × 256, half the `q_proj` output — noted for future investigation.
+  `self_attn.o_proj.weight` `[2560, 6144]` **resolved round 4 [D]**
+  (full-attention block forward `FUN_01fb3670`, §3,
+  [fun-01fb3670.json](../evidence/flash_serve/engine/fun-01fb3670.json)):
+  the block's attention core operates on **24 query heads × 256 =
+  6144** — the RoPE wrapper receives head count `0x18` (24) for q (and
+  `0x2` for k), the attention kernel's q slot stride is `0x3000` bytes
+  (6144 fp8 activations), and the `o_proj` gemv contracts exactly
+  `0x1800` (6144) → `0xa00` (2560). The `q_proj` gemv still computes
+  all 12288 rows (the weight table exposes `q_proj` as two 6144-row
+  halves `DAT_02127a40`/`DAT_02127a48` plus a combined handle
+  `DAT_02127a38`); the rope/attention path consumes the 6144 (24
+  heads) via the layer+`0x460` buffer fed by the `HALOGEN_QK_PREP`
+  kernel from the gemv output (layer+`0x280`). Which consumer uses the
+  second 6144-row half is an open sub-gap (Gaps register; candidates:
+  the QSA indexer path, the MTP head, a second attention pass).
 
 ## 3. Forward pass
 
@@ -223,6 +236,72 @@ against the raw binary bytes).
   router, 512 `experts` and a `shared_expert`; PLE ngram heads
   (`qwen4exp.ple.*`, §2); `hyper_connection_mixer` (also present in the
   MTP head, §4).
+- **[D]** **Layer dispatcher and block forwards (resolved round 4):**
+  `FUN_01ffe2e0(model, layer, tokens)`
+  ([fun-01ffe2e0.json](../evidence/flash_serve/engine/fun-01ffe2e0.json))
+  executes one decoder layer: hyper-connection pre-mix `FUN_01f8c690(…, 0)`
+  → block dispatch on the layer-type byte
+  (`*(model->layers + layer·0xd08) == 1` → full attention `FUN_01fb3670`,
+  else linear attention `FUN_01fa0700`) → MLP `FUN_01f9f8c0` (a
+  small-batch variant `FUN_01f98d30` runs first for token counts < 9 when
+  the layer's own buffers at +0x800/+0x8f0/+0x9e0 are staged; the result
+  flag is stored at model+`0x57f`) → hyper-connection post-mix
+  `FUN_01f8c690(…, 1)`. With verbose timing on, `hipEventRecord` slots
+  indexed by layer (`DAT_0212a0a0 + layer·7`, 7 qwords per layer for the
+  48 main layers; 5 stages used: pre-mix start/end, attention end, MLP
+  end, post-mix end) bracket the stages — the decompile counterpart of
+  the per-stage timing template above. The function iterates the layer
+  range (tail: `param_2 + 1` while `< 0x2f`), so one call drives a full
+  48-layer forward for the token batch.
+- **[D]** **Full-attention block forward `FUN_01fb3670`**
+  ([fun-01fb3670.json](../evidence/flash_serve/engine/fun-01fb3670.json))
+  — op sequence per token batch, confirming the frozen
+  `norm → qkv → rope → attention → projection` template:
+  1. QSA index gemv `indexer.index_qk_proj` `[640, 2560]` → layer+`0x470`
+     (gated by `HALOGEN_QSA_DENSE`; the staging error text names the same
+     indexer and its `block_topk`);
+  2. qkv projection gemvs: `q_proj` 12288 rows (combined handle
+     `DAT_02127a38`, also exposed as two 6144-row halves
+     `DAT_02127a40`/`DAT_02127a48`) → layer+`0x280`; `k_proj`/`v_proj`
+     512 rows each → layer+`0x2f8`/`0x370`;
+  3. `HALOGEN_QK_PREP` kernel (grid `tokens × 0x1b`) — the per-head
+     `q_norm`/`k_norm` [256] application (§2), writing the rope inputs
+     layer+`0x460` (q, 6144 wide) and layer+`0x468` (k);
+  4. RoPE wrapper `FUN_01f88ea0`: q 24 heads × `0x100` (256),
+     k 2 heads × `0x100` (the 24-vs-48 head asymmetry is resolved in the
+     §2 `o_proj` note);
+  5. KV-cache append (`hipMemcpyAsync`, device pointers layer+`0xc30` /
+     `0xc38`, 1024 B per token = 2 × 512 B fp8 k+v, matching the §2 KV8
+     sizing);
+  6. attention kernel — `k_attn_fd` for batches n ≤ 8 via `FUN_01fb9970`
+     (error text `forward_batch: the per-row attention is k_attn_fd only
+     (HALOGEN_ATTN_FD=%d, n=%d > %d?)`);
+  7. `o_proj` gemv `[2560, 6144]` → layer+`0x3e8` (the block output
+     hidden-state slot).
+- **[D]** **Linear-attention block forward `FUN_01fa0700` — Gated
+  DeltaNet math (resolved round 4)**
+  ([fun-01fa0700.json](../evidence/flash_serve/engine/fun-01fa0700.json)):
+  identified as Gated DeltaNet from the `k_dn_*`/`k_dnc_*` kernel family
+  in `binutils-strings.txt` and the §2 tensor set. Op sequence:
+  1. gemv `in_proj_qkv` `[10240, 2560]` → block+`0x8` (packed q/k/v:
+     v = 6144 = 48 heads × 128; q/k = 2048 each inferred from the
+     10240 − 6144 split — the head split is an open sub-gap, Gaps
+     register);
+  2. gemv `in_proj_z` `[6144, 2560]` → block+`0x80` (output gate, v-width);
+  3. gemvs `in_proj_a` / `in_proj_b` `[48, 2560]` → block+`0xf8` /
+     `0x170` (per-v-head decay/input scalars);
+  4. depthwise causal conv1d `conv1d.weight` `[10240, 4]` over the packed
+     qkv, with a 3-token history state (`hipMemset` of `0xf000` =
+     3 × 10240 × 2 B at `flash_model.hip:3433`);
+  5. decay gates from `A_log` / `dt_bias` `[48]` (`k_dn_gates` kernel
+     family);
+  6. delta-rule recurrence (`k_dn_recur_step`): state 48 × 128 × 128
+     bf16 (`0x180000` bytes per slot, confirmed in the model ctor
+     `FUN_01f70c20` arena layout), step kernel grid 48 × block 128;
+  7. per-head `norm` `[128]` and gemv `out_proj` `[2560, 6144]`.
+  The exact recurrence formula (β normalisation and decay application
+  order) remains an open sub-gap pending the `k_dn_recur_step` GPU
+  code-object disassembly (Gaps register).
 - **[D]** Engine construction chain from `main`
   ([main-FUN_01ede7e0.json](../evidence/flash_serve/decompile/main-FUN_01ede7e0.json)):
   `FUN_01f24460(ck, pool, ctx, max_tok, slots, pooled)` → `FUN_020bea30` →
@@ -476,7 +555,10 @@ Exact algorithm, from
 | 1 | ~~reference `.hgn` entry layout vs port `hgn.rs`~~ **resolved round 2 [RV]:** on-disk entry = name `0..96` / dtype u32 @96 / kind u32 @100 / dims u64×4 @104..@136 / data_offset u64 @136 / nbytes u64 @144 / uninterpreted u64 @152; confirmed against `qwen38-flash-next-v2-abliterated.hgn` (66,687,678,432 B, first-4 KiB sha256 `0ccfefcdb01b67708b05865be5f5778828f2f7027377313616c48bc8b9ce62a0`) and `FUN_020be0a0`; port readers in `cc-flash-serve` + `cc-halogen-tools` corrected (the old name `0..32`/dtype @32/nbytes @40 accessors were the tools' in-memory layout, not on-disk) | — |
 | 1 | ~~version gate {1, 2} vs the port's ungated reader~~ **resolved round 2:** `cc-flash-serve` reader gates to {1, 2} (wording `checkpoint: unsupported version in %s` per `FUN_020bea30`); real file is version 2; `cc-halogen-tools` stays ungated (no version error in its spec table, v7 fixtures pinned by the matrix) | — |
 | 1 | `FUN_020bd2d0` full decompile | decompile pending |
-| 2 | ~~attention head count / head dim / GQA~~ **resolved round 3 [RV]:** `num_heads = 48`, `head_dim = 256`, `num_kv_heads = 2` (GQA 24:1) from the real checkpoint's `self_attn` tensor dims + `FUN_01f82410`'s KV sizing (§2, [fun-01f82410.json](../evidence/flash_serve/engine/fun-01f82410.json)); 12 main attention layers (3, 7, …, 47) + 1 MTP layer = the `× 13` multiplier; `o_proj` input 6144 (half the `q_proj` output) noted for follow-up | — |
+| 2 | ~~attention head count / head dim / GQA~~ **resolved round 3 [RV]:** `num_heads = 48`, `head_dim = 256`, `num_kv_heads = 2` (GQA 24:1) from the real checkpoint's `self_attn` tensor dims + `FUN_01f82410`'s KV sizing (§2, [fun-01f82410.json](../evidence/flash_serve/engine/fun-01f82410.json)); 12 main attention layers (3, 7, …, 47) + 1 MTP layer = the `× 13` multiplier; ~~`o_proj` input 6144 (half the `q_proj` output) noted for follow-up~~ **resolved round 4 [D]** (§2 `o_proj` note / §3 `FUN_01fb3670`: the attention core is 24 q-heads × 256 = 6144; the second `q_proj` half's consumer is registered below) | — |
+| 3 | consumer of the second 6144-row `q_proj` half (the rope/attention path consumes 6144 via layer+`0x460`; `o_proj` contracts 6144) | candidates: QSA indexer path, MTP head, a second attention pass — re-visit `FUN_01fb3670` branches + the `DAT_02127a38`/`DAT_02127a40`/`DAT_02127a48` handle set in `FUN_01f766f0` ([fun-01f766f0.json](../evidence/flash_serve/engine/fun-01f766f0.json)) |
+| 3 | linear_attn q/k head split (inferred 2048 + 2048 from `in_proj_qkv` 10240 − v 6144; no `0x800` constant appears in `FUN_01fa0700`) | `k_dn_*` kernel arguments in the AMDGPU code objects |
+| 3 | exact Gated DeltaNet recurrence formula (β normalisation, decay application order) | `k_dn_recur_step` GPU code-object disassembly |
 | 4 | MTP-head loader function (`FUN_01f24c10`/`FUN_01f24d00` resolved as composable-context instead) | `FUN_01f24580`/`FUN_01f24690` ctor steps |
 | 5 | `FUN_020bdd90` (resident-gib `extra` field) | 3.1 MB function, re-run queued |
 | 4 | `HALOGEN_MTP_DEPTH` default 2 vs 3 contradiction | mode-dispatcher vs frozen spec |
