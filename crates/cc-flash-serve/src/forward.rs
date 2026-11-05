@@ -12,9 +12,10 @@
 //!   MLP after every block, the top-level hyper-connection mixer and the
 //!   `lm_head` gemv. Single-token decode first: prefill is a
 //!   single-token loop over the context (the reference's paged slot pool,
-//!   spec §5, is a later increment), and the per-sequence KV/delta/conv
-//!   state is memoised in [`Forward::cache`] so extending the context by
-//!   one token costs one token step, not a full recompute.
+//!   spec §5, is ported in [`crate::kvcache`]), and the per-sequence
+//!   KV/delta/conv state is memoised in the pool-backed slot
+//!   ([`Forward::rollback`] / [`Forward::commit`]) so extending the
+//!   context by one token costs one token step, not a full recompute.
 //! * **Stub fallback** (the historical behaviour): checkpoints whose
 //!   weights cannot be run for real — the real
 //!   `qwen38-flash-next-v2-abliterated.hgn` stores its projections in
@@ -35,6 +36,7 @@
 use std::cell::RefCell;
 
 use crate::hgn;
+use crate::kvcache::{self, LayerRuntime, SlotPool, SlotRecord};
 use crate::model::{self, Block, Model, NORM_EPS, ROPE_THETA};
 use crate::ops;
 use crate::sampling::Rng;
@@ -52,28 +54,10 @@ pub struct Forward<'a> {
     /// tensor set (`model::load`); `None` selects the stub fallback
     /// (module docs).
     model: Option<Model>,
-    /// Per-sequence decode state (the in-memory stand-in for the
-    /// reference's slot pool, spec §5).
-    cache: RefCell<Option<Cache>>,
-}
-
-/// Memoised decode state for one context prefix.
-#[derive(Debug, Clone)]
-struct Cache {
-    context: Vec<i64>,
-    layers: Vec<LayerRuntime>,
-    logits: Vec<f32>,
-}
-
-/// Per-layer recurrent state: the accumulated (post-RoPE) keys/values for
-/// full-attention layers, the conv1d history and delta-rule states for
-/// linear-attention layers.
-#[derive(Debug, Clone)]
-struct LayerRuntime {
-    k: Vec<f32>,
-    v: Vec<f32>,
-    conv_hist: Vec<f32>,
-    delta: Vec<f32>,
+    /// The decode cache as a single-slot pool (the reference's slot pool,
+    /// spec §2, ported in [`crate::kvcache`]): created on the first real
+    /// logits call, holding the current sequence's slot record.
+    pool: RefCell<Option<SlotPool>>,
 }
 
 impl<'a> Forward<'a> {
@@ -85,7 +69,7 @@ impl<'a> Forward<'a> {
             checkpoint,
             vocab_size: vocab_size(checkpoint),
             model: model::load(checkpoint),
-            cache: RefCell::new(None),
+            pool: RefCell::new(None),
         }
     }
 
@@ -116,30 +100,52 @@ impl<'a> Forward<'a> {
         }
     }
 
+    /// Commit the last `n` appended positions of the cached sequence (the
+    /// port's counterpart of the reference's commit-window mechanics,
+    /// spec §2: drafted rows whose K/V were written speculatively become
+    /// committed). No-op wording-wise when nothing is cached.
+    pub fn commit(&self, n: usize) {
+        if let Some(pool) = self.pool.borrow_mut().as_mut() {
+            pool.slots_mut()[0].commit(n);
+        }
+    }
+
+    /// Roll the cached context back by `n` positions, restoring the exact
+    /// layer state of the shorter context (spec §2: speculative rows are
+    /// rolled back on rejection). Errors when there is no cached sequence
+    /// or `n` exceeds the uncommitted positions.
+    pub fn rollback(&self, n: usize) -> Result<(), String> {
+        let mut pool = self.pool.borrow_mut();
+        match pool.as_mut() {
+            Some(pool) => pool.slots_mut()[0].rollback(n),
+            None => Err(format!("rollback({n}): no cached sequence to roll back")),
+        }
+    }
+
     /// Real-path logits: reuse the cached prefix when the context only
     /// grew, otherwise re-run the single-token prefill loop (module docs).
     fn real_logits(&self, model: &Model, context: &[i64]) -> Vec<f32> {
-        let mut cache = self.cache.borrow_mut();
-        if let Some(cached) = cache.as_ref() {
-            if cached.context == context {
-                return cached.logits.clone();
-            }
+        let mut pool = self.pool.borrow_mut();
+        if pool.is_none() {
+            *pool = Some(SlotPool::single(
+                model,
+                self.checkpoint,
+                kvcache::kv8_mode(),
+            ));
         }
-        let (start, mut layers) = match cache.take() {
-            Some(cached) if context.starts_with(&cached.context) => {
-                (cached.context.len(), cached.layers)
-            }
-            _ => (0, new_runtimes(model)),
-        };
-        let mut logits = vec![0.0; model.dims.vocab];
-        for (position, &token) in context.iter().enumerate().skip(start) {
-            logits = forward_token(model, token, position, &mut layers);
+        let slot = &mut pool.as_mut().expect("pool just set").slots_mut()[0];
+        if slot.context == context {
+            return slot.logits.clone();
         }
-        *cache = Some(Cache {
-            context: context.to_vec(),
-            layers,
-            logits: logits.clone(),
-        });
+        if !context.starts_with(&slot.context) {
+            // A shorter or diverging context resets the slot and reruns
+            // (the historical cache behaviour).
+            *slot = SlotRecord::with_model(model);
+        }
+        let mut logits = slot.logits.clone();
+        for &token in context.iter().skip(slot.context.len()) {
+            logits = slot.append_step(model, token);
+        }
         logits
     }
 }
@@ -177,33 +183,10 @@ fn context_seed(context_ids: &[i64]) -> u64 {
     hash
 }
 
-/// Fresh per-layer runtimes for a new sequence (empty KV, zeroed conv
-/// history and delta states).
-fn new_runtimes(model: &Model) -> Vec<LayerRuntime> {
-    model
-        .layers
-        .iter()
-        .map(|layer| match &layer.block {
-            Block::Attention(_) => LayerRuntime {
-                k: Vec::new(),
-                v: Vec::new(),
-                conv_hist: Vec::new(),
-                delta: Vec::new(),
-            },
-            Block::Linear(linear) => LayerRuntime {
-                k: Vec::new(),
-                v: Vec::new(),
-                conv_hist: Vec::new(),
-                delta: vec![0.0; linear.v_heads * linear.v_head_dim * linear.head_dim],
-            },
-        })
-        .collect()
-}
-
 /// One token step: embedding lookup → 48 layers → final mixer → `lm_head`
 /// (spec §3; the per-layer stage order is `norm → qkv → rope → attention →
 /// projection → mlp` with the hyper-connection mixers around each block).
-fn forward_token(
+pub(crate) fn forward_token(
     model: &Model,
     token: i64,
     position: usize,
@@ -457,5 +440,24 @@ mod tests {
         let logits = forward.logits(&[model::MINI_VOCAB as i64 + 1]);
         assert_eq!(logits.len(), model::MINI_VOCAB);
         assert!(logits.iter().all(|logit| logit.is_finite()));
+    }
+
+    #[test]
+    fn rollback_restores_the_shorter_context_through_the_pool() {
+        // The forward-level round-trip (the slot-level port is tested in
+        // `kvcache`): append five positions, roll three back, and the
+        // two-token context must answer with the fresh-recompute logits.
+        let ck = model::mini_checkpoint();
+        let forward = Forward::new(&ck);
+        let five = forward.logits(&[1, 2, 3, 4, 5]);
+        assert!(five.iter().all(|logit| logit.is_finite()));
+        forward.rollback(3).expect("three positions roll back");
+        let fresh = Forward::new(&ck);
+        assert_eq!(fresh.logits(&[1, 2]), forward.logits(&[1, 2]));
+        // Committing the remaining positions leaves nothing to roll back.
+        forward.commit(2);
+        assert!(forward.rollback(1).is_err());
+        // Extending past the committed prefix still matches a fresh run.
+        assert_eq!(five, forward.logits(&[1, 2, 3, 4, 5]));
     }
 }

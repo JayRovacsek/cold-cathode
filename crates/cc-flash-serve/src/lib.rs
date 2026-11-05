@@ -14,6 +14,7 @@ pub mod bf16;
 pub mod forward;
 pub mod gguf;
 pub mod hgn;
+pub mod kvcache;
 pub mod model;
 pub mod ops;
 pub mod protocol;
