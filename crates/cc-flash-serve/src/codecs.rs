@@ -89,9 +89,14 @@ pub fn f8e4m3_to_f32(byte: u8) -> f32 {
     }
 }
 
-/// Encode an `f32` as the nearest fp8 e4m3 byte (exhaustive nearest
-/// search over the 254 finite patterns, ties to the smaller pattern;
-/// NaN maps to `0x7f`). Used by the fixture builder's i4r encoder.
+/// Encode an `f32` as the nearest fp8 e4m3 byte with round-to-nearest-
+/// even (matching llama.cpp's conversion): an exhaustive search over the
+/// 254 finite patterns where a tie between two equidistant patterns
+/// picks the even one (adjacent patterns alternate parity, so the even
+/// byte is the even mantissa; infinities saturate to the largest finite
+/// pattern `0x7e`, the CUDA satfinite convention — fp8 e4m3 has no
+/// infinity). NaN maps to `0x7f`. Used by the fixture builder's i4r
+/// encoder.
 pub fn f8e4m3_from_f32(value: f32) -> u8 {
     if value.is_nan() {
         return 0x7f;
@@ -99,6 +104,13 @@ pub fn f8e4m3_from_f32(value: f32) -> u8 {
     if value == 0.0 {
         // Preserve the sign of zero (0x00 / 0x80).
         return if value.is_sign_negative() { 0x80 } else { 0x00 };
+    }
+    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
+    let magnitude = value.abs();
+    if !magnitude.is_finite() || magnitude > 448.0 {
+        // Everything beyond the largest finite pattern (infinities
+        // included) saturates to 0x7e — the CUDA satfinite convention.
+        return sign | 0x7e;
     }
     let mut best = 0u8;
     let mut best_err = f32::INFINITY;
@@ -108,7 +120,9 @@ pub fn f8e4m3_from_f32(value: f32) -> u8 {
             continue;
         }
         let err = (candidate - value).abs();
-        if err < best_err {
+        // RNE: an exact tie between two patterns resolves to the even
+        // pattern (e.g. 0.96875 → 0x38 (1.0), not 0x37 (0.9375)).
+        if err < best_err || (err == best_err && byte % 2 == 0) {
             best_err = err;
             best = byte as u8;
         }
@@ -169,6 +183,12 @@ impl Weights {
     /// `(suh, svh)` f16 plane values, required by dtypes 16/23.
     /// `None` for dtypes without a codec (3/4) or a payload that fails
     /// its layout check.
+    ///
+    /// Quantised payloads must be 16 B multiples: the engine requires
+    /// 16 B-aligned payloads, and a payload length that is not a 16 B
+    /// multiple misaligns every following tensor in the checkpoint's
+    /// data section (the float dtypes 0/1/2 are exempt — they have no
+    /// block layout to align to).
     pub fn from_dtype(
         dtype: u32,
         bytes: &[u8],
@@ -183,6 +203,7 @@ impl Weights {
             }
             5 => {
                 if !cols.is_multiple_of(32)
+                    || !bytes.len().is_multiple_of(16)
                     || bytes.len() != 64 + rows.checked_mul(pad16(9 * cols / 16))?
                 {
                     return None;
@@ -194,6 +215,7 @@ impl Weights {
             }
             7 => {
                 if !cols.is_multiple_of(64)
+                    || !bytes.len().is_multiple_of(16)
                     || bytes.len() != rows.checked_mul(cols / 64)?.checked_mul(68)?
                 {
                     return None;
@@ -204,6 +226,7 @@ impl Weights {
             }
             24 => {
                 if !cols.is_multiple_of(64)
+                    || !bytes.len().is_multiple_of(16)
                     || bytes.len() != rows.checked_mul(pad16(13 * cols / 16))?
                 {
                     return None;
@@ -220,6 +243,7 @@ impl Weights {
                     rows
                 };
                 if !cols.is_multiple_of(2)
+                    || !bytes.len().is_multiple_of(16)
                     || bytes.len() != rows.checked_mul(cols / 2)?
                     || suh.len() != cols
                     || svh.len() != svh_rows
@@ -241,6 +265,7 @@ impl Weights {
                     rows
                 };
                 if !cols.is_multiple_of(64)
+                    || !bytes.len().is_multiple_of(16)
                     || bytes.len() != rows.checked_mul(cols / 64)?.checked_mul(33)?
                     || suh.len() != cols
                     || svh.len() != svh_rows
@@ -263,21 +288,39 @@ impl Weights {
     pub fn row(&self, cols: usize, row: usize) -> Vec<f32> {
         match self {
             Weights::Dense(data) => data[row * cols..(row + 1) * cols].to_vec(),
-            Weights::Q4c { bytes, source } => q4c_row(bytes, cols, *source, row),
-            Weights::Q8g64 { bytes } => q8g64_row(bytes, cols, row),
-            Weights::Q6g64 { bytes } => q6g64_row(bytes, cols, row),
+            weights => {
+                let mut out = Vec::with_capacity(cols);
+                weights.row_into(cols, row, &mut out);
+                out
+            }
+        }
+    }
+
+    /// Dequantise row `row` into `out` (cleared, its capacity reused):
+    /// the allocating variant [`Weights::row`] builds on, and what lets a
+    /// quantised gemv decode every row through one buffer instead of one
+    /// `Vec` per row (the real `lm_head` has 248 320 rows per token).
+    pub fn row_into(&self, cols: usize, row: usize, out: &mut Vec<f32>) {
+        match self {
+            Weights::Dense(data) => {
+                out.clear();
+                out.extend_from_slice(&data[row * cols..(row + 1) * cols]);
+            }
+            Weights::Q4c { bytes, source } => q4c_row_into(bytes, cols, *source, row, out),
+            Weights::Q8g64 { bytes } => q8g64_row_into(bytes, cols, row, out),
+            Weights::Q6g64 { bytes } => q6g64_row_into(bytes, cols, row, out),
             Weights::Ht {
                 bytes,
                 suh,
                 svh,
                 svh_rows,
-            } => ht_row(bytes, cols, row, suh, svh, *svh_rows),
+            } => ht_row_into(bytes, cols, row, suh, svh, *svh_rows, out),
             Weights::I4r {
                 bytes,
                 suh,
                 svh,
                 svh_rows,
-            } => i4r_row(bytes, cols, row, suh, svh, *svh_rows),
+            } => i4r_row_into(bytes, cols, row, suh, svh, *svh_rows, out),
         }
     }
 
@@ -308,13 +351,13 @@ pub fn decode(
 // q4c (dtype 5)
 // ---------------------------------------------------------------------------
 
-/// Dequantise one q4c row: `pad16(9k/16)` bytes at `64 + row × stride`,
-/// `k/32` blocks of 18 bytes (2-byte f16 scale + 16 nibble bytes, low
-/// nibble = element `2i`).
-fn q4c_row(bytes: &[u8], cols: usize, source: Q4cSource, row: usize) -> Vec<f32> {
+/// Dequantise one q4c row into `out`: `pad16(9k/16)` bytes at
+/// `64 + row × stride`, `k/32` blocks of 18 bytes (2-byte f16 scale +
+/// 16 nibble bytes, low nibble = element `2i`).
+fn q4c_row_into(bytes: &[u8], cols: usize, source: Q4cSource, row: usize, out: &mut Vec<f32>) {
+    out.clear();
     let stride = pad16(9 * cols / 16);
     let base = 64 + row * stride;
-    let mut out = Vec::with_capacity(cols);
     for block in 0..cols / 32 {
         let off = base + block * 18;
         let scale = bf16::f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
@@ -329,7 +372,6 @@ fn q4c_row(bytes: &[u8], cols: usize, source: Q4cSource, row: usize) -> Vec<f32>
             }
         }
     }
-    out
 }
 
 /// Encode `rows × cols` values as a Q4_0 q4c payload (64-byte zero
@@ -371,12 +413,12 @@ fn nibble_quantise(value: f32, scale: f32) -> u8 {
 // q8g64 (dtype 7)
 // ---------------------------------------------------------------------------
 
-/// Dequantise one q8g64 row: `(k/64) × 68` bytes, each block a 4-byte
-/// f32 scale followed by 64 i8 values (`w = scale × i8`).
-fn q8g64_row(bytes: &[u8], cols: usize, row: usize) -> Vec<f32> {
+/// Dequantise one q8g64 row into `out`: `(k/64) × 68` bytes, each block
+/// a 4-byte f32 scale followed by 64 i8 values (`w = scale × i8`).
+fn q8g64_row_into(bytes: &[u8], cols: usize, row: usize, out: &mut Vec<f32>) {
+    out.clear();
     let stride = (cols / 64) * 68;
     let base = row * stride;
-    let mut out = Vec::with_capacity(cols);
     for block in 0..cols / 64 {
         let off = base + block * 68;
         let scale = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
@@ -384,7 +426,6 @@ fn q8g64_row(bytes: &[u8], cols: usize, row: usize) -> Vec<f32> {
             out.push(scale * f32::from(bytes[off + 4 + i] as i8));
         }
     }
-    out
 }
 
 /// Encode `rows × cols` values as a q8g64 payload (per block the f32
@@ -452,13 +493,13 @@ pub fn q6g64_unpack_row(bytes: [u8; 48]) -> [u8; 64] {
     out
 }
 
-/// Dequantise one q6g64 row: `pad16(13k/16)` bytes per row, each 52-byte
-/// block a 4-byte f32 scale + 48 packed 6-bit values
+/// Dequantise one q6g64 row into `out`: `pad16(13k/16)` bytes per row,
+/// each 52-byte block a 4-byte f32 scale + 48 packed 6-bit values
 /// (`w = scale × (q6 − 32)`).
-fn q6g64_row(bytes: &[u8], cols: usize, row: usize) -> Vec<f32> {
+fn q6g64_row_into(bytes: &[u8], cols: usize, row: usize, out: &mut Vec<f32>) {
+    out.clear();
     let stride = pad16(13 * cols / 16);
     let base = row * stride;
-    let mut out = Vec::with_capacity(cols);
     for block in 0..cols / 64 {
         let off = base + block * 52;
         let scale = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
@@ -467,7 +508,6 @@ fn q6g64_row(bytes: &[u8], cols: usize, row: usize) -> Vec<f32> {
             out.push(scale * (f32::from(q) - 32.0));
         }
     }
-    out
 }
 
 /// Encode `rows × cols` values as a q6g64 payload (per block the f32
@@ -503,25 +543,25 @@ pub fn q6g64_encode(values: &[f32], rows: usize, cols: usize) -> Option<Vec<u8>>
 // ht (dtype 16)
 // ---------------------------------------------------------------------------
 
-/// Dequantise one ht row: `k/2` nibble bytes (low nibble = element
-/// `2k`), each value `suh[k] · svh[r % svh_rows] · (nibble − 8)`.
-fn ht_row(
+/// Dequantise one ht row into `out`: `k/2` nibble bytes (low nibble =
+/// element `2k`), each value `suh[k] · svh[r % svh_rows] · (nibble − 8)`.
+fn ht_row_into(
     bytes: &[u8],
     cols: usize,
     row: usize,
     suh: &[f32],
     svh: &[f32],
     svh_rows: usize,
-) -> Vec<f32> {
+    out: &mut Vec<f32>,
+) {
+    out.clear();
     let base = row * (cols / 2);
     let sv = svh[row % svh_rows];
-    let mut out = Vec::with_capacity(cols);
     for k in 0..cols {
         let byte = bytes[base + k / 2];
         let nibble = if k % 2 == 0 { byte & 0xf } else { byte >> 4 };
         out.push(suh[k] * sv * (f32::from(nibble) - 8.0));
     }
-    out
 }
 
 /// Encode `rows × cols` values as an ht nibble payload (per row the
@@ -558,22 +598,23 @@ pub fn ht_encode(values: &[f32], rows: usize, cols: usize) -> Option<Vec<u8>> {
 // i4r (dtype 23)
 // ---------------------------------------------------------------------------
 
-/// Dequantise one i4r row: `(k/64) × 33` bytes, each block 32 nibble
-/// bytes (low nibble = element `2i`) plus a 1-byte fp8 e4m3 scale at
-/// byte 32; each value `scale × (nibble − 8) × suh[k] × svh[r %
+/// Dequantise one i4r row into `out`: `(k/64) × 33` bytes, each block 32
+/// nibble bytes (low nibble = element `2i`) plus a 1-byte fp8 e4m3 scale
+/// at byte 32; each value `scale × (nibble − 8) × suh[k] × svh[r %
 /// svh_rows]`.
-fn i4r_row(
+fn i4r_row_into(
     bytes: &[u8],
     cols: usize,
     row: usize,
     suh: &[f32],
     svh: &[f32],
     svh_rows: usize,
-) -> Vec<f32> {
+    out: &mut Vec<f32>,
+) {
+    out.clear();
     let stride = (cols / 64) * 33;
     let base = row * stride;
     let sv = svh[row % svh_rows];
-    let mut out = Vec::with_capacity(cols);
     for block in 0..cols / 64 {
         let off = base + block * 33;
         let scale = f8e4m3_to_f32(bytes[off + 32]);
@@ -583,7 +624,6 @@ fn i4r_row(
             out.push(scale * (f32::from(nibble) - 8.0) * suh[block * 64 + i] * sv);
         }
     }
-    out
 }
 
 /// Encode `rows × cols` values as an i4r payload (per block the scale
@@ -649,6 +689,15 @@ mod tests {
         assert_eq!(f8e4m3_to_f32(0x7e), 448.0); // largest finite
         assert_eq!(f8e4m3_to_f32(0x01), 2f32.powi(-9)); // smallest subnormal
         assert!(f8e4m3_to_f32(0x7f).is_nan());
+        // RNE ties (the previous exhaustive search was ties-to-smaller):
+        // 0.96875 is exactly halfway between 0.9375 (0x37) and 1.0
+        // (0x38) → the even pattern 0x38; likewise −0.96875 → 0xb8.
+        assert_eq!(f8e4m3_from_f32(0.96875), 0x38);
+        assert_eq!(f8e4m3_from_f32(-0.96875), 0xb8);
+        // Beyond the largest finite pattern everything saturates to 0x7e.
+        assert_eq!(f8e4m3_from_f32(480.0), 0x7e);
+        assert_eq!(f8e4m3_from_f32(f32::INFINITY), 0x7e);
+        assert_eq!(f8e4m3_from_f32(f32::NEG_INFINITY), 0xfe);
         // The encoder inverts the decoder exactly on representable values.
         for byte in 0u16..=255 {
             let byte = byte as u8;
@@ -712,7 +761,11 @@ mod tests {
         let values: Vec<f32> = (0..32).map(|i| (i as f32) * 0.25 - 4.0).collect();
         let bytes = q4c_encode(&values, 1, 32).unwrap();
         assert_eq!(bytes.len(), 64 + 32);
-        let decoded = q4c_row(&bytes, 32, Q4cSource::Q40, 0);
+        let decoded = Weights::Q4c {
+            bytes: bytes.clone(),
+            source: Q4cSource::Q40,
+        }
+        .row(32, 0);
         let scale = 4.0f32 / 8.0; // max|w| = 4.0 (f16-exact)
         for (got, want) in decoded.iter().zip(&values) {
             assert!((got - want).abs() <= scale, "{got} vs {want}");
@@ -740,7 +793,10 @@ mod tests {
         let values: Vec<f32> = (0..64).map(|i| (i as f32) * 0.5 - 16.0).collect();
         let bytes = q8g64_encode(&values, 1, 64).unwrap();
         assert_eq!(bytes.len(), 68);
-        let decoded = q8g64_row(&bytes, 64, 0);
+        let decoded = Weights::Q8g64 {
+            bytes: bytes.clone(),
+        }
+        .row(64, 0);
         let scale = 16.0f32 / 127.0; // max|w| = 16.0 (values span −16.0..15.5)
         for (got, want) in decoded.iter().zip(&values) {
             assert!(
@@ -787,7 +843,10 @@ mod tests {
         let values: Vec<f32> = (0..64).map(|i| (i as f32) * 0.25 - 8.0).collect();
         let bytes = q6g64_encode(&values, 1, 64).unwrap();
         assert_eq!(bytes.len(), 64); // pad16(52) = 64 for k = 64
-        let decoded = q6g64_row(&bytes, 64, 0);
+        let decoded = Weights::Q6g64 {
+            bytes: bytes.clone(),
+        }
+        .row(64, 0);
         let scale = 8.0f32 / 32.0; // max|w| = 8.0
         for (got, want) in decoded.iter().zip(&values) {
             assert!((got - want).abs() <= scale, "{got} vs {want}");
@@ -875,7 +934,13 @@ mod tests {
         let bytes = i4r_encode(&values, 1, 64).unwrap();
         assert_eq!(bytes.len(), 33);
         let suh = vec![1.0f32; 64];
-        let decoded = i4r_row(&bytes, 64, 0, &suh, &[1.0], 1);
+        let decoded = Weights::I4r {
+            bytes: bytes.clone(),
+            suh,
+            svh: vec![1.0],
+            svh_rows: 1,
+        }
+        .row(64, 0);
         let scale = f8e4m3_to_f32(bytes[32]); // max|w| = 8 → 8/8 = 1.0 exactly
         assert_eq!(scale, 1.0);
         for (got, want) in decoded.iter().zip(&values) {
@@ -892,27 +957,42 @@ mod tests {
         assert!(Weights::from_dtype(3, &[0; 4], &[1], None).is_none());
         assert!(Weights::from_dtype(4, &[0; 8], &[1], None).is_none());
         assert!(Weights::from_dtype(99, &[], &[0], None).is_none());
+        // Quantised payloads must be 16 B multiples (the engine requires
+        // 16 B-aligned payloads; a non-multiple length misaligns every
+        // following tensor in the data section).
         // q4c: k % 32 and the exact 64 + rows·pad16(9k/16) length
         // (k = 32 → stride pad16(18) = 32 → 96 bytes).
         assert!(Weights::from_dtype(5, &[0; 96], &[1, 32], None).is_some());
         assert!(Weights::from_dtype(5, &[0; 95], &[1, 32], None).is_none());
+        assert!(Weights::from_dtype(5, &[0; 112], &[1, 32], None).is_none());
         assert!(Weights::from_dtype(5, &[0; 96], &[1, 33], None).is_none());
-        // q8g64: k % 64 and rows·(k/64)·68.
-        assert!(Weights::from_dtype(7, &[0; 68], &[1, 64], None).is_some());
-        assert!(Weights::from_dtype(7, &[0; 67], &[1, 64], None).is_none());
+        // q8g64: k % 64 and rows·(k/64)·68 — a single row (68 B) is
+        // rejected as misaligned, four rows (272 B) pass.
+        assert!(Weights::from_dtype(7, &[0; 68], &[1, 64], None).is_none());
+        assert!(Weights::from_dtype(7, &[0; 80], &[1, 64], None).is_none());
+        assert!(Weights::from_dtype(7, &[0; 272], &[4, 64], None).is_some());
+        assert!(Weights::from_dtype(7, &[0; 264], &[4, 64], None).is_none());
         // q6g64: k % 64 and rows·pad16(13k/16).
         assert!(Weights::from_dtype(24, &[0; 64], &[1, 64], None).is_some());
         assert!(Weights::from_dtype(24, &[0; 52], &[1, 64], None).is_none());
-        // ht: k even, rows·k/2 bytes, planes of length k and rows.
-        let suh = vec![1.0f32; 4];
+        assert!(Weights::from_dtype(24, &[0; 68], &[1, 64], None).is_none());
+        // ht: k even, rows·k/2 bytes (16 B-aligned), planes of length k
+        // and rows — a 4-byte payload is rejected as misaligned.
         let svh = vec![1.0f32; 2];
-        assert!(Weights::from_dtype(16, &[0; 4], &[2, 4], Some((&suh, &svh))).is_some());
-        assert!(Weights::from_dtype(16, &[0; 4], &[2, 4], None).is_none());
-        assert!(Weights::from_dtype(16, &[0; 4], &[2, 5], Some((&suh, &svh))).is_none());
-        // i4r: k % 64 and rows·(k/64)·33 plus planes.
+        assert!(Weights::from_dtype(16, &[0; 4], &[2, 4], Some((&[1.0; 4], &svh))).is_none());
+        assert!(Weights::from_dtype(16, &[0; 8], &[2, 4], Some((&[1.0; 4], &svh))).is_none());
+        assert!(Weights::from_dtype(16, &[0; 16], &[2, 16], Some((&[1.0; 16], &svh))).is_some());
+        assert!(Weights::from_dtype(16, &[0; 16], &[2, 16], None).is_none());
+        assert!(Weights::from_dtype(16, &[0; 16], &[2, 20], Some((&[1.0; 16], &svh))).is_none());
+        // i4r: k % 64 and rows·(k/64)·33 plus planes — a single row
+        // (33 B) is rejected as misaligned, 16 rows (528 B) pass.
         let suh64 = vec![1.0f32; 64];
-        assert!(Weights::from_dtype(23, &[0; 33], &[1, 64], Some((&suh64, &[1.0]))).is_some());
-        assert!(Weights::from_dtype(23, &[0; 33], &[1, 64], None).is_none());
+        assert!(Weights::from_dtype(23, &[0; 33], &[1, 64], Some((&suh64, &[1.0]))).is_none());
+        assert!(Weights::from_dtype(23, &[0; 48], &[1, 64], Some((&suh64, &[1.0]))).is_none());
+        assert!(
+            Weights::from_dtype(23, &[0; 528], &[16, 64], Some((&suh64, &[1.0; 16]))).is_some()
+        );
+        assert!(Weights::from_dtype(23, &[0; 528], &[16, 64], None).is_none());
         // 3-D i4r takes svh from dims[1] (the per-expert plane): rows is
         // a·b, so [4, 16, 64] needs 64 × 33 = 2112 payload bytes.
         let stacked = vec![0u8; 2112];
@@ -926,20 +1006,17 @@ mod tests {
 
     #[test]
     fn decode_facade_matches_row_by_row_dequantisation() {
-        // A 2-row q8g64 tensor: the facade and the per-row decode agree.
-        let values: Vec<f32> = (0..128).map(|i| (i as f32) * 0.1 - 6.4).collect();
-        let bytes = q8g64_encode(&values, 2, 64).unwrap();
-        let all = decode(7, &bytes, &[2, 64], None).unwrap();
-        assert_eq!(all.len(), 128);
-        let weights = Weights::from_dtype(7, &bytes, &[2, 64], None).unwrap();
-        assert_eq!(all, weights.dequant_all(2, 64));
+        // A 4-row q8g64 tensor (272 B, 16 B-aligned): the facade and the
+        // per-row decode agree.
+        let values: Vec<f32> = (0..256).map(|i| (i as f32) * 0.1 - 6.4).collect();
+        let bytes = q8g64_encode(&values, 4, 64).unwrap();
+        let all = decode(7, &bytes, &[4, 64], None).unwrap();
+        assert_eq!(all.len(), 256);
+        let weights = Weights::from_dtype(7, &bytes, &[4, 64], None).unwrap();
+        assert_eq!(all, weights.dequant_all(4, 64));
         assert_eq!(
             all,
-            weights
-                .row(64, 0)
-                .into_iter()
-                .chain(weights.row(64, 1))
-                .collect::<Vec<_>>()
+            (0..4).flat_map(|r| weights.row(64, r)).collect::<Vec<_>>()
         );
     }
 }

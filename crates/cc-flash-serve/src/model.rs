@@ -387,9 +387,18 @@ fn resolve_planes(
         return Some(None);
     }
     let (suh_names, svh_name) = plane_names(name)?;
-    let suh = suh_names
-        .iter()
-        .find_map(|candidate| load_f16_plane(checkpoint, by_name, candidate))?;
+    // The own `<base>.suh` wins when present and must be f16: an own
+    // plane of the wrong dtype rejects the tensor rather than silently
+    // falling through to the shared `<parent>.su` (the shared name only
+    // applies when the own one is absent — the fused expert sets,
+    // spec §7).
+    let suh = if by_name.contains_key(suh_names[0].as_str()) {
+        load_f16_plane(checkpoint, by_name, &suh_names[0])?
+    } else {
+        suh_names
+            .get(1)
+            .and_then(|shared| load_f16_plane(checkpoint, by_name, shared))?
+    };
     let svh = load_f16_plane(checkpoint, by_name, &svh_name)?;
     Some(Some((suh, svh)))
 }
@@ -1065,7 +1074,12 @@ pub fn mini_checkpoint_quantised() -> hgn::Checkpoint {
 fn build_fixture(file: &str, specs: &[FixtureSpec]) -> hgn::Checkpoint {
     let entry_count = specs.len() as u64;
     let table_offset = hgn::HEADER_BYTES as u64;
-    let data_offset = table_offset + entry_count * hgn::ENTRY_BYTES as u64;
+    // The engine requires 16 B-aligned payloads: the data section starts
+    // on a 16 B boundary and every stored payload is padded up to one
+    // (the entry's nbytes stays the exact payload length, the padding is
+    // filler), so each entry's data_offset is 16 B-aligned.
+    let data_offset =
+        codecs::pad16(table_offset as usize + entry_count as usize * hgn::ENTRY_BYTES) as u64;
     let mut payloads: Vec<u8> = Vec::new();
     let mut entries: Vec<u8> = Vec::new();
     for spec in specs {
@@ -1083,6 +1097,7 @@ fn build_fixture(file: &str, specs: &[FixtureSpec]) -> hgn::Checkpoint {
         entry[144..152].copy_from_slice(&(payload.len() as u64).to_le_bytes());
         entries.extend_from_slice(&entry);
         payloads.extend_from_slice(&payload);
+        payloads.resize(codecs::pad16(payloads.len()), 0);
     }
     let declared = data_offset + payloads.len() as u64;
     let mut bytes = Vec::with_capacity(declared as usize);
@@ -1096,6 +1111,10 @@ fn build_fixture(file: &str, specs: &[FixtureSpec]) -> hgn::Checkpoint {
     model_id[..4].copy_from_slice(b"qwen");
     bytes.extend_from_slice(&model_id);
     bytes.extend_from_slice(&entries);
+    // Pad the gap between the table and the data section so the header's
+    // data_offset matches the payloads' actual position (the raw table
+    // end is 104 + n·160 ≡ 8 (mod 16)).
+    bytes.resize(data_offset as usize, 0);
     bytes.extend_from_slice(&payloads);
     hgn::load_prefix(file, bytes, declared).expect("fixture loads")
 }
@@ -1213,6 +1232,90 @@ mod tests {
     }
 
     #[test]
+    fn resolve_planes_rejects_an_own_suh_that_is_not_f16() {
+        // Review fix: an own `.suh` of the wrong dtype must reject the
+        // tensor, not silently fall through to the shared `.su` (the
+        // spec requires the planes to be f16).
+        let spec = |name: &str, dims: Vec<u64>, dtype: u32| FixtureSpec {
+            name: name.to_string(),
+            kind: 1,
+            dims,
+            dtype,
+        };
+        let weight = FixtureSpec {
+            name: "blk.proj.weight".to_string(),
+            kind: 2,
+            dims: vec![1, 4],
+            dtype: 16,
+        };
+        // Own `.suh` present but bf16 while the shared `.su` is a valid
+        // f16 plane: rejected (the old find_map picked the shared plane).
+        let ck = build_fixture(
+            "ccfs-planes-badsuh.hgn",
+            &[
+                weight.clone(),
+                spec("blk.proj.suh", vec![4], 0),
+                spec("blk.proj.svh", vec![1], 2),
+                spec("blk.su", vec![4], 2),
+            ],
+        );
+        let by_name: HashMap<&str, usize> = ck
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name(), i))
+            .collect();
+        assert_eq!(resolve_planes(&ck, &by_name, 16, "blk.proj.weight"), None);
+        // Own `.suh` present and f16 (the shared `.su` is the bf16 one):
+        // resolves to the own plane's values.
+        let ck = build_fixture(
+            "ccfs-planes-ownsuh.hgn",
+            &[
+                weight.clone(),
+                spec("blk.proj.suh", vec![4], 2),
+                spec("blk.proj.svh", vec![1], 2),
+                spec("blk.su", vec![4], 0),
+            ],
+        );
+        let by_name: HashMap<&str, usize> = ck
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name(), i))
+            .collect();
+        let planes = resolve_planes(&ck, &by_name, 16, "blk.proj.weight")
+            .expect("own f16 suh resolves")
+            .expect("planes present");
+        assert_eq!(
+            planes.0,
+            load_f16_plane(&ck, &by_name, "blk.proj.suh").expect("f16 own suh")
+        );
+        // No own `.suh`: the shared `.su` is used (the fused expert set,
+        // spec §7).
+        let ck = build_fixture(
+            "ccfs-planes-shared.hgn",
+            &[
+                weight,
+                spec("blk.proj.svh", vec![1], 2),
+                spec("blk.su", vec![4], 2),
+            ],
+        );
+        let by_name: HashMap<&str, usize> = ck
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name(), i))
+            .collect();
+        let planes = resolve_planes(&ck, &by_name, 16, "blk.proj.weight")
+            .expect("shared su resolves")
+            .expect("planes present");
+        assert_eq!(
+            planes.0,
+            load_f16_plane(&ck, &by_name, "blk.su").expect("f16 shared su")
+        );
+    }
+
+    #[test]
     fn load_accepts_the_quantised_mini_checkpoint() {
         // The fixture carrying one tensor per quantised dtype (q4c,
         // q8g64, ht, i4r, q6g64) plus their f16 planes loads as a real
@@ -1228,6 +1331,19 @@ mod tests {
         assert_eq!(model.dims.num_experts, MINI_EXPERTS);
         assert_eq!(model.dims.expert_dim, MINI_FFN);
         assert_eq!(model.dims.top_k, MINI_EXPERTS); // clamped from 10
+    }
+
+    #[test]
+    fn fixture_payload_offsets_are_16_byte_aligned() {
+        // Review fix: the engine requires 16 B-aligned payloads; the
+        // builder pads the data section start and every stored payload
+        // to a 16 B boundary (the raw table layout would put payloads
+        // at 104 + n·160 ≡ 8 (mod 16)).
+        for ck in [mini_checkpoint(), mini_checkpoint_quantised()] {
+            for entry in &ck.entries {
+                assert_eq!(entry.data_offset() % 16, 0, "{}", entry.name());
+            }
+        }
     }
 
     #[test]

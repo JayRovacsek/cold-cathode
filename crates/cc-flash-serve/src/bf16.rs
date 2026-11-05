@@ -137,7 +137,9 @@ pub fn f16_from_f32(value: f32) -> u16 {
         return sign;
     }
     let significand = man | 0x0080_0000;
-    let m = (significand + (1 << (shift - 1)) + ((significand >> shift) & 1)) >> shift;
+    // RNE: half-ulp minus one plus the retained lsb (the same trick as
+    // the normal path's `0x0fff`).
+    let m = (significand + (1 << (shift - 1)) - 1 + ((significand >> shift) & 1)) >> shift;
     sign | m as u16
 }
 
@@ -292,6 +294,77 @@ mod tests {
                 bits,
                 "round-trip of {bits:#06x}"
             );
+        }
+    }
+
+    /// Reference f32→f16 for finite normal inputs (the sweep's domain):
+    /// pick the nearest f16 by exact integer comparison, ties to the
+    /// even pattern — an independent formulation of the `f16_from_f32`
+    /// rounding trick.
+    fn ref_f16(bits: u32) -> u16 {
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = (bits >> 23) & 0xff;
+        let man = bits & 0x007f_ffff;
+        assert!(exp != 0, "sweep inputs are normal f32s");
+        let unbiased = exp as i32 - 127;
+        assert!(unbiased <= 15, "sweep inputs do not overflow f16");
+        if unbiased >= -14 {
+            // Normal f16: round the 23-bit mantissa to 10 bits.
+            let q = man >> 13;
+            let rem = man & 0x1fff;
+            let (mut mantissa, mut exponent) = (q, (unbiased + 15) as u32);
+            if rem > 0x1000 || (rem == 0x1000 && q & 1 == 1) {
+                mantissa = q + 1;
+                if mantissa == 0x400 {
+                    mantissa = 0;
+                    exponent += 1;
+                }
+            }
+            if exponent == 0x1f {
+                sign | 0x7c00
+            } else {
+                sign | ((exponent as u16) << 10) | mantissa as u16
+            }
+        } else {
+            // Subnormal f16: M = round_half_even(significand / 2^shift).
+            let shift = (-unbiased - 1) as u32;
+            let significand = man | 0x0080_0000;
+            let m = if shift > 24 {
+                0
+            } else {
+                let q = significand >> shift;
+                let rem = significand & ((1u32 << shift) - 1);
+                let half = 1u32 << (shift - 1);
+                if rem > half || (rem == half && q & 1 == 1) {
+                    q + 1
+                } else {
+                    q
+                }
+            };
+            // m == 0x400 promotes to the smallest normal via the layout.
+            sign | m as u16
+        }
+    }
+
+    #[test]
+    fn f16_subnormal_ties_round_to_even() {
+        // 1.25·2⁻²³ = 2.5 ulp of 2⁻²⁴: tie between 0x0002 and 0x0003 →
+        // RNE picks the even pattern 0x0002.
+        assert_eq!(f16_from_f32(1.25f32 * 2f32.powi(-23)), 0x0002);
+        // 2⁻²⁵ = 0.5 ulp: tie between 0x0000 and 0x0001 → 0x0000.
+        assert_eq!(f16_from_f32(2f32.powi(-25)), 0x0000);
+        // Sweep the f32 exponents 100..=113 (f16 subnormals up to the
+        // smallest normal f16) across a few mantissa patterns, asserting
+        // against the inline reference.
+        for exp in 100u32..=113 {
+            for man in [0x000000u32, 0x000001, 0x3f_ffff, 0x40_0000, 0x7f_ffff] {
+                let bits = (exp << 23) | man;
+                assert_eq!(
+                    f16_from_f32(f32::from_bits(bits)),
+                    ref_f16(bits),
+                    "bits {bits:#08x}"
+                );
+            }
         }
     }
 
