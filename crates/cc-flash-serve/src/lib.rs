@@ -11,6 +11,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod bf16;
+pub mod codecs;
 pub mod forward;
 pub mod gguf;
 pub mod hgn;

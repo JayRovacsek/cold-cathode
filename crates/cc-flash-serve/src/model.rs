@@ -5,26 +5,33 @@
 //! `qwen4exp` tensor-name set (48 layers, both hyper-connection mixers per
 //! layer, the `self_attn`/`linear_attn` block tensors, the MoE MLP and the
 //! top-level `embed_tokens`/`lm_head`/`hyper_connection_mixer`), decodes
-//! every payload through [`crate::bf16`] and derives the shape constants
-//! (hidden width, stream count, head counts, expert count) from the entry
-//! dims — the same derivation the spec's §2 head-configuration resolution
-//! uses (e.g. `num_heads = q_proj.rows / 2 / head_dim` from the 24-vs-48
+//! every payload through [`crate::bf16`] and [`crate::codecs`] (including
+//! the quantised dtypes of the real `qwen38-flash-next-v2-abliterated.hgn`
+//! checkpoint: `q4c`/`q8g64`/`ht`/`i4r`/`q6g64`, spec
+//! `flash_serve-dtypes.md`) and derives the shape constants (hidden
+//! width, stream count, head counts, expert count) from the entry dims —
+//! the same derivation the spec's §2 head-configuration resolution uses
+//! (e.g. `num_heads = q_proj.rows / 2 / head_dim` from the 24-vs-48
 //! `o_proj` note).
 //!
-//! Checkpoints whose required tensors carry dtypes without a dequant
-//! codec (the real `qwen38-flash-next-v2-abliterated.hgn`: `q4c`/`ht`/
-//! `i4r`/`q6g64` payloads) yield `None` — the caller falls back to the
-//! documented stub (module docs in [`crate::forward`]).
+//! Checkpoints whose required tensors carry a dtype without a codec
+//! (the integer codes `3`/`4` on weight entries) or a payload that fails
+//! its dtype's layout validation yield `None` — the caller falls back to
+//! the documented stub (module docs in [`crate::forward`]).
 //!
-//! The mini-checkpoint fixture ([`mini_checkpoint`]) is the test vehicle:
-//! the full tensor-name set with shrunk dims (hidden 4, head dims 8, 4
-//! experts of width 8, mix rank 8, 48 layers), every payload bf16 with
-//! deterministic pseudo-random values.
+//! The mini-checkpoint fixtures ([`mini_checkpoint`],
+//! [`mini_checkpoint_quantised`]) are the test vehicles: the full
+//! tensor-name set with shrunk dims (hidden 4, head dims 8, 4 experts of
+//! width 8, mix rank 8, 48 layers), every payload bf16 with deterministic
+//! pseudo-random values; the quantised variant swaps one tensor per
+//! quantised dtype in (with its f16 rotation planes) at hidden 64, the
+//! smallest width satisfying every codec's k-group rules.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::bf16;
+use crate::codecs;
 use crate::hgn;
 use crate::ops::{self, Matrix};
 use crate::sampling::Rng;
@@ -54,11 +61,12 @@ pub struct Dims {
     pub top_k: usize,
 }
 
-/// A decoded tensor: its (non-zero) dims and `f32` values.
+/// A decoded tensor: its (non-zero) dims and weight storage (dense
+/// values or a quantised payload, per [`codecs::Weights`]).
 #[derive(Debug, Clone)]
 struct Tensor {
     dims: Vec<u64>,
-    data: Vec<f32>,
+    weights: codecs::Weights,
 }
 
 impl Tensor {
@@ -68,14 +76,27 @@ impl Tensor {
     /// entries, read as `[channels, kernel]`).
     fn matrix(&self) -> Option<Matrix> {
         match self.dims.as_slice() {
-            [rows, cols] => Matrix::new(*rows as usize, *cols as usize, self.data.clone()),
-            [a, b, c] => Matrix::new((*a * *b) as usize, *c as usize, self.data.clone()),
+            [rows, cols] => {
+                Matrix::with_weights(*rows as usize, *cols as usize, self.weights.clone())
+            }
+            [a, b, c] => {
+                Matrix::with_weights((*a * *b) as usize, *c as usize, self.weights.clone())
+            }
             _ => None,
         }
     }
 
+    /// The values of a 1-D tensor (norm gains, `A_log`, `dt_bias`, …).
     fn vector(&self) -> Option<Vec<f32>> {
-        (self.dims.len() == 1).then(|| self.data.clone())
+        (self.dims.len() == 1).then(|| self.weights.row(self.dims[0] as usize, 0))
+    }
+
+    /// Every value of the tensor materialised (used where the forward
+    /// path needs the raw values rather than a matrix, e.g. the conv1d
+    /// kernel weights).
+    fn values(&self) -> Option<Vec<f32>> {
+        let (rows, cols) = codecs::shape(&self.dims)?;
+        Some(self.weights.dequant_all(rows, cols))
     }
 }
 
@@ -168,7 +189,10 @@ pub struct LinearBlock {
     pub b: Matrix,
     pub a_log: Vec<f32>,
     pub dt_bias: Vec<f32>,
-    pub conv_w: Matrix,
+    /// The depthwise conv1d weights `[channels, kernel]` (always bf16 in
+    /// the real file and the fixtures).
+    pub conv_w: Vec<f32>,
+    pub conv_kernel: usize,
     pub norm: Vec<f32>,
     pub out: Matrix,
     pub q_heads: usize,
@@ -223,23 +247,13 @@ pub struct Model {
 }
 
 /// Load the model from a checkpoint, or `None` when the checkpoint lacks
-/// the full bf16/f32 tensor set (module docs).
+/// the full tensor set (module docs).
 pub fn load(checkpoint: &hgn::Checkpoint) -> Option<Model> {
     let mut by_name: HashMap<&str, usize> = HashMap::new();
     for (index, entry) in checkpoint.entries.iter().enumerate() {
         by_name.entry(entry.name()).or_insert(index);
     }
-    let tensor = |name: &str| -> Option<Tensor> {
-        let &index = by_name.get(name)?;
-        let entry = &checkpoint.entries[index];
-        let data = bf16::decode_tensor(entry.dtype(), checkpoint.tensor_bytes(index)?)?;
-        let dims: Vec<u64> = entry.dims().into_iter().filter(|d| *d != 0).collect();
-        let expected: u64 = dims.iter().product();
-        if expected == 0 || data.len() as u64 != expected {
-            return None;
-        }
-        Some(Tensor { dims, data })
-    };
+    let tensor = |name: &str| -> Option<Tensor> { load_tensor(checkpoint, &by_name, name) };
 
     // Layer count: consecutive `layers.N.attn_hyper_connection.hc_norm`
     // from 0 (the real file: 48).
@@ -334,6 +348,80 @@ pub fn load(checkpoint: &hgn::Checkpoint) -> Option<Model> {
         final_mixer,
         layers,
     })
+}
+
+/// Load one tensor by name: decode its payload through the dtype codecs
+/// (resolving the f16 rotation planes for `ht`/`i4r` tensors per
+/// [`plane_names`]) and validate it against the entry's dims.
+fn load_tensor(
+    checkpoint: &hgn::Checkpoint,
+    by_name: &HashMap<&str, usize>,
+    name: &str,
+) -> Option<Tensor> {
+    let &index = by_name.get(name)?;
+    let entry = &checkpoint.entries[index];
+    let bytes = checkpoint.tensor_bytes(index)?;
+    let dims: Vec<u64> = entry.dims().into_iter().filter(|d| *d != 0).collect();
+    let planes = resolve_planes(checkpoint, by_name, entry.dtype(), name)?;
+    let weights = codecs::Weights::from_dtype(
+        entry.dtype(),
+        bytes,
+        &dims,
+        planes.as_ref().map(|(suh, svh)| (&suh[..], &svh[..])),
+    )?;
+    Some(Tensor { dims, weights })
+}
+
+/// The decoded `(suh, svh)` planes a quantised weight needs: `Some(None)`
+/// for dtypes without planes, `Some(Some(..))` when an `ht`/`i4r`
+/// tensor's planes resolve, `None` when they are missing or malformed
+/// (the engine's `an HT linear without its rotation planes` failure,
+/// spec §2).
+fn resolve_planes(
+    checkpoint: &hgn::Checkpoint,
+    by_name: &HashMap<&str, usize>,
+    dtype: u32,
+    name: &str,
+) -> Option<Option<(Vec<f32>, Vec<f32>)>> {
+    if !matches!(dtype, 16 | 23) {
+        return Some(None);
+    }
+    let (suh_names, svh_name) = plane_names(name)?;
+    let suh = suh_names
+        .iter()
+        .find_map(|candidate| load_f16_plane(checkpoint, by_name, candidate))?;
+    let svh = load_f16_plane(checkpoint, by_name, &svh_name)?;
+    Some(Some((suh, svh)))
+}
+
+/// Load one f16 plane tensor (spec §2: the planes `must be f16`).
+fn load_f16_plane(
+    checkpoint: &hgn::Checkpoint,
+    by_name: &HashMap<&str, usize>,
+    name: &str,
+) -> Option<Vec<f32>> {
+    let &index = by_name.get(name)?;
+    let entry = &checkpoint.entries[index];
+    if entry.dtype() != 2 {
+        return None;
+    }
+    bf16::decode_float_payload(2, checkpoint.tensor_bytes(index)?)
+}
+
+/// The companion plane names for a quantised `<base>.weight` (spec §2
+/// naming rule): the `suh` candidates — the own `<base>.suh`, else the
+/// shared `<parent>.su` used by the fused expert sets (spec §7) — and
+/// the `svh` name `<base>.svh`.
+fn plane_names(name: &str) -> Option<(Vec<String>, String)> {
+    let base = name.strip_suffix(".weight")?;
+    let mut suh = vec![format!("{base}.suh")];
+    if let Some((parent, _)) = base.rsplit_once('.') {
+        let shared = format!("{parent}.su");
+        if shared != suh[0] {
+            suh.push(shared);
+        }
+    }
+    Some((suh, format!("{base}.svh")))
 }
 
 /// Load one mixer set (`hc_norm` + `down`/`up` + optional
@@ -460,11 +548,14 @@ fn load_linear(
         return None;
     }
     // conv1d dims are `[channels, 1, kernel]` in the real file (kind 3);
-    // Tensor::matrix reads them as `[channels, kernel]`.
-    let conv_w = conv.matrix()?;
-    if conv_w.rows != qkv.rows {
+    // the block keeps the values plus the kernel width (conv1d weights
+    // are always bf16 in the real file and the fixtures).
+    let conv_kernel = *conv.dims.last()?;
+    let conv_w = conv.values()?;
+    if conv_w.len() != qkv.rows * conv_kernel as usize {
         return None;
     }
+    let conv_kernel = conv_kernel as usize;
     Some(LinearBlock {
         qkv,
         z,
@@ -473,6 +564,7 @@ fn load_linear(
         a_log,
         dt_bias,
         conv_w,
+        conv_kernel,
         norm,
         out,
         q_heads: qk_rows / (2 * head_dim),
@@ -524,7 +616,7 @@ fn load_mlp(tensor: &dyn Fn(&str) -> Option<Tensor>, prefix: &str, h: usize) -> 
         shared_gate_proj,
         shared_up_proj,
         shared_down_proj,
-        shared_router: shared_router.data.clone(),
+        shared_router: shared_router.row(0),
         ffn,
         top_k: DEFAULT_TOP_K.min(num_experts),
     })
@@ -595,264 +687,396 @@ pub const MINI_EXPERTS: usize = 4;
 pub const MINI_FFN: usize = 8;
 pub const MINI_MIX_RANK: usize = 8;
 pub const MINI_HEAD_DIM: usize = 8;
+/// Hidden width of the quantised fixture ([`mini_checkpoint_quantised`]):
+/// the smallest value that satisfies every codec's k-group rules (q8g64,
+/// q6g64 and i4r need `k % 64 == 0`, q4c needs `k % 32 == 0`).
+pub const MINI_HIDDEN_QUANTISED: usize = 64;
 /// Attention layers sit every 4th index (3, 7, …, 47) — the real file's
 /// pattern (spec §2).
 pub fn mini_is_attention_layer(layer: usize) -> bool {
     layer % 4 == 3
 }
 
+/// One fixture entry: name, kind, dims and dtype code.
+#[derive(Debug, Clone)]
+struct FixtureSpec {
+    name: String,
+    kind: u32,
+    dims: Vec<u64>,
+    dtype: u32,
+}
+
 /// Build the full tensor-name set (48 layers, both mixers, the block
 /// tensors for the layer kind, the MoE MLP, the layer-1 PLE extras and the
-/// top-level tensors) with mini dims, every payload bf16 with
-/// deterministic values, and return the parsed checkpoint.
-pub fn mini_checkpoint() -> hgn::Checkpoint {
+/// top-level tensors) with the given hidden width, every spec bf16.
+fn mini_specs(hidden: usize) -> Vec<FixtureSpec> {
     // (name, kind, dims) — the top-level tensors seed the list.
-    let mut specs: Vec<(String, u32, Vec<u64>)> = vec![
+    let tuples: Vec<(String, u32, Vec<u64>)> = vec![
         (
             "embed_tokens.weight".to_string(),
             2,
-            vec![MINI_VOCAB as u64, MINI_HIDDEN as u64],
+            vec![MINI_VOCAB as u64, hidden as u64],
         ),
         (
             "lm_head.weight".to_string(),
             2,
-            vec![MINI_VOCAB as u64, MINI_HIDDEN as u64],
+            vec![MINI_VOCAB as u64, hidden as u64],
         ),
         (
             "hyper_connection_mixer.hc_norm.weight".to_string(),
             1,
-            vec![(MINI_STREAMS * MINI_HIDDEN) as u64],
+            vec![(MINI_STREAMS * hidden) as u64],
         ),
         (
             "hyper_connection_mixer.input_mix_weight_down.weight".to_string(),
             2,
-            vec![MINI_MIX_RANK as u64, (MINI_STREAMS * MINI_HIDDEN) as u64],
+            vec![MINI_MIX_RANK as u64, (MINI_STREAMS * hidden) as u64],
         ),
         (
             "hyper_connection_mixer.input_mix_weight_up.weight".to_string(),
             2,
-            vec![(MINI_STREAMS * MINI_HIDDEN) as u64, MINI_MIX_RANK as u64],
+            vec![(MINI_STREAMS * hidden) as u64, MINI_MIX_RANK as u64],
         ),
     ];
+    let mut specs: Vec<FixtureSpec> = tuples
+        .into_iter()
+        .map(|(name, kind, dims)| FixtureSpec {
+            name,
+            kind,
+            dims,
+            dtype: 0,
+        })
+        .collect();
     for layer in 0..MINI_LAYERS {
         let prefix = format!("layers.{layer}");
         for mixer in ["attn_hyper_connection", "mlp_hyper_connection"] {
-            specs.push((
-                format!("{prefix}.{mixer}.hc_norm.weight"),
-                1,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.{mixer}.block_inject_weight.weight"),
-                2,
-                vec![MINI_STREAMS as u64, (MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.{mixer}.input_mix_weight_down.weight"),
-                2,
-                vec![MINI_MIX_RANK as u64, (MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.{mixer}.input_mix_weight_up.weight"),
-                2,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64, MINI_MIX_RANK as u64],
-            ));
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.{mixer}.hc_norm.weight"),
+                kind: 1,
+                dims: vec![(MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.{mixer}.block_inject_weight.weight"),
+                kind: 2,
+                dims: vec![MINI_STREAMS as u64, (MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.{mixer}.input_mix_weight_down.weight"),
+                kind: 2,
+                dims: vec![MINI_MIX_RANK as u64, (MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.{mixer}.input_mix_weight_up.weight"),
+                kind: 2,
+                dims: vec![(MINI_STREAMS * hidden) as u64, MINI_MIX_RANK as u64],
+                dtype: 0,
+            });
         }
         if mini_is_attention_layer(layer) {
             // q_proj exposes 2·head_dim rows; the forward consumes half
             // (the 24-vs-48 nuance, spec §2) → 1 query head.
-            specs.push((
-                format!("{prefix}.self_attn.q_proj.weight"),
-                2,
-                vec![(2 * MINI_HEAD_DIM) as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.q_norm.weight"),
-                1,
-                vec![MINI_HEAD_DIM as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.k_proj.weight"),
-                2,
-                vec![MINI_HEAD_DIM as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.k_norm.weight"),
-                1,
-                vec![MINI_HEAD_DIM as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.v_proj.weight"),
-                2,
-                vec![MINI_HEAD_DIM as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.o_proj.weight"),
-                2,
-                vec![MINI_HIDDEN as u64, MINI_HEAD_DIM as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.indexer.index_qk_proj.weight"),
-                2,
-                vec![MINI_HEAD_DIM as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.indexer.q_layernorm.weight"),
-                1,
-                vec![MINI_HEAD_DIM as u64],
-            ));
-            specs.push((
-                format!("{prefix}.self_attn.indexer.k_layernorm.weight"),
-                1,
-                vec![MINI_HEAD_DIM as u64],
-            ));
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.q_proj.weight"),
+                kind: 2,
+                dims: vec![(2 * MINI_HEAD_DIM) as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.q_norm.weight"),
+                kind: 1,
+                dims: vec![MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.k_proj.weight"),
+                kind: 2,
+                dims: vec![MINI_HEAD_DIM as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.k_norm.weight"),
+                kind: 1,
+                dims: vec![MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.v_proj.weight"),
+                kind: 2,
+                dims: vec![MINI_HEAD_DIM as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.o_proj.weight"),
+                kind: 2,
+                dims: vec![hidden as u64, MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.indexer.index_qk_proj.weight"),
+                kind: 2,
+                dims: vec![MINI_HEAD_DIM as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.indexer.q_layernorm.weight"),
+                kind: 1,
+                dims: vec![MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.self_attn.indexer.k_layernorm.weight"),
+                kind: 1,
+                dims: vec![MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
         } else {
             // Packed qkv: 1 q + 1 k head (8 each) + 1 v head (8) = 24 rows,
             // matching the real `[10240, 2560]` = q 2048 + k 2048 + v 6144
             // layout at mini scale (spec §3 `FUN_01fa0700`).
-            specs.push((
-                format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                2,
-                vec![(3 * MINI_HEAD_DIM) as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.linear_attn.in_proj_z.weight"),
-                2,
-                vec![MINI_HEAD_DIM as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.linear_attn.in_proj_a.weight"),
-                2,
-                vec![1, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.linear_attn.in_proj_b.weight"),
-                2,
-                vec![1, MINI_HIDDEN as u64],
-            ));
-            specs.push((format!("{prefix}.linear_attn.A_log"), 1, vec![1]));
-            specs.push((format!("{prefix}.linear_attn.dt_bias"), 1, vec![1]));
-            specs.push((
-                format!("{prefix}.linear_attn.conv1d.weight"),
-                3,
-                vec![(3 * MINI_HEAD_DIM) as u64, 1, 4],
-            ));
-            specs.push((
-                format!("{prefix}.linear_attn.norm.weight"),
-                1,
-                vec![MINI_HEAD_DIM as u64],
-            ));
-            specs.push((
-                format!("{prefix}.linear_attn.out_proj.weight"),
-                2,
-                vec![MINI_HIDDEN as u64, MINI_HEAD_DIM as u64],
-            ));
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                kind: 2,
+                dims: vec![(3 * MINI_HEAD_DIM) as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.in_proj_z.weight"),
+                kind: 2,
+                dims: vec![MINI_HEAD_DIM as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.in_proj_a.weight"),
+                kind: 2,
+                dims: vec![1, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.in_proj_b.weight"),
+                kind: 2,
+                dims: vec![1, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.A_log"),
+                kind: 1,
+                dims: vec![1],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.dt_bias"),
+                kind: 1,
+                dims: vec![1],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.conv1d.weight"),
+                kind: 3,
+                dims: vec![(3 * MINI_HEAD_DIM) as u64, 1, 4],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.norm.weight"),
+                kind: 1,
+                dims: vec![MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.linear_attn.out_proj.weight"),
+                kind: 2,
+                dims: vec![hidden as u64, MINI_HEAD_DIM as u64],
+                dtype: 0,
+            });
         }
-        specs.push((
-            format!("{prefix}.mlp.gate.weight"),
-            2,
-            vec![MINI_EXPERTS as u64, MINI_HIDDEN as u64],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.experts.gate_up_proj.weight"),
-            3,
-            vec![
-                MINI_EXPERTS as u64,
-                (2 * MINI_FFN) as u64,
-                MINI_HIDDEN as u64,
-            ],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.experts.down_proj.weight"),
-            3,
-            vec![MINI_EXPERTS as u64, MINI_HIDDEN as u64, MINI_FFN as u64],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
-            2,
-            vec![MINI_FFN as u64, MINI_HIDDEN as u64],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.shared_expert.up_proj.weight"),
-            2,
-            vec![MINI_FFN as u64, MINI_HIDDEN as u64],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.shared_expert.down_proj.weight"),
-            2,
-            vec![MINI_HIDDEN as u64, MINI_FFN as u64],
-        ));
-        specs.push((
-            format!("{prefix}.mlp.shared_expert_gate.weight"),
-            2,
-            vec![1, MINI_HIDDEN as u64],
-        ));
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.gate.weight"),
+            kind: 2,
+            dims: vec![MINI_EXPERTS as u64, hidden as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.experts.gate_up_proj.weight"),
+            kind: 3,
+            dims: vec![MINI_EXPERTS as u64, (2 * MINI_FFN) as u64, hidden as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.experts.down_proj.weight"),
+            kind: 3,
+            dims: vec![MINI_EXPERTS as u64, hidden as u64, MINI_FFN as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+            kind: 2,
+            dims: vec![MINI_FFN as u64, hidden as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+            kind: 2,
+            dims: vec![MINI_FFN as u64, hidden as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+            kind: 2,
+            dims: vec![hidden as u64, MINI_FFN as u64],
+            dtype: 0,
+        });
+        specs.push(FixtureSpec {
+            name: format!("{prefix}.mlp.shared_expert_gate.weight"),
+            kind: 2,
+            dims: vec![1, hidden as u64],
+            dtype: 0,
+        });
         // PLE exists only on layer 1 in the real file; the forward path
         // skips it (out of scope), but the fixture keeps the name set.
         if layer == 1 {
-            specs.push((
-                format!("{prefix}.ple.conv1d.weight"),
-                3,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64, 1, 4],
-            ));
-            specs.push((
-                format!("{prefix}.ple.key_proj.weight"),
-                2,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64, MINI_HIDDEN as u64],
-            ));
-            specs.push((
-                format!("{prefix}.ple.norm_conv.weight"),
-                1,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.ple.norm_key.weight"),
-                1,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.ple.norm_query.weight"),
-                1,
-                vec![(MINI_STREAMS * MINI_HIDDEN) as u64],
-            ));
-            specs.push((
-                format!("{prefix}.ple.ple_embedding.layer_multipliers"),
-                1,
-                vec![3],
-            ));
-            specs.push((
-                format!("{prefix}.ple.ple_embedding.ngram_heads_offsets"),
-                1,
-                vec![16],
-            ));
-            specs.push((
-                format!("{prefix}.ple.ple_embedding.ngram_heads_vocab_sizes"),
-                1,
-                vec![16],
-            ));
-            specs.push((
-                format!("{prefix}.ple.value_proj.weight"),
-                2,
-                vec![MINI_HIDDEN as u64, MINI_HIDDEN as u64],
-            ));
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.conv1d.weight"),
+                kind: 3,
+                dims: vec![(MINI_STREAMS * hidden) as u64, 1, 4],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.key_proj.weight"),
+                kind: 2,
+                dims: vec![(MINI_STREAMS * hidden) as u64, hidden as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.norm_conv.weight"),
+                kind: 1,
+                dims: vec![(MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.norm_key.weight"),
+                kind: 1,
+                dims: vec![(MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.norm_query.weight"),
+                kind: 1,
+                dims: vec![(MINI_STREAMS * hidden) as u64],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.ple_embedding.layer_multipliers"),
+                kind: 1,
+                dims: vec![3],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.ple_embedding.ngram_heads_offsets"),
+                kind: 1,
+                dims: vec![16],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.ple_embedding.ngram_heads_vocab_sizes"),
+                kind: 1,
+                dims: vec![16],
+                dtype: 0,
+            });
+            specs.push(FixtureSpec {
+                name: format!("{prefix}.ple.value_proj.weight"),
+                kind: 2,
+                dims: vec![hidden as u64, hidden as u64],
+                dtype: 0,
+            });
         }
     }
+    specs
+}
 
-    // Serialise header + entries + payloads (layout per `hgn::TensorEntry`).
+/// Build the full mini-checkpoint (module docs): the full tensor-name set
+/// with mini dims, every payload bf16 with deterministic values, and
+/// return the parsed checkpoint.
+pub fn mini_checkpoint() -> hgn::Checkpoint {
+    build_fixture("ccfs-mini-fixture.hgn", &mini_specs(MINI_HIDDEN))
+}
+
+/// The mini fixture with quantised payloads on every quantised dtype the
+/// real checkpoint ships (module docs): `embed_tokens` q4c, `lm_head` ht
+/// (with its f16 planes), layer 0's `attn_hyper_connection.block_inject_weight`
+/// q6g64, layer 0's `mlp.gate` q8g64 and layer 0's
+/// `mlp.experts.gate_up_proj` i4r (with the shared `experts.su` and its
+/// own `svh`), at hidden [`MINI_HIDDEN_QUANTISED`].
+pub fn mini_checkpoint_quantised() -> hgn::Checkpoint {
+    let mut specs = mini_specs(MINI_HIDDEN_QUANTISED);
+    for (name, dtype) in [
+        ("embed_tokens.weight", 5),
+        ("lm_head.weight", 16),
+        (
+            "layers.0.attn_hyper_connection.block_inject_weight.weight",
+            24,
+        ),
+        ("layers.0.mlp.gate.weight", 7),
+        ("layers.0.mlp.experts.gate_up_proj.weight", 23),
+    ] {
+        specs
+            .iter_mut()
+            .find(|spec| spec.name == name)
+            .expect("quantised fixture overrides an existing spec")
+            .dtype = dtype;
+    }
+    // The f16 rotation planes the ht/i4r tensors need (spec §2 naming
+    // rule via `plane_names`): lm_head's own pair, and the shared
+    // `experts.su` plus the own `gate_up_proj.svh` (spec §7 — the fused
+    // expert set ships the shared `su`, not a per-projection `suh`).
+    let (lm_suh, lm_svh) = plane_names("lm_head.weight").expect("lm_head planes");
+    specs.push(FixtureSpec {
+        name: lm_suh[0].clone(),
+        kind: 1,
+        dims: vec![MINI_HIDDEN_QUANTISED as u64],
+        dtype: 2,
+    });
+    specs.push(FixtureSpec {
+        name: lm_svh,
+        kind: 1,
+        dims: vec![MINI_VOCAB as u64],
+        dtype: 2,
+    });
+    let (gu_suh, gu_svh) =
+        plane_names("layers.0.mlp.experts.gate_up_proj.weight").expect("gate_up_proj planes");
+    specs.push(FixtureSpec {
+        name: gu_suh[1].clone(),
+        kind: 1,
+        dims: vec![MINI_HIDDEN_QUANTISED as u64],
+        dtype: 2,
+    });
+    specs.push(FixtureSpec {
+        name: gu_svh,
+        kind: 1,
+        dims: vec![(2 * MINI_FFN) as u64],
+        dtype: 2,
+    });
+    build_fixture("ccfs-mini-quantised.hgn", &specs)
+}
+
+/// Serialise header + entries + payloads (layout per `hgn::TensorEntry`)
+/// and parse the bytes back into a checkpoint.
+fn build_fixture(file: &str, specs: &[FixtureSpec]) -> hgn::Checkpoint {
     let entry_count = specs.len() as u64;
     let table_offset = hgn::HEADER_BYTES as u64;
     let data_offset = table_offset + entry_count * hgn::ENTRY_BYTES as u64;
     let mut payloads: Vec<u8> = Vec::new();
     let mut entries: Vec<u8> = Vec::new();
-    for (name, kind, dims) in &specs {
-        let values = fixture_values(name, dims);
-        let payload = bf16::encode_bf16(&values);
+    for spec in specs {
+        let values = fixture_values(&spec.name, &spec.dims);
+        let payload = fixture_payload(spec, &values);
         let offset = data_offset + payloads.len() as u64;
         let mut entry = [0u8; hgn::ENTRY_BYTES];
-        entry[..name.len()].copy_from_slice(name.as_bytes());
-        entry[96..100].copy_from_slice(&0u32.to_le_bytes()); // dtype bf16
-        entry[100..104].copy_from_slice(&kind.to_le_bytes());
-        for (i, dim) in dims.iter().take(4).enumerate() {
+        entry[..spec.name.len()].copy_from_slice(spec.name.as_bytes());
+        entry[96..100].copy_from_slice(&spec.dtype.to_le_bytes());
+        entry[100..104].copy_from_slice(&spec.kind.to_le_bytes());
+        for (i, dim) in spec.dims.iter().take(4).enumerate() {
             entry[104 + i * 8..112 + i * 8].copy_from_slice(&dim.to_le_bytes());
         }
         entry[136..144].copy_from_slice(&offset.to_le_bytes());
@@ -873,7 +1097,23 @@ pub fn mini_checkpoint() -> hgn::Checkpoint {
     bytes.extend_from_slice(&model_id);
     bytes.extend_from_slice(&entries);
     bytes.extend_from_slice(&payloads);
-    hgn::load_prefix("ccfs-mini-fixture.hgn", bytes, declared).expect("mini fixture loads")
+    hgn::load_prefix(file, bytes, declared).expect("fixture loads")
+}
+
+/// The payload bytes for a spec's dtype: the float dtypes encode the
+/// deterministic values, the quantised dtypes run the codec encoders.
+fn fixture_payload(spec: &FixtureSpec, values: &[f32]) -> Vec<u8> {
+    let (rows, cols) = codecs::shape(&spec.dims).expect("fixture dims");
+    match spec.dtype {
+        0 => bf16::encode_bf16(values),
+        2 => bf16::encode_f16(values),
+        5 => codecs::q4c_encode(values, rows, cols).expect("q4c fixture payload"),
+        7 => codecs::q8g64_encode(values, rows, cols).expect("q8g64 fixture payload"),
+        24 => codecs::q6g64_encode(values, rows, cols).expect("q6g64 fixture payload"),
+        16 => codecs::ht_encode(values, rows, cols).expect("ht fixture payload"),
+        23 => codecs::i4r_encode(values, rows, cols).expect("i4r fixture payload"),
+        other => unimplemented!("fixture dtype {other}"),
+    }
 }
 
 /// Deterministic pseudo-random payload values in `[-0.5, 0.5)`, seeded by
@@ -949,8 +1189,9 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quantised_dtypes_without_a_codec() {
-        // The real checkpoint's embed is q4c (dtype 5): no codec → None.
+    fn load_rejects_a_q4c_tensor_whose_shape_fails_the_codec() {
+        // A q4c embed with k = 4: the codec requires k % 32 == 0 (and an
+        // empty payload), so the tensor cannot be decoded → None.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"HGN1");
         bytes.extend_from_slice(&2u32.to_le_bytes());
@@ -969,6 +1210,24 @@ mod tests {
         bytes.extend_from_slice(&entry);
         let ck = hgn::load_prefix("ccfs-q4c.hgn", bytes, 264).expect("loads");
         assert!(load(&ck).is_none());
+    }
+
+    #[test]
+    fn load_accepts_the_quantised_mini_checkpoint() {
+        // The fixture carrying one tensor per quantised dtype (q4c,
+        // q8g64, ht, i4r, q6g64) plus their f16 planes loads as a real
+        // model — the regression this change exists for (the real
+        // checkpoint previously fell back to the stub).
+        let ck = mini_checkpoint_quantised();
+        assert_eq!(ck.entries.len(), 48 * 24 + 9 + 5 + 4);
+        let model = load(&ck).expect("quantised mini checkpoint loads a real model");
+        assert_eq!(model.dims.num_layers, MINI_LAYERS);
+        assert_eq!(model.dims.num_streams, MINI_STREAMS);
+        assert_eq!(model.dims.hidden_per_stream, MINI_HIDDEN_QUANTISED);
+        assert_eq!(model.dims.vocab, MINI_VOCAB);
+        assert_eq!(model.dims.num_experts, MINI_EXPERTS);
+        assert_eq!(model.dims.expert_dim, MINI_FFN);
+        assert_eq!(model.dims.top_k, MINI_EXPERTS); // clamped from 10
     }
 
     #[test]

@@ -2,26 +2,62 @@
 //! `flash_serve-engine.md` §3 op sequences: `norm → qkv → rope →
 //! attention → projection → mlp`, the Gated DeltaNet block and the MoE
 //! MLP). Everything operates on `f32` slices (dequantised via
-//! [`crate::bf16`]); the reference runs the same math through embedded
-//! AMDGPU code objects, which the port replaces with straightforward CPU
-//! kernels (no `unsafe`, no O(n²) accidents: every kernel is a single
-//! pass over its operands).
+//! [`crate::bf16`] and [`crate::codecs`]); the reference runs the same
+//! math through embedded AMDGPU code objects, which the port replaces
+//! with straightforward CPU kernels (no `unsafe`, no O(n²) accidents:
+//! every kernel is a single pass over its operands).
 
-/// Row-major matrix of `f32` values (`data.len() == rows * cols`).
+use crate::codecs::Weights;
+
+/// Row-major matrix backed by [`Weights`]: dense matrices hold their
+/// `f32` values (`weights` is `Weights::Dense` with `rows * cols`
+/// entries), quantised matrices keep the raw payload and decode one row
+/// at a time, so [`Matrix::gemv_rows`] costs O(row) on quantised
+/// weights instead of materialising the whole tensor per call.
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    pub data: Vec<f32>,
+    pub weights: Weights,
 }
 
 impl Matrix {
-    /// Build a matrix from raw values; `None` when the length mismatches.
+    /// Build a dense matrix from raw values; `None` when the length
+    /// mismatches.
     pub fn new(rows: usize, cols: usize, data: Vec<f32>) -> Option<Self> {
         if rows.checked_mul(cols)? == data.len() {
-            Some(Matrix { rows, cols, data })
+            Some(Matrix {
+                rows,
+                cols,
+                weights: Weights::Dense(data),
+            })
         } else {
             None
+        }
+    }
+
+    /// Build a matrix from any [`Weights`] variant; `None` when the
+    /// weights do not match the shape.
+    pub fn with_weights(rows: usize, cols: usize, weights: Weights) -> Option<Self> {
+        let matrix = Matrix {
+            rows,
+            cols,
+            weights,
+        };
+        matrix.weights_matches_shape().then_some(matrix)
+    }
+
+    /// The decoded values of row `i` (dense: a slice clone; quantised:
+    /// the fused row decode).
+    pub fn row(&self, i: usize) -> Vec<f32> {
+        self.weights.row(self.cols, i)
+    }
+
+    /// The dense values when this matrix is not quantised.
+    pub fn dense(&self) -> Option<&[f32]> {
+        match &self.weights {
+            Weights::Dense(data) => Some(data),
+            _ => None,
         }
     }
 
@@ -37,12 +73,62 @@ impl Matrix {
     pub fn gemv_rows(&self, start: usize, count: usize, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.cols, "gemv input width");
         debug_assert!(start.saturating_add(count) <= self.rows, "gemv rows");
-        (0..count)
-            .map(|row| {
-                let offset = (start + row) * self.cols;
-                dot(&self.data[offset..offset + self.cols], x)
-            })
-            .collect()
+        match &self.weights {
+            // Dense fast path: dot straight over the stored slice.
+            Weights::Dense(data) => (0..count)
+                .map(|row| {
+                    let offset = (start + row) * self.cols;
+                    dot(&data[offset..offset + self.cols], x)
+                })
+                .collect(),
+            // Quantised path: dequantise exactly the rows the gemv reads.
+            weights => (0..count)
+                .map(|row| dot(&weights.row(self.cols, start + row), x))
+                .collect(),
+        }
+    }
+
+    /// Check the weights against the shape (dense length, or the
+    /// quantised payload formula for `rows × cols`).
+    fn weights_matches_shape(&self) -> bool {
+        match &self.weights {
+            Weights::Dense(data) => self.rows.checked_mul(self.cols) == Some(data.len()),
+            Weights::Q4c { bytes, .. } => {
+                self.cols.is_multiple_of(32)
+                    && self
+                        .rows
+                        .checked_mul(crate::codecs::pad16(9 * self.cols / 16))
+                        .and_then(|bytes_per_row| bytes_per_row.checked_add(64))
+                        == Some(bytes.len())
+            }
+            Weights::Q8g64 { bytes } => {
+                self.cols.is_multiple_of(64)
+                    && self
+                        .rows
+                        .checked_mul(self.cols / 64)
+                        .and_then(|blocks| blocks.checked_mul(68))
+                        == Some(bytes.len())
+            }
+            Weights::Q6g64 { bytes } => {
+                self.cols.is_multiple_of(64)
+                    && self
+                        .rows
+                        .checked_mul(crate::codecs::pad16(13 * self.cols / 16))
+                        == Some(bytes.len())
+            }
+            Weights::Ht { bytes, .. } => {
+                self.cols.is_multiple_of(2)
+                    && self.rows.checked_mul(self.cols / 2) == Some(bytes.len())
+            }
+            Weights::I4r { bytes, .. } => {
+                self.cols.is_multiple_of(64)
+                    && self
+                        .rows
+                        .checked_mul(self.cols / 64)
+                        .and_then(|blocks| blocks.checked_mul(33))
+                        == Some(bytes.len())
+            }
+        }
     }
 }
 
@@ -258,6 +344,24 @@ mod tests {
         assert!(Matrix::new(2, 3, vec![0.0; 6]).is_some());
         assert!(Matrix::new(2, 3, vec![0.0; 5]).is_none());
         assert!(Matrix::new(0, 0, Vec::new()).is_some());
+    }
+
+    #[test]
+    fn quantised_matrix_row_and_gemv_match_the_codec_decode() {
+        // A 2×64 q8g64 matrix: with_weights validates the payload, row()
+        // matches the codec's row decode and gemv agrees with dotting
+        // those rows (the O(row) fused path).
+        let values: Vec<f32> = (0..128).map(|i| (i as f32) * 0.5 - 32.0).collect();
+        let bytes = crate::codecs::q8g64_encode(&values, 2, 64).unwrap();
+        let weights = crate::codecs::Weights::from_dtype(7, &bytes, &[2, 64], None).unwrap();
+        let matrix = Matrix::with_weights(2, 64, weights.clone()).expect("shape matches");
+        assert_eq!(matrix.row(1), weights.row(64, 1));
+        assert_eq!(matrix.dense(), None, "quantised weights are not dense");
+        let x = vec![1.0f32; 64];
+        let expected: Vec<f32> = (0..2).map(|r| matrix.row(r).iter().sum()).collect();
+        assert_eq!(matrix.gemv(&x), expected);
+        // A shape the payload does not back is rejected.
+        assert!(Matrix::with_weights(3, 64, weights).is_none());
     }
 
     #[test]

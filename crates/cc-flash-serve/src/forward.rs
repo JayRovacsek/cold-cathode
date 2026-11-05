@@ -17,15 +17,15 @@
 //!   ([`Forward::rollback`] / [`Forward::commit`]) so extending the
 //!   context by one token costs one token step, not a full recompute.
 //! * **Stub fallback** (the historical behaviour): checkpoints whose
-//!   weights cannot be run for real — the real
-//!   `qwen38-flash-next-v2-abliterated.hgn` stores its projections in
-//!   quantised dtypes (`q4c`/`ht`/`i4r`/`q6g64`) whose dequant codecs are
-//!   not yet specified (spec §1), and the port's own write-path fixtures
-//!   carry no layer tensors at all — fall back to the deterministic
-//!   FNV-1a-seeded pseudo-random distribution (the reference's hash
-//!   family, spec §5). The real numerics arrive by landing the quant
-//!   codecs in [`crate::bf16::decode_tensor`]; the fallback keeps the
-//!   `GEN` contract byte-stable until then.
+//!   weights cannot be run for real — the port's own write-path fixtures
+//!   carry no layer tensors at all, and dtypes without a dequant codec
+//!   (the integer codes `3`/`4` on weight entries) still yield no
+//!   model — fall back to the deterministic FNV-1a-seeded pseudo-random
+//!   distribution (the reference's hash family, spec §5). The real
+//!   `qwen38-flash-next-v2-abliterated.hgn` now takes the real path:
+//!   its quantised projections (`q4c`/`q8g64`/`ht`/`i4r`/`q6g64`)
+//!   decode through [`crate::codecs`] (spec `flash_serve-dtypes.md`),
+//!   so the stub only serves fixtures without a full tensor set.
 //!
 //! The signature takes the full context (prompt ids followed by the
 //! generated ids so far) and returns the next-token logits, which is the
@@ -199,11 +199,10 @@ pub(crate) fn forward_token(
     position: usize,
     layers: &mut [LayerRuntime],
 ) -> Vec<f32> {
-    let h = model.dims.hidden_per_stream;
     // Out-of-range ids wrap into the table (the reference validates ids at
     // the protocol layer; the port clamps defensively here).
     let row = token.rem_euclid(model.dims.vocab as i64) as usize;
-    let embedding = &model.embed.data[row * h..(row + 1) * h];
+    let embedding = model.embed.row(row);
     // The top-level hyper-connection expands the embedding into the
     // stream stack (the real file has no top-level `block_inject_weight`,
     // so every stream starts at the raw embedding row — documented
@@ -279,9 +278,9 @@ fn attention_block(
 fn linear_block(linear: &model::LinearBlock, x: &[f32], runtime: &mut LayerRuntime) -> Vec<f32> {
     let qkv_raw = linear.qkv.gemv(x);
     let convolved = ops::conv1d_step(
-        &linear.conv_w.data,
-        linear.conv_w.rows,
-        linear.conv_w.cols,
+        &linear.conv_w,
+        linear.qkv.rows,
+        linear.conv_kernel,
         &mut runtime.conv_hist,
         &qkv_raw,
     );

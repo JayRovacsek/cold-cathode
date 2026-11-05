@@ -1,5 +1,7 @@
 //! bf16 primitives and the checkpoint dtype decoders (spec
-//! `flash_serve-engine.md` §1, [dtype-table-PTR_DAT_020baa68]).
+//! `flash_serve-engine.md` §1, [dtype-table-PTR_DAT_020baa68], with the
+//! quantised codecs of spec `flash_serve-dtypes.md` §3–§7 implemented in
+//! [`crate::codecs`]).
 //!
 //! The reference stores norms, vectors and (dequantised) activations as
 //! bfloat16 — the binary16 brain format: the top 16 bits of an IEEE-754
@@ -10,11 +12,11 @@
 //!
 //! The dtype codes the reference table assigns to the resident *float* formats are
 //! `0=bf16`, `1=f32`, `2=f16`, `3=i32`, `4=i64`; the quantised codes
-//! (`5=q4c`, `16=ht`, `23=i4r`, `24=q6g64`, …) have no dequant codec
-//! specified yet (spec §1 resolved table, §3 `[D]` entries), so
-//! [`decode_tensor`] accepts only the resident float formats and returns
-//! `None` for everything else — the caller (`model::Model::new`) treats
-//! that as "this checkpoint cannot be run for real yet".
+//! (`5=q4c`, `7=q8g64`, `16=ht`, `23=i4r`, `24=q6g64`) decode through
+//! [`crate::codecs`]. [`decode_tensor`] routes every code: the float
+//! formats decode here, the quantised formats delegate to the codecs
+//! (dtypes 16/23 additionally need their f16 rotation planes), and the
+//! integer codes `3`/`4` (ple metadata, not weights) return `None`.
 
 /// A bf16 value: the high 16 bits of an `f32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +93,58 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-/// Decode a tensor payload of the given dtype code into `f32` values.
-/// Supports the resident float formats (`0=bf16`, `1=f32`, `2=f16`);
-/// quantised and integer dtypes return `None` (module docs).
-pub fn decode_tensor(dtype: u32, bytes: &[u8]) -> Option<Vec<f32>> {
+/// Convert an `f32` to an IEEE-754 binary16 (`f16`) bit pattern with
+/// round-to-nearest-even (the inverse of [`f16_to_f32`]): normals round
+/// their mantissa RNE (a carry promotes the exponent), values below the
+/// smallest subnormal round to signed zero, values above the largest
+/// finite normal round to infinity.
+pub fn f16_from_f32(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    if value.is_nan() {
+        return sign | 0x7e00; // quiet the NaN, keep the sign
+    }
+    if value.is_infinite() {
+        return sign | 0x7c00;
+    }
+    let exp = (bits >> 23) & 0xff;
+    let man = bits & 0x007f_ffff;
+    if exp == 0 {
+        return sign; // f32 subnormals are far below the f16 subnormal range
+    }
+    let unbiased = exp as i32 - 127;
+    if unbiased > 15 {
+        return sign | 0x7c00; // overflow → infinity
+    }
+    if unbiased >= -14 {
+        // Normal f16: round the 23-bit mantissa to 10 bits (RNE).
+        let rounded = man + 0x0fff + ((man >> 13) & 1);
+        let mut mantissa = (rounded >> 13) as u16;
+        let mut exponent = (unbiased + 15) as u16;
+        if mantissa == 0x400 {
+            mantissa = 0;
+            exponent += 1;
+            if exponent == 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+        return sign | (exponent << 10) | mantissa;
+    }
+    // f16 subnormal: value = M · 2⁻²⁴ with the f32 significand (implicit
+    // bit included) shifted right, RNE (M = round(S · 2^(unbiased+1))).
+    let shift = (-unbiased - 1) as u32; // 14..=125 for unbiased in −126..−15
+    if shift > 24 {
+        return sign;
+    }
+    let significand = man | 0x0080_0000;
+    let m = (significand + (1 << (shift - 1)) + ((significand >> shift) & 1)) >> shift;
+    sign | m as u16
+}
+
+/// Decode a tensor payload of the resident float dtypes (`0=bf16`,
+/// `1=f32`, `2=f16`) into `f32` values; `None` when the payload length
+/// does not fit the element size.
+pub(crate) fn decode_float_payload(dtype: u32, bytes: &[u8]) -> Option<Vec<f32>> {
     match dtype {
         0 if bytes.len().is_multiple_of(2) => Some(
             bytes
@@ -124,12 +174,45 @@ pub fn decode_tensor(dtype: u32, bytes: &[u8]) -> Option<Vec<f32>> {
     }
 }
 
+/// Decode a tensor payload of the given dtype code into `f32` values.
+/// The resident float formats (`0=bf16`, `1=f32`, `2=f16`) decode here;
+/// the quantised formats (`5=q4c`, `7=q8g64`, `16=ht`, `23=i4r`,
+/// `24=q6g64`) delegate to [`crate::codecs::decode`] (dtypes 16/23
+/// require their f16 rotation planes in `planes`); the integer codes
+/// `3`/`4` have no codec (module docs).
+pub fn decode_tensor(
+    dtype: u32,
+    bytes: &[u8],
+    dims: &[u64],
+    planes: Option<(&[f32], &[f32])>,
+) -> Option<Vec<f32>> {
+    match dtype {
+        0..=2 => {
+            let values = decode_float_payload(dtype, bytes)?;
+            let (rows, cols) = crate::codecs::shape(dims)?;
+            (rows.checked_mul(cols)? == values.len()).then_some(values)
+        }
+        _ => crate::codecs::decode(dtype, bytes, dims, planes),
+    }
+}
+
 /// Encode `f32` values as a little-endian bf16 payload (the fixture
 /// builder's writer for dtype-0 tensors).
 pub fn encode_bf16(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 2);
     for value in values {
         out.extend_from_slice(&Bf16::from_f32(*value).to_le_bytes());
+    }
+    out
+}
+
+/// Encode `f32` values as a little-endian f16 payload (the fixture
+/// builder's writer for dtype-2 tensors — the quantised codecs' f16
+/// rotation planes).
+pub fn encode_f16(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        out.extend_from_slice(&f16_from_f32(*value).to_le_bytes());
     }
     out
 }
@@ -180,26 +263,77 @@ mod tests {
     }
 
     #[test]
+    fn f16_conversions_from_f32() {
+        assert_eq!(f16_from_f32(1.0), 0x3c00);
+        assert_eq!(f16_from_f32(-1.0), 0xbc00);
+        assert_eq!(f16_from_f32(0.5), 0x3800);
+        assert_eq!(f16_from_f32(0.0), 0x0000);
+        assert_eq!(f16_from_f32(-0.0), 0x8000);
+        assert_eq!(f16_from_f32(f32::INFINITY), 0x7c00);
+        assert!(f16_from_f32(f32::NAN) & 0x7e00 == 0x7e00);
+        // RNE on the discarded mantissa bits: 0x3f811xxx-ish ties.
+        // 1.00048828125 is exactly halfway between f16 1.0 and 1.00097…
+        // → ties-to-even picks 0x3c00.
+        assert_eq!(f16_from_f32(f32::from_bits(0x3f80_1000)), 0x3c00);
+        // 1.000732421875 is nearer 1.00097… → 0x3c01.
+        assert_eq!(f16_from_f32(f32::from_bits(0x3f80_1800)), 0x3c01);
+        // Overflow and the largest finite normal.
+        assert_eq!(f32::from_bits(0x4780_0000), 65_536.0);
+        assert_eq!(f16_from_f32(65_536.0), 0x7c00); // rounds to infinity
+        assert_eq!(f16_from_f32(65_504.0), 0x7bff); // largest finite f16
+                                                    // Subnormals: the smallest f16 subnormal and a tie rounding.
+        assert_eq!(f16_from_f32(2f32.powi(-24)), 0x0001);
+        assert_eq!(f16_from_f32(1.5f32 * 2f32.powi(-24)), 0x0002);
+        // Round-trip every exactly-representable sample back through the
+        // decoder.
+        for bits in [0x0001u16, 0x03ff, 0x0400, 0x3c00, 0x3800, 0xbc00, 0x7bff] {
+            assert_eq!(
+                f16_from_f32(f16_to_f32(bits)),
+                bits,
+                "round-trip of {bits:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_f16_matches_the_decoder() {
+        let values = vec![0.0, 1.0, -2.5, 0.75];
+        let bytes = encode_f16(&values);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(decode_tensor(2, &bytes, &[1, 4], None).unwrap(), values);
+    }
+
+    #[test]
     fn decode_tensor_accepts_the_resident_float_dtypes() {
         // dtype 0: bf16 little-endian.
         let bytes = vec![0x80, 0x3f, 0x00, 0x40]; // 1.0, 2.0
-        assert_eq!(decode_tensor(0, &bytes).unwrap(), vec![1.0, 2.0]);
+        assert_eq!(
+            decode_tensor(0, &bytes, &[2], None).unwrap(),
+            vec![1.0, 2.0]
+        );
         // dtype 1: f32 little-endian.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1.5f32.to_le_bytes());
         bytes.extend_from_slice(&(-0.25f32).to_le_bytes());
-        assert_eq!(decode_tensor(1, &bytes).unwrap(), vec![1.5, -0.25]);
+        assert_eq!(
+            decode_tensor(1, &bytes, &[1, 2], None).unwrap(),
+            vec![1.5, -0.25]
+        );
         // dtype 2: f16 little-endian.
         let bytes = 0x3c00u16.to_le_bytes().to_vec();
-        assert_eq!(decode_tensor(2, &bytes).unwrap(), vec![1.0]);
-        // Quantised and integer dtypes have no codec (module docs).
-        assert_eq!(decode_tensor(5, &[0, 0]), None);
-        assert_eq!(decode_tensor(16, &[0, 0]), None);
-        assert_eq!(decode_tensor(23, &[0, 0]), None);
-        assert_eq!(decode_tensor(24, &[0, 0]), None);
-        assert_eq!(decode_tensor(3, &[0, 0, 0, 0]), None);
+        assert_eq!(decode_tensor(2, &bytes, &[1, 1], None).unwrap(), vec![1.0]);
+        // A payload whose length contradicts dims is rejected.
+        assert_eq!(decode_tensor(0, &bytes, &[2, 1], None), None);
+        // Integer dtypes have no codec (module docs).
+        assert_eq!(decode_tensor(3, &[0, 0, 0, 0], &[1], None), None);
         // A short payload cannot be decoded.
-        assert_eq!(decode_tensor(0, &[0]), None);
+        assert_eq!(decode_tensor(0, &[0], &[1, 1], None), None);
+        // Quantised dtypes route to the codecs (tested in crate::codecs);
+        // payloads failing the codec layout still yield None here.
+        assert_eq!(decode_tensor(5, &[0, 0], &[1, 2], None), None);
+        assert_eq!(decode_tensor(16, &[0, 0], &[1, 2], None), None);
+        assert_eq!(decode_tensor(23, &[0, 0], &[1, 2], None), None);
+        assert_eq!(decode_tensor(24, &[0, 0], &[1, 2], None), None);
     }
 
     #[test]
@@ -207,6 +341,6 @@ mod tests {
         let values = vec![0.0, 1.0, -2.5, 0.75];
         let bytes = encode_bf16(&values);
         assert_eq!(bytes.len(), 8);
-        assert_eq!(decode_tensor(0, &bytes).unwrap(), values);
+        assert_eq!(decode_tensor(0, &bytes, &[1, 4], None).unwrap(), values);
     }
 }
