@@ -498,9 +498,12 @@ impl<W: Write> ReplySink for SocketSink<W> {
 /// only emitted by the reference's grammar subsystem (off here, per
 /// `info_line`), and `C` lines answer `CSTAT`, not `GEN`.
 ///
-/// Collects the reply into a `String` (the [`handle_line`] shape); the
-/// serve path streams it line by line through [`gen_response_into`]
-/// instead.
+/// Collects the reply into a `String` — the exact string
+/// [`handle_line`] derives via [`handle_line_into`] (review 💡-3 moved
+/// the dispatch there, leaving this as the test-facing shape the mtp
+/// tests pin); the serve path streams it line by line through
+/// [`gen_response_into`].
+#[cfg(test)]
 pub(crate) fn gen_response_with(
     request: &GenRequest,
     info: &EngineInfo,
@@ -685,23 +688,13 @@ fn generate_tokens(
 ///   dies without one), so closing is the evidenced default; the front-end
 ///   reconnects via `_ensure` (:1774–1779).
 pub fn handle_line(request: &str, state: &ServeState<'_>) -> Option<String> {
-    let line = request.trim_end_matches(['\r', '\n']);
-    let verb = line.split_whitespace().next()?;
-    match verb {
-        "PING" => Some("PONG".to_string()),
-        "INFO" => Some(info_line(&state.info)),
-        "GEN" => {
-            let request = parse_gen(line)?;
-            let forward = state.forward?;
-            Some(gen_response_with(
-                &request,
-                &state.info,
-                forward,
-                state.mtp.as_ref(),
-            ))
-        }
-        _ => None,
-    }
+    // The verb dispatch lives in [`handle_line_into`] alone (review 💡-3:
+    // the old duplicated match could drift from the streaming path).
+    // A `Vec` sink's `emit` always succeeds, so the bool means exactly
+    // "a reply was produced" here: `Some(joined)` when one was, `None`
+    // when the verb closes the connection.
+    let mut lines: Vec<String> = Vec::new();
+    handle_line_into(request, state, &mut lines).then(|| lines.join("\n"))
 }
 
 /// The [`handle_line`] body streaming every reply line into `sink` as it
@@ -1551,5 +1544,18 @@ mod tests {
             .read_line(&mut line)
             .expect("the line is readable while the sink is still open");
         assert_eq!(line, "T 1 5 -0.5\n");
+        // The dropped-peer case (review 💡-4): once the client hangs up,
+        // emit must report false so the generation loop stops (the
+        // reference's failed `send` ends the request the same way). The
+        // first write after a graceful close may still land in the
+        // kernel's send buffer before the RST is processed, so emit
+        // until the sink reports the socket is gone — within a bounded
+        // number of writes.
+        drop(client);
+        let mut writes = 1usize;
+        while sink.emit(&format!("T 1 {writes} -0.5")) {
+            writes += 1;
+            assert!(writes <= 64, "emit must report false once the peer is gone");
+        }
     }
 }

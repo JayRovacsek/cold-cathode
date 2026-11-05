@@ -629,6 +629,14 @@ pub struct MtpEngine<'a> {
     model: &'a model::Model,
     head: MtpHead,
     config: MtpConfig,
+    /// Test seam (review 🟡-1): `Some(k)` makes [`Self::generate_into`]
+    /// fail its draft once `k` rounds have succeeded. The late-failure
+    /// break is otherwise unreachable with the fixtures (a fixture
+    /// round's draft/verify accounting always succeeds), so
+    /// [`Self::new_with_late_failure`] exists to pin the contract;
+    /// production engines are always `None`.
+    #[cfg(test)]
+    late_failure_after: Option<usize>,
 }
 
 impl<'a> MtpEngine<'a> {
@@ -641,7 +649,24 @@ impl<'a> MtpEngine<'a> {
             model,
             head,
             config,
+            #[cfg(test)]
+            late_failure_after: None,
         })
+    }
+
+    /// The test constructor behind [`Self::late_failure_after`]: an
+    /// engine whose `generate_into` fails the draft of its
+    /// `rounds`-th-indexed round (the first `rounds` rounds succeed).
+    #[cfg(test)]
+    pub(crate) fn new_with_late_failure(
+        forward: &'a Forward<'a>,
+        head: MtpHead,
+        config: MtpConfig,
+        rounds: usize,
+    ) -> Option<Self> {
+        let mut engine = Self::new(forward, head, config)?;
+        engine.late_failure_after = Some(rounds);
+        Some(engine)
     }
 
     /// Build the engine from the environment: `None` when MTP is off
@@ -659,6 +684,29 @@ impl<'a> MtpEngine<'a> {
         let head_ck = hgn::load(&head_path).ok()?;
         let head = MtpHead::load(forward.checkpoint(), &head_ck).ok()?;
         Self::new(forward, head, config)
+    }
+
+    /// The round's draft outcome (the [`Self::generate_into`] loop's
+    /// call site): [`Self::draft`] in production; test engines built
+    /// with [`Self::new_with_late_failure`] return `None` once the
+    /// injected round count is reached (review 🟡-1 — the late-failure
+    /// break is otherwise unreachable with the fixtures).
+    fn round_draft(
+        &self,
+        n: usize,
+        context: &[i64],
+        params: &SampleParams,
+        rng: &mut Rng,
+        trunk_hidden: Option<&[f32]>,
+        rounds: usize,
+    ) -> Option<Vec<DraftToken>> {
+        #[cfg(test)]
+        if self.late_failure_after.is_some_and(|after| rounds >= after) {
+            return None;
+        }
+        #[cfg(not(test))]
+        let _ = rounds;
+        self.draft(n, context, params, rng, trunk_hidden)
     }
 
     /// `draft_sample` port: draw `n` tokens with their logprobs. Row 0
@@ -799,8 +847,9 @@ impl<'a> MtpEngine<'a> {
     /// single-token decode, matching the old collect-then-return shape.
     /// Once lines have been emitted they cannot be unsent, so a later
     /// draft/verify failure ends the generation with the partial
-    /// accounting, and a dead sink (client hangup) stops the loop the
-    /// same way the reference's failed `send` ends a request.
+    /// accounting and reason `error` (review 🟡-1), and a dead sink
+    /// (client hangup) stops the loop the same way the reference's
+    /// failed `send` ends a request.
     pub fn generate_into(
         &self,
         request: &crate::protocol::GenRequest,
@@ -835,18 +884,35 @@ impl<'a> MtpEngine<'a> {
             } else {
                 None
             };
-            let drafts = match self.draft(n, &context, params, &mut rng, trunk_hidden.as_deref()) {
-                Some(drafts) => drafts,
+            let drafts = match self.round_draft(
+                n,
+                &context,
+                params,
+                &mut rng,
+                trunk_hidden.as_deref(),
+                rounds,
+            ) {
                 // A first-round failure with nothing emitted keeps the
                 // caller's fallback; a later failure cannot unsend the
-                // lines already on the wire, so it ends the run.
+                // lines already on the wire, so it ends the run with
+                // reason `error` (the over-context refusal shape) —
+                // never a `length` stop a front-end cross-check
+                // (serve_api's _demux) could misread as a normal
+                // finish (review 🟡-1).
+                Some(drafts) => drafts,
                 None if rounds == 0 => return None,
-                None => break,
+                None => {
+                    reason = "error";
+                    break;
+                }
             };
             let (emitted, k) = match self.verify(n, &context, &drafts, &mut rng) {
                 Ok(pair) => pair,
                 Err(_) if rounds == 0 => return None,
-                Err(_) => break,
+                Err(_) => {
+                    reason = "error";
+                    break;
+                }
             };
             rounds += 1;
             committed += k;
@@ -1456,13 +1522,75 @@ mod tests {
         let off_forward = Forward::new(&trunk);
         let off = gen_response_with(&request, &info, &off_forward, None);
         assert_eq!(lines[0], off.lines().next().unwrap());
-        // Determinism: a second engine on the same fixtures replays the
-        // same T lines.
+        // Determinism, routed through the `generate` wrapper (review
+        // 💡-2): a second engine on the same fixtures replays the same
+        // T lines via MtpGeneration — the wrapper's contract is exactly
+        // the lines gen_response_with streams (the D line aside:
+        // decode_ms measures the wall clock) plus the summary the D
+        // line carries.
         let forward2 = Forward::new(&trunk);
         let engine2 = MtpEngine::new(&forward2, head, config).unwrap();
-        let again = gen_response_with(&request, &info, &forward2, Some(&engine2));
+        let generation = engine2
+            .generate(
+                &request,
+                &SampleParams::greedy(),
+                request.max_tokens as usize,
+                std::time::Instant::now(),
+            )
+            .expect("the engine generates at gate 1");
+        assert_eq!(generation.n_gen, 6);
+        assert_eq!(generation.reason, "length");
+        assert_eq!(generation.rounds, 3);
+        assert_eq!(generation.committed, 6);
         let first: Vec<&str> = on.lines().take(6).collect();
-        let second: Vec<&str> = again.lines().take(6).collect();
+        let second: Vec<&str> = generation.lines.iter().map(String::as_str).collect();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_late_mtp_round_failure_reports_reason_error() {
+        // Review 🟡-1: a draft/verify failure after round 0 cannot
+        // unsend the lines already on the wire, so the run ends with
+        // the partial output and reason `error` — never a `length`
+        // stop serve_api's _demux could misread as a normal finish
+        // while n_gen < max_tokens. The fixture rounds always succeed,
+        // so the engine is built through the test seam that fails the
+        // draft after one successful round.
+        let trunk = trunk();
+        let head_ck = head();
+        let head = MtpHead::load(&trunk, &head_ck).unwrap();
+        let forward = Forward::new(&trunk);
+        let config = MtpConfig {
+            enabled: true,
+            depth: 2,
+            depth_set: true,
+            depth_hi: 0,
+            spec_n: 3,
+            gate_p: 1.0,
+        };
+        let engine = MtpEngine::new_with_late_failure(&forward, head, config, 1).unwrap();
+        let info = fixture_info();
+        let request = GenRequest {
+            req: 7,
+            max_tokens: 6,
+            eos: vec![],
+            ids: vec![1, 2],
+            sample: None,
+            progress: false,
+        };
+        let reply = gen_response_with(&request, &info, &forward, Some(&engine));
+        let lines: Vec<&str> = reply.lines().collect();
+        // Round 0 (gate 1, draft_n 2) delivered its two T lines; the
+        // D line reports the failure with the delivered count.
+        assert_eq!(lines.len(), 3, "two T lines + the D line: {reply:?}");
+        let d_fields: Vec<&str> = lines[2].split_whitespace().collect();
+        assert_eq!(d_fields[1], "7"); // req
+        assert_eq!(
+            d_fields[2], "error",
+            "a late failure must not read as a length stop"
+        );
+        assert_eq!(d_fields[4], "2", "n_gen carries the delivered count");
+        assert_eq!(d_fields[8], "1"); // rounds
+        assert_eq!(d_fields[9], "2"); // committed
     }
 }
