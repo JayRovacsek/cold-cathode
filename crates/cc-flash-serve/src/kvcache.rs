@@ -297,15 +297,17 @@ pub fn host_reserve_gib() -> f64 {
 // ---------------------------------------------------------------------------
 
 // The `FUN_01f82130` device-buffer sizes of the 0x160-byte slot record,
-// with the record offsets from the decompiled stack frame.
-const ACTIVATION_STAGING: usize = 0x30_0000; // +0x000, 3 MiB
-const SECONDARY_STAGING: usize = 0x1_4000; // +0x018, 80 KiB
-const SMALL_CONTROL: usize = 0x300; // +0x078, 768 B
-const STATE_SMALL: usize = 0x10; // +0x090, 16 B
-const STATE_MAIN: usize = 0x2_d000; // +0x098, 184 KiB
-const KV_REGION: usize = 0xf_2800; // +0x0b8, 993 280 B
-const ALT_SMALL_CONTROL: usize = 0x300; // +0x0d0, 768 B
-const ALT_STATE_BLOCK: usize = 0x5000; // +0x0e0
+// with the record offsets from the decompiled stack frame. `pub(crate)`
+// so the hip module's `dmalloc` accounting can sum them (the kvcache
+// pool budget math's per-slot cost).
+pub(crate) const ACTIVATION_STAGING: usize = 0x30_0000; // +0x000, 3 MiB
+pub(crate) const SECONDARY_STAGING: usize = 0x1_4000; // +0x018, 80 KiB
+pub(crate) const SMALL_CONTROL: usize = 0x300; // +0x078, 768 B
+pub(crate) const STATE_SMALL: usize = 0x10; // +0x090, 16 B
+pub(crate) const STATE_MAIN: usize = 0x2_d000; // +0x098, 184 KiB
+pub(crate) const KV_REGION: usize = 0xf_2800; // +0x0b8, 993 280 B
+pub(crate) const ALT_SMALL_CONTROL: usize = 0x300; // +0x0d0, 768 B
+pub(crate) const ALT_STATE_BLOCK: usize = 0x5000; // +0x0e0
 
 /// Per-layer recurrent state: the accumulated (post-RoPE) keys/values for
 /// full-attention layers, the conv1d history and delta-rule states for

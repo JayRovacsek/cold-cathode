@@ -15,6 +15,7 @@ pub mod codecs;
 pub mod forward;
 pub mod gguf;
 pub mod hgn;
+pub mod hip;
 pub mod kvcache;
 pub mod model;
 pub mod mtp;
@@ -33,7 +34,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::path::Path;
 
 /// Exact no-GPU wording (spec "Observed behaviours" #1, verbatim).
-const ROCM_NO_GPU: &str = "halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.";
+pub(crate) const ROCM_NO_GPU: &str = "halogen: ROCm reports no GPU in this container, so there is nothing to run on. Pass the GPU in (--device /dev/kfd --device /dev/dri), and if HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES is set in the environment, unset it.";
 
 /// Hard-coded serve defaults (spec note under the env-var table: the
 /// binary's own defaults, not the launcher's `HALOGEN_*` variables).
@@ -196,6 +197,7 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         eprintln!("{ROCM_NO_GPU}");
         return 1;
     }
+    log_info(&format!("halogen: backend: {}", hip::active().label()));
     // All env-var checks sit behind the GPU check (matrix note, env group).
     if let Err(message) = validate_env() {
         eprintln!("{message}");
