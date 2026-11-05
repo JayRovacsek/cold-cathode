@@ -16,12 +16,16 @@
 //! XRT-gated paths (device enumeration, engine I/O) are not observable with
 //! the stub library the reference is probed with; the port performs the
 //! documented local validation (manifest/config checks) and exits 0 on the
-//! success paths the spec documents as GPU/XRT-gated.
+//! success paths the spec documents as GPU/XRT-gated. The XRT integration
+//! itself (FFI surface, runtime probe, typed lifecycle port) lives in
+//! [`xrt`] and is attempted by `listen` when available.
 
 #![warn(unsafe_op_in_unsafe_fn)]
 
 use std::env;
 use std::fs;
+
+pub mod xrt;
 
 /// Main usage, verbatim (316-byte embedded string, `fwrite` in `main` [D]).
 const MAIN_USAGE: &str = "usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]\n";
@@ -181,7 +185,17 @@ fn listen(argv: &[String]) -> i32 {
     if argv.len() < 5 {
         return usage(MAIN_USAGE, 1);
     }
-    devices_manifest(&argv[2])
+    let code = devices_manifest(&argv[2]);
+    if code != 0 {
+        return code;
+    }
+    // Phase 7 XRT integration: attempt engine init (dlopen probe + device
+    // open, see [`xrt::listen_init`]) and fall back to the documented
+    // no-device behaviour otherwise. The reference's listen success output
+    // is GPU/XRT-gated and unobservable (spec ambiguity (b)), so both
+    // paths stay silent and exit 0.
+    let _ = xrt::listen_init();
+    0
 }
 
 /// Check `<dir>/devices.hnpm` (the serve/listen manifest, checked before any
@@ -328,4 +342,84 @@ fn cache(argv: &[String]) -> i32 {
         return 0;
     }
     usage(CACHE_USAGE, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("halogen-npu".to_string())
+            .chain(args.iter().map(|arg| (*arg).to_string()))
+            .collect()
+    }
+
+    /// Creates a scratch dir (project-local `.tmp`, per AGENTS.md: no
+    /// system temp dirs) containing `devices.hnpm` and returns its path.
+    fn devices_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp")
+            .join(name);
+        fs::create_dir_all(&dir).expect("create .tmp scratch dir");
+        fs::write(dir.join("devices.hnpm"), "").expect("write devices.hnpm");
+        dir
+    }
+
+    #[test]
+    fn listen_requires_three_positional_arguments() {
+        // [D] `listen` requires argc >= 5 (DEVICES_DIR WEIGHTS HOST:PORT).
+        for len in 1..4 {
+            let args: Vec<&str> = std::iter::once("listen")
+                .chain((0..len - 1).map(|_| "x"))
+                .collect();
+            assert_eq!(run(&argv(&args)), 1, "listen with {} args", len);
+        }
+    }
+
+    #[test]
+    fn listen_missing_manifest_exits_one_before_xrt() {
+        // [RV] the manifest check precedes any XRT work.
+        assert_eq!(
+            run(&argv(&[
+                "listen",
+                "/nonexistent",
+                "/nonexistent",
+                "127.0.0.1:9999"
+            ])),
+            1
+        );
+    }
+
+    #[test]
+    fn listen_falls_back_to_exit_zero_without_a_device() {
+        // Valid manifest: the XRT init attempt (probe + fallback, see
+        // `xrt::listen_init`) is silent and the port exits 0 — the
+        // reference's success path is GPU/XRT-gated (spec ambiguity (b)).
+        let dir = devices_dir("cc-halogen-npu-listen");
+        let code = run(&argv(&[
+            "listen",
+            dir.to_str().unwrap(),
+            "weights",
+            "127.0.0.1:9999",
+        ]));
+        let cleanup = fs::remove_dir_all(&dir);
+        assert_eq!(code, 0);
+        cleanup.expect("clean up scratch dir");
+    }
+
+    #[test]
+    fn listen_accepts_the_optional_order_and_model_arguments() {
+        // `listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model ...]...`
+        let dir = devices_dir("cc-halogen-npu-listen-order");
+        let code = run(&argv(&[
+            "listen",
+            dir.to_str().unwrap(),
+            "weights",
+            "127.0.0.1:9999",
+            "order",
+        ]));
+        let cleanup = fs::remove_dir_all(&dir);
+        assert_eq!(code, 0);
+        cleanup.expect("clean up scratch dir");
+    }
 }
