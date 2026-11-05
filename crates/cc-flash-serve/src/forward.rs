@@ -190,10 +190,24 @@ fn context_seed(context_ids: &[i64]) -> u64 {
     hash
 }
 
-/// One token step: embedding lookup → 48 layers → final mixer → `lm_head`
-/// (spec §3; the per-layer stage order is `norm → qkv → rope → attention →
-/// projection → mlp` with the hyper-connection mixers around each block).
-pub(crate) fn forward_token(
+/// The trunk hidden state at the end of `context` (the MTP head's
+/// `hidden_states` input, spec flash_serve-mtp-kv-npu.md §1.1): replays
+/// the context through fresh layer runtimes and returns the final mixer
+/// output the `lm_head` reads. An empty context yields an empty vector.
+pub fn trunk_hidden(model: &Model, context: &[i64]) -> Vec<f32> {
+    let mut layers = kvcache::new_runtimes(model);
+    let mut hidden = Vec::new();
+    for (position, &token) in context.iter().enumerate() {
+        hidden = forward_token_hidden(model, token, position, &mut layers);
+    }
+    hidden
+}
+
+/// One token step's hidden state (embedding lookup → 48 layers → final
+/// mixer, without the `lm_head` projection — spec §3; the per-layer
+/// stage order is `norm → qkv → rope → attention → projection → mlp`
+/// with the hyper-connection mixers around each block).
+pub(crate) fn forward_token_hidden(
     model: &Model,
     token: i64,
     position: usize,
@@ -227,15 +241,29 @@ pub(crate) fn forward_token(
     }
     // Final aggregation: the top-level mixer folds the stream stack into
     // the single hidden vector the `lm_head` reads.
-    let (final_hidden, _, _) = model.final_mixer.mix(&streams);
-    model.lm_head.gemv(&final_hidden)
+    model.final_mixer.mix(&streams).0
+}
+
+/// One token step: embedding lookup → 48 layers → final mixer → `lm_head`
+/// (spec §3 — the [`forward_token_hidden`] pipeline plus the shared
+/// `lm_head` projection).
+pub(crate) fn forward_token(
+    model: &Model,
+    token: i64,
+    position: usize,
+    layers: &mut [LayerRuntime],
+) -> Vec<f32> {
+    model
+        .lm_head
+        .gemv(&forward_token_hidden(model, token, position, layers))
 }
 
 /// The full-attention block (`self_attn`, spec §3 `FUN_01fb3670`): the
 /// `q_proj` gemv computes all rows, the rope/attention path consumes the
 /// first half (the 24-vs-48 nuance, spec §2); per-head `q_norm`/`k_norm`,
 /// half-rotary RoPE, GQA attention over the cached keys/values, `o_proj`.
-fn attention_block(
+/// Also used by the MTP head's row-local attention (`crate::mtp`).
+pub(crate) fn attention_block(
     attn: &model::AttnBlock,
     x: &[f32],
     position: usize,

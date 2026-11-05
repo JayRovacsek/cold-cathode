@@ -283,6 +283,9 @@ fn count_ids<'a>(words: &mut impl Iterator<Item = &'a str>, count: usize) -> Opt
 /// carries the reason text there — serve_api's `engine_refusal`
 /// (:1350–1363) skips the leading numeric fields of `parts[7:]` and
 /// renders `the engine refused this request: <message>`.
+// The `D` line carries 33 fixed fields (engine spec §8); the parameter
+// list mirrors them, so the arity is inherent to the format.
+#[allow(clippy::too_many_arguments)]
 fn done_line(
     req: i64,
     reason: &str,
@@ -291,10 +294,15 @@ fn done_line(
     max_tokens: i64,
     decode_ms: f64,
     message: &str,
+    rounds: usize,
+    commit: usize,
 ) -> String {
+    // Fields [8]/[9] (after the leading `0` at [7]) carry the MTP
+    // speculative accounting (engine spec §8); the MTP-off path passes
+    // `0 0`, keeping the historical bytes.
     let line = format!(
         "D {req} {reason} {n_prompt} {n_gen} 0.0 {decode_ms:.1} \
-         0 0 0 0 0 0 0 0 0 0 {max_tokens} 0 0 0 0 0 0 0 0.0 0 0 0 0 0 0 0"
+         0 {rounds} {commit} 0 0 0 0 0 0 0 {max_tokens} 0 0 0 0 0 0 0 0.0 0 0 0 0 0 0 0"
     );
     if message.is_empty() {
         line
@@ -325,6 +333,24 @@ const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 /// subsystem (off here, per `info_line`), and `C` lines answer `CSTAT`,
 /// not `GEN`.
 fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Checkpoint) -> String {
+    let forward = forward::Forward::new(checkpoint);
+    let engine = crate::mtp::MtpEngine::from_env(&forward);
+    gen_response_with(request, info, &forward, engine.as_ref())
+}
+
+/// The [`gen_response`] body with the forward pass and the optional MTP
+/// engine injected (the MTP wiring, `crate::mtp`): when `mtp` is `Some`
+/// and the request has a prompt (the reference's warm-sequence rule,
+/// spec flash_serve-mtp-kv-npu.md §1), generation runs the speculative
+/// draft/verify loop and the `D` line carries its `rounds`/`commit`
+/// accounting; otherwise the single-token loop ([`generate_tokens`])
+/// answers with `0 0` accounting.
+pub(crate) fn gen_response_with(
+    request: &GenRequest,
+    info: &EngineInfo,
+    forward: &forward::Forward<'_>,
+    mtp: Option<&crate::mtp::MtpEngine<'_>>,
+) -> String {
     let n_prompt = request.ids.len() as i64;
     if request
         .max_tokens
@@ -339,10 +365,11 @@ fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Check
             request.max_tokens,
             0.0,
             OVER_CONTEXT_MESSAGE,
+            0,
+            0,
         );
     }
     let params = request.sample.clone().unwrap_or_else(SampleParams::greedy);
-    let forward = forward::Forward::new(checkpoint);
     let mut lines = Vec::new();
     if request.progress {
         // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
@@ -351,10 +378,25 @@ fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Check
         lines.push(format!("P {} {n_prompt} {n_prompt} 0 0", request.req));
     }
     let started = Instant::now();
-    let (token_lines, n_gen, reason) =
-        generate_tokens(request, &params, request.max_tokens as usize, &|context| {
-            forward.logits(context)
-        });
+    let (token_lines, n_gen, reason, rounds, commit) = match mtp
+        .filter(|_| !request.ids.is_empty())
+        .and_then(|engine| engine.generate(request, &params, request.max_tokens as usize))
+    {
+        Some(generation) => (
+            generation.lines,
+            generation.n_gen,
+            generation.reason,
+            generation.rounds,
+            generation.committed,
+        ),
+        None => {
+            let (lines, n_gen, reason) =
+                generate_tokens(request, &params, request.max_tokens as usize, &|context| {
+                    forward.logits(context)
+                });
+            (lines, n_gen, reason, 0, 0)
+        }
+    };
     let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
     lines.extend(token_lines);
     lines.push(done_line(
@@ -365,6 +407,8 @@ fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Check
         request.max_tokens,
         decode_ms,
         "",
+        rounds,
+        commit,
     ));
     lines.join("\n")
 }

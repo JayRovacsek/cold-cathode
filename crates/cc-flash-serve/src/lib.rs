@@ -17,9 +17,15 @@ pub mod gguf;
 pub mod hgn;
 pub mod kvcache;
 pub mod model;
+pub mod mtp;
 pub mod ops;
 pub mod protocol;
 pub mod sampling;
+
+/// Process-environment lock shared by every test that mutates env vars
+/// (`env::set_var`/`remove_var` race across the parallel test threads).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::env;
 use std::fs;
@@ -990,6 +996,7 @@ mod tests {
 
     #[test]
     fn env_validations_match_spec_wording() {
+        let _guard = crate::ENV_LOCK.lock().unwrap();
         // Each check is exercised through run_serve's order by calling the
         // validator directly (the GPU check gates it in the binary). The
         // invalid and valid sets share one test so parallel test threads
