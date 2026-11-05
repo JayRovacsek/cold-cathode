@@ -315,6 +315,80 @@ fn done_line(
 /// prompt plus max_tokens inside the context).
 const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 
+/// The reference's generation progress interval in seconds: the double
+/// `0x403e000000000000` (30.0) in the decompiled `main`'s config
+/// initialisation
+/// ([`evidence/flash_serve/decompile/main-FUN_01ede7e0.json`](../../../docs/analysis/evidence/flash_serve/decompile/main-FUN_01ede7e0.json)),
+/// confirmed live by the reference journal emitting its generation lines
+/// at 30.0 s and 60.0 s of a request.
+const GEN_PROGRESS_INTERVAL_SECS: f64 = 30.0;
+
+/// The reference's generation progress line, instantiated:
+/// `flash_serve: req %ld generated %d tokens, %.1f s`
+/// ([`evidence/flash_serve/binutils-strings.txt`](../../../docs/analysis/evidence/flash_serve/binutils-strings.txt):1237,
+/// observed live as `flash_serve: req 2 generated 1748 tokens, 30.0 s`).
+/// The `req` id is the `GEN` request's own id (the reference numbers
+/// requests at the protocol layer and every per-request log line names
+/// it); `elapsed_s` renders with the format string's `%.1f`.
+pub(crate) fn generated_line(req: i64, n_gen: usize, elapsed_s: f64) -> String {
+    format!("flash_serve: req {req} generated {n_gen} tokens, {elapsed_s:.1} s")
+}
+
+/// The reference's prompt-load progress line, instantiated:
+/// `flash_serve: req %ld prefill %d/%d tokens, 0.0 s%s`
+/// ([`evidence/flash_serve/binutils-strings.txt`](../../../docs/analysis/evidence/flash_serve/binutils-strings.txt):601).
+/// The port's prefill is the prompt itself (the same reading the `P`
+/// progress line takes in [`gen_response_with`]), so the line is emitted
+/// once with `processed == total` and the format string's fixed `0.0 s`
+/// time; the trailing `%s` suffix's variants are not pinned in the
+/// evidence, so the port emits it empty (flagged in the port notes).
+pub(crate) fn prefill_line(req: i64, processed: i64, total: i64) -> String {
+    format!("flash_serve: req {req} prefill {processed}/{total} tokens, 0.0 s")
+}
+
+/// The per-request cadence state for [`generated_line`]: emits the
+/// reference's line once per elapsed [`GEN_PROGRESS_INTERVAL_SECS`]
+/// interval while the token loop runs (the reference's journal shows the
+/// 30.0 s / 60.0 s ticks; a request that ends before a tick emits
+/// none). Split into a pure `line_at` so the cadence is unit-testable
+/// without waiting on a wall clock.
+#[derive(Debug)]
+pub(crate) struct GenProgress {
+    /// The `GEN` request id the lines name (`req %ld`).
+    req: i64,
+    /// Elapsed seconds at which the next line is due.
+    next_s: f64,
+}
+
+impl GenProgress {
+    pub(crate) fn new(req: i64) -> Self {
+        GenProgress {
+            req,
+            next_s: GEN_PROGRESS_INTERVAL_SECS,
+        }
+    }
+
+    /// The reference's line when `elapsed_s` has reached the next 30 s
+    /// tick (`None` otherwise). The tick boundary advances to the next
+    /// whole interval multiple, so an elapsed 30.4 s emits the 30 s tick
+    /// and the next fires at 60 s (the reference's observed cadence).
+    pub(crate) fn line_at(&mut self, n_gen: usize, elapsed_s: f64) -> Option<String> {
+        (elapsed_s >= self.next_s).then(|| {
+            // The next whole interval: (floor(elapsed / 30) + 1) · 30 s.
+            self.next_s = ((elapsed_s / GEN_PROGRESS_INTERVAL_SECS).floor() + 1.0)
+                * GEN_PROGRESS_INTERVAL_SECS;
+            generated_line(self.req, n_gen, elapsed_s)
+        })
+    }
+
+    /// [`Self::line_at`] against the wall clock (`started` = when the
+    /// request's generation began, the same instant the `D` line's
+    /// `decode_ms` measures).
+    pub(crate) fn line(&mut self, n_gen: usize, started: Instant) -> Option<String> {
+        self.line_at(n_gen, started.elapsed().as_secs_f64())
+    }
+}
+
 /// The per-server state the protocol answers from (review 🟡-6): the
 /// INFO configuration, the forward pass over the loaded checkpoint and
 /// the MTP engine constructed once at server startup — replacing the
@@ -410,10 +484,16 @@ pub(crate) fn gen_response_with(
         // itself — processed/total carry its length, cache and time 0.
         lines.push(format!("P {} {n_prompt} {n_prompt} 0 0", request.req));
     }
+    // The reference's prompt-load progress line (see [`prefill_line`]):
+    // the port's prefill completes with the prompt itself, so the line
+    // is emitted once with processed == total (HALOGEN_LOG-gated).
+    if n_prompt > 0 {
+        crate::log_info(&prefill_line(request.req, n_prompt, n_prompt));
+    }
     let started = Instant::now();
     let (token_lines, n_gen, reason, rounds, commit) = match mtp
         .filter(|_| !request.ids.is_empty())
-        .and_then(|engine| engine.generate(request, &params, request.max_tokens as usize))
+        .and_then(|engine| engine.generate(request, &params, request.max_tokens as usize, started))
     {
         Some(generation) => (
             generation.lines,
@@ -423,10 +503,13 @@ pub(crate) fn gen_response_with(
             generation.committed,
         ),
         None => {
-            let (lines, n_gen, reason) =
-                generate_tokens(request, &params, request.max_tokens as usize, &|context| {
-                    forward.logits(context)
-                });
+            let (lines, n_gen, reason) = generate_tokens(
+                request,
+                &params,
+                request.max_tokens as usize,
+                started,
+                &|context| forward.logits(context),
+            );
             (lines, n_gen, reason, 0, 0)
         }
     };
@@ -452,10 +535,15 @@ pub(crate) fn gen_response_with(
 /// the `T` lines, the generated-token count and the done reason (`stop`
 /// when a drawn token is in the request's eos set, `length` otherwise —
 /// also used when the logits source runs dry before the budget).
+/// `started` is the instant the request's generation began (the same one
+/// the `D` line's `decode_ms` measures); the loop emits the reference's
+/// 30 s generation ticks ([`GenProgress`], HALOGEN_LOG-gated) as the
+/// token count advances.
 fn generate_tokens(
     request: &GenRequest,
     params: &SampleParams,
     limit: usize,
+    started: Instant,
     logits: &dyn Fn(&[i64]) -> Vec<f32>,
 ) -> (Vec<String>, usize, &'static str) {
     let mut rng = sampling::Rng::new(params.seed);
@@ -463,6 +551,7 @@ fn generate_tokens(
     let mut context = request.ids.clone();
     let mut n_gen = 0usize;
     let mut reason = "length";
+    let mut progress = GenProgress::new(request.req);
     for _ in 0..limit {
         let Some(token) = sampling::sample(&logits(&context), params, &mut rng) else {
             break;
@@ -478,6 +567,9 @@ fn generate_tokens(
         ));
         context.push(token_id);
         n_gen += 1;
+        if let Some(tick) = progress.line(n_gen, started) {
+            crate::log_info(&tick);
+        }
         if request.eos.contains(&token_id) {
             reason = "stop";
             break;
@@ -882,6 +974,71 @@ mod tests {
     }
 
     #[test]
+    fn generated_line_and_ticks_match_the_reference_evidence() {
+        // The reference's format string (binutils-strings.txt:1237)
+        // instantiated with the live journal's own values:
+        // `flash_serve: req 2 generated 1748 tokens, 30.0 s` and
+        // `flash_serve: req 2 generated 3383 tokens, 60.0 s`.
+        assert_eq!(
+            generated_line(2, 1748, 30.04),
+            "flash_serve: req 2 generated 1748 tokens, 30.0 s"
+        );
+        assert_eq!(
+            generated_line(2, 3383, 60.04),
+            "flash_serve: req 2 generated 3383 tokens, 60.0 s"
+        );
+        // Cadence (the double 30.0 in the decompiled main's config init):
+        // silent before 30 s, one line per elapsed 30 s interval after.
+        let mut progress = GenProgress::new(2);
+        assert_eq!(progress.line_at(1, 0.0), None);
+        assert_eq!(progress.line_at(1747, 29.99), None);
+        assert_eq!(
+            progress.line_at(1748, 30.04).as_deref(),
+            Some("flash_serve: req 2 generated 1748 tokens, 30.0 s")
+        );
+        // The next tick boundary is 60 s: nothing between, the next line
+        // fires at 60 s with the then-current token count.
+        assert_eq!(progress.line_at(2000, 45.0), None);
+        assert_eq!(
+            progress.line_at(3383, 60.04).as_deref(),
+            Some("flash_serve: req 2 generated 3383 tokens, 60.0 s")
+        );
+        assert_eq!(progress.line_at(3384, 61.0), None);
+    }
+
+    #[test]
+    fn prefill_line_matches_the_reference_evidence() {
+        // The reference's format string (binutils-strings.txt:601)
+        // instantiated; the port's prefill is the prompt itself (the P
+        // line's reading), so processed == total and the fixed 0.0 s.
+        assert_eq!(
+            prefill_line(2, 10, 10),
+            "flash_serve: req 2 prefill 10/10 tokens, 0.0 s"
+        );
+        assert_eq!(
+            prefill_line(7, 1, 1),
+            "flash_serve: req 7 prefill 1/1 tokens, 0.0 s"
+        );
+    }
+
+    #[test]
+    fn gen_reply_never_carries_log_lines_on_the_socket() {
+        // The progress lines are the reference's journal output (the
+        // port's HALOGEN_LOG channel), never part of the socket reply: a
+        // two-token GEN answers with exactly its T lines and D line.
+        let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply = handle_line("GEN 2 2 0 1 5", &state).expect("GEN answers");
+        assert!(
+            !reply.contains("flash_serve:"),
+            "log lines never ride the socket: {reply:?}"
+        );
+        let lines: Vec<&str> = reply.split('\n').collect();
+        assert_eq!(lines.len(), 3, "two T lines + the D line: {reply:?}");
+    }
+
+    #[test]
     fn gen_reply_refuses_a_prompt_over_the_context() {
         // The reference reserves prompt + max_tokens inside the context
         // (spec §3); the refusal is the full D-line shape with reason
@@ -952,8 +1109,13 @@ mod tests {
         // The `sample`-returns-`None` stop (empty logits): no T lines,
         // n_gen 0, reason stays `length`.
         let request = parse_gen("GEN 1 3 0 0").expect("parses");
-        let (lines, n_gen, reason) =
-            generate_tokens(&request, &SampleParams::greedy(), 3, &|_| Vec::new());
+        let (lines, n_gen, reason) = generate_tokens(
+            &request,
+            &SampleParams::greedy(),
+            3,
+            Instant::now(),
+            &|_| Vec::new(),
+        );
         assert!(lines.is_empty(), "T lines: {lines:?}");
         assert_eq!(n_gen, 0);
         assert_eq!(reason, "length");
@@ -1073,6 +1235,53 @@ mod tests {
         assert_eq!(info_reply, format!("{expected_info}\n"));
         // The client dropping below gives the server thread EOF.
         drop(client);
+    }
+
+    #[test]
+    fn sequential_probes_are_answered_while_a_connection_is_open_but_idle() {
+        // Regression for the live startup INFO probe failure: the
+        // launcher's wait_for_engine probe and serve_api's capability
+        // probe each hold a connection while they wait for a reply, and
+        // the engine must answer every one of them. One open-but-idle
+        // connection (a probe that connected but has not sent its line —
+        // exactly what a connect-only readiness check leaves behind) must
+        // not stop two further sequential INFO probes from being served:
+        // serve_forever answers each connection on its own thread, so a
+        // connection that blocks in read_line never queues the next ones
+        // behind it (the single-threaded accept loop this replaced served
+        // one connection at a time, and the idle connection starved the
+        // probes behind it).
+        let info = fixture_info();
+        let expected_info = info_line(&info);
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let state = ServeState::new(info, None);
+            serve_forever(&listener, &state)
+        });
+        // The idle connection: connected, accepted, nothing sent yet.
+        let mut idle = TcpStream::connect(addr).expect("idle connect");
+        // Two sequential probe connections while the idle one is open.
+        for probe in 0..2 {
+            let mut client = TcpStream::connect(addr).expect("probe connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            client.write_all(b"INFO\n").expect("write INFO");
+            let mut reply = String::new();
+            BufReader::new(client.try_clone().expect("clone"))
+                .read_line(&mut reply)
+                .unwrap_or_else(|err| panic!("probe {probe} must be answered while idle: {err}"));
+            assert_eq!(reply, format!("{expected_info}\n"), "probe {probe} reply");
+        }
+        // The idle connection still gets its answer once it sends.
+        idle.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("idle timeout");
+        idle.write_all(b"PING\n").expect("idle write");
+        let mut idle_reader = BufReader::new(idle.try_clone().expect("idle clone"));
+        let mut pong = String::new();
+        idle_reader.read_line(&mut pong).expect("idle PONG");
+        assert_eq!(pong, "PONG\n");
     }
 
     #[test]

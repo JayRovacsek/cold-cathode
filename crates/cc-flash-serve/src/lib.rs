@@ -306,6 +306,21 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
+    // The serve state is built before binding (the startup INFO probe fix):
+    // `Forward::new` runs `model::load` (decoding the checkpoint's tensors)
+    // and `ServeState::new` builds the MTP engine, and the kernel completes
+    // TCP handshakes into the accept backlog the moment the socket is
+    // bound. Building the state after bind let the launcher's connect-based
+    // `wait_for_engine` (cc-launcher, commit 4a6c577) pass while the engine
+    // could not yet answer INFO: its probe connections sat unanswered in
+    // the backlog, serve_api's startup probe timed out 3×5 s and only
+    // recovered once the accept loop started. The reference builds
+    // everything, then binds, then accepts (decompiled main: socket → bind
+    // → listen → accept after the checkpoint load), so bind is the
+    // readiness signal the launcher's contract relies on — keep every
+    // startup-time construction above the bind.
+    let forward = checkpoint.as_deref().map(forward::Forward::new);
+    let state = protocol::ServeState::new(info, forward.as_ref());
     log_info(&format!("halogen: checkpoint resident, binding {addr}"));
     // Socket setup (spec "Observed behaviours" #7): bind + listen(fd, 64),
     // then serve the engine's line protocol (PING/INFO/GEN, port 8730 per
@@ -315,12 +330,6 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     // separately and served by the Python front-end, not this binary.
     match TcpListener::bind(addr) {
         Ok(listener) => {
-            // The serve state is built once at startup (review 🟡-6):
-            // the forward pass plus the MTP engine from the environment
-            // (`mtp::MtpEngine::from_env`), shared with every connection
-            // instead of being rebuilt per GEN request.
-            let forward = checkpoint.as_deref().map(forward::Forward::new);
-            let state = protocol::ServeState::new(info, forward.as_ref());
             protocol::serve_forever(&listener, &state);
             0
         }

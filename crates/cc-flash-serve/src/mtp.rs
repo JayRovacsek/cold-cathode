@@ -764,11 +764,17 @@ impl<'a> MtpEngine<'a> {
 
     /// The generation loop: rounds of `draft` → `verify` → commit/rollback
     /// until the token budget runs out or an eos token is emitted.
+    /// `started` is the instant the request's generation began (the same
+    /// one the `D` line's `decode_ms` measures); the loop emits the
+    /// reference's 30 s generation ticks (`protocol::GenProgress`,
+    /// HALOGEN_LOG-gated) as the token count advances — the same lines
+    /// the single-token `protocol::generate_tokens` path emits.
     pub fn generate(
         &self,
         request: &crate::protocol::GenRequest,
         params: &SampleParams,
         limit: usize,
+        started: std::time::Instant,
     ) -> Option<MtpGeneration> {
         let mut rng = Rng::new(params.seed);
         let mut lines = Vec::new();
@@ -777,6 +783,7 @@ impl<'a> MtpEngine<'a> {
         let mut reason = "length";
         let mut rounds = 0usize;
         let mut committed = 0usize;
+        let mut progress = crate::protocol::GenProgress::new(request.req);
         while n_gen < limit {
             // The gate-0 round degenerates to the live row alone (the
             // module docs' byte-identity rule).
@@ -815,6 +822,9 @@ impl<'a> MtpEngine<'a> {
                 ));
                 context.push(token_id);
                 n_gen += 1;
+                if let Some(tick) = progress.line(n_gen, started) {
+                    crate::log_info(&tick);
+                }
                 if request.eos.contains(&token_id) {
                     reason = "stop";
                     break;
