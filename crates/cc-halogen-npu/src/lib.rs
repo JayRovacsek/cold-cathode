@@ -192,8 +192,9 @@ fn listen(argv: &[String]) -> i32 {
     // Phase 7 XRT integration: attempt engine init (dlopen probe + device
     // open, see [`xrt::listen_init`]) and fall back to the documented
     // no-device behaviour otherwise. The reference's listen success output
-    // is GPU/XRT-gated and unobservable (spec ambiguity (b)), so both
-    // paths stay silent and exit 0.
+    // is GPU/XRT-gated and unobservable (the spec's exit-code table:
+    // "serve/listen success is GPU/XRT-gated"), so both paths stay silent
+    // and exit 0.
     let _ = xrt::listen_init();
     0
 }
@@ -394,7 +395,8 @@ mod tests {
     fn listen_falls_back_to_exit_zero_without_a_device() {
         // Valid manifest: the XRT init attempt (probe + fallback, see
         // `xrt::listen_init`) is silent and the port exits 0 — the
-        // reference's success path is GPU/XRT-gated (spec ambiguity (b)).
+        // reference's success path is GPU/XRT-gated (the spec's
+        // exit-code table).
         let dir = devices_dir("cc-halogen-npu-listen");
         let code = run(&argv(&[
             "listen",

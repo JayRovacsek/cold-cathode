@@ -160,6 +160,9 @@ extern "C" {
     pub fn run_wait(run: *const c_void, timeout_ms: *const i64);
     /// `xrt::run::state() const` — returns `xrt::kernel::state` (the stub
     /// declares `void`; the real XRT returns the enum, modelled as `c_uint`).
+    /// Calling the void stub through this value-returning pointer reads
+    /// whatever the stub leaves in `rax` — typically 0, which decodes as
+    /// `RunState::Running`.
     #[link_name = "_ZNK3xrt3run5stateEv"]
     pub fn run_state(run: *const c_void) -> c_uint;
 
@@ -182,6 +185,10 @@ extern "C" {
     pub fn bo_dtor(bo: *mut c_void);
     /// `xrt::bo::map()` — returns the host mapping (the stub declares
     /// `void`; the real XRT returns `void*`, modelled as `*mut c_void`).
+    /// Calling the void stub through this value-returning pointer reads
+    /// whatever the stub leaves in `rax` — typically 0, so the session
+    /// port's `bo_map` treats the result as a null mapping and returns
+    /// `Err` against the stub.
     #[link_name = "_ZN3xrt2bo3mapEv"]
     pub fn bo_map(bo: *mut c_void) -> *mut c_void;
     /// `xrt::bo::sync(xclBOSyncDirection, unsigned long, unsigned long)`.

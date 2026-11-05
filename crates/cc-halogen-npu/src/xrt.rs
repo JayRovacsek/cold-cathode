@@ -25,7 +25,9 @@
 //! the full symbol table and the typed lifecycle becomes usable.
 //!
 //! The reference's `listen` success output is GPU/XRT-gated and not
-//! observable with the stub library (spec ambiguity (b)), so the port
+//! observable with the stub library (the spec's exit-code table:
+//! "serve/listen success is GPU/XRT-gated"; its limitations bullet lists
+//! the `serve`/`listen` success paths as unverified), so the port
 //! performs the XRT init attempt silently and exits 0 on both paths.
 
 pub mod ffi;
@@ -65,9 +67,10 @@ pub enum ListenInit {
 /// The `listen` engine init: attempt XRT init when the runtime is
 /// available, falling back to the documented no-device behaviour
 /// otherwise. The reference's `listen` success output is GPU/XRT-gated and
-/// unobservable (spec ambiguity (b)), so nothing is printed on either
-/// path; the port's contract output for a valid invocation stays empty
-/// with exit 0.
+/// unobservable (the spec's exit-code table and limitations bullet mark
+/// the `serve`/`listen` success paths as GPU/XRT-gated and unverified), so
+/// nothing is printed on either path; the port's contract output for a
+/// valid invocation stays empty with exit 0.
 pub fn listen_init() -> ListenInit {
     match runtime() {
         // The reference's engine opens device 0 (the `HALOGEN_NPU_DEV_SERIAL`

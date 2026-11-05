@@ -121,9 +121,11 @@ impl RunState {
 
 /// The XRT operations the typed lifecycle performs. The real implementation
 /// is [`XrtRuntime`] (the dlopen-resolved FFI table); tests inject a fake.
-/// The method set mirrors [`crate::xrt::ffi::XRT_SYMBOLS`] exactly —
-/// including the catalogue's omission of an `xrt::elf` destructor (the
-/// reference never destroys the elf object, so [`Elf`] has no close).
+/// The method set mirrors the catalogue's callable surface — the
+/// never-invoked `device_get_info_std` is FFI-only ([`crate::xrt::ffi`]
+/// declares it, the typed lifecycle never calls it) — including the
+/// catalogue's omission of an `xrt::elf` destructor (the reference never
+/// destroys the elf object, so [`Elf`] has no close).
 pub trait Backend {
     fn device_open(&self, index: u32) -> XrtResult<Handle>;
     fn device_close(&self, handle: Handle);
@@ -163,6 +165,9 @@ pub trait Backend {
 /// content is never read; against a real XRT the slot sizes would need the
 /// XRT object layout, which the frozen evidence does not record (the
 /// spec's existing "XRT-dependent behaviour unverified" limitation).
+/// Per-type sizing note: XRT's handle classes are pimpl-only — 8 bytes for
+/// the pimpl pointer, at most 16 with inline scalar members — so the fixed
+/// 64-byte slot is a conservative over-allocation, not a measured layout.
 #[repr(align(8))]
 #[allow(dead_code)] // the field defines the slot's size/alignment; the
                     // C++ object bytes are written through the FFI, never read
@@ -485,6 +490,12 @@ impl Drop for Kernel<'_> {
 pub struct Run<'a> {
     backend: &'a dyn Backend,
     handle: Handle,
+    /// The bound argument slots as raw bo handles. The stored handle is
+    /// not lifetime-tied to the `Bo` it came from (storing `&'a Bo` would
+    /// need extra lifetime parameters on `Run` and reject the common
+    /// create-run-then-bind-argument order), so the handle dangles if the
+    /// `Bo` drops before the run — currently benign because the map is
+    /// only read via [`Run::bound_args`].
     args: BTreeMap<i32, Handle>,
     started: bool,
     state: Option<RunState>,
