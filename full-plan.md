@@ -145,9 +145,9 @@ before any real implementation — proving the harness works (TDD).
 - [x] Checkpoint load into RAM (`crates/cc-flash-serve/src/hgn.rs` + serve-path wiring, `c836d0b`; round-1 review approve-with-nits; entry-layout/version-gate fix landed in `698043a` against the reference checkpoint — round-2 review approve, `.tmp/review-report-engine-round2.md`).
 - [x] Launcher `wait_for_engine` before spawning the api (`crates/cc-launcher/src/lib.rs`, `4a6c577`; fixes the live `ConnectionRefusedError` regression from `c836d0b`; round-2 review approve).
 - [x] Survive transient accept errors in the serve loop (`crates/cc-flash-serve/src/protocol.rs`, `6ecf49f`; fixes the live silent-engine-death symptom — RAM filled then dropped after the front-end's first reconnect cycle: `serve_forever` broke its accept loop on the first `ECONNABORTED`, which std's `incoming()` surfaces as an `Err`; the reference's decompiled `main` re-accepts on every errno except the `EINTR` its signal handlers use for shutdown. Small fix per AGENTS.md exception — no dedicated review; folded into the next round).
-- [ ] Forward pass + sampling (real `GEN` output).
-- [ ] MTP speculative decoding.
-- [ ] KV-cache management.
+- [x] Forward pass + sampling (real `GEN` output).
+- [x] MTP speculative decoding.
+- [x] KV-cache management.
 - [ ] NPU/XRT integration (`halogen-npu listen`).
 
 ---

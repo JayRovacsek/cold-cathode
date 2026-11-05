@@ -101,7 +101,7 @@ pub mod ffi {
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct _hipblasLtMatmulAlgo_t {
-        pub data: [u32; 8],
+        pub data: [u64; 8],
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -421,12 +421,15 @@ pub mod ffi {
 
 /// Resolves `symbol` from an open library handle as the function-pointer
 /// type `$ty`, or returns `None` from the enclosing `load` when the
-/// symbol is missing (the port then treats the runtime as absent).
+/// symbol is missing (the port then treats the runtime as absent). A
+/// missing symbol closes the handle first, so a failed load does not
+/// leak the dlopen reference.
 macro_rules! bind {
     ($handle:expr, $symbol:expr, $ty:ty) => {{
         let name = CString::new($symbol).expect("symbol name without interior nul");
         let ptr = unsafe { ffi::dlsym($handle, name.as_ptr()) };
         if ptr.is_null() {
+            unsafe { ffi::dlclose($handle) };
             return None;
         }
         unsafe { core::mem::transmute::<*mut c_void, $ty>(ptr) }
@@ -876,6 +879,11 @@ pub struct DeviceSelection {
     /// decompile's control flow). The port records the rewrite instead
     /// of exec-ing.
     pub visible_devices_rewrite: Option<i32>,
+    /// Whether the reference would print the device banner: it does so
+    /// when the selection is not the trivial single-device default (more
+    /// than one device in view, a non-zero device, or an explicit
+    /// `HALOGEN_GPU_DEVICE` request).
+    pub banner_shown: bool,
 }
 
 impl DeviceSelection {
@@ -895,6 +903,25 @@ impl DeviceSelection {
             )
         }
     }
+
+    /// The re-exec line the reference prints alongside the banner
+    /// (`fprintf("%s\n%s\n", banner, reexec)`) when the rewrite rule
+    /// restarts the process pinned to a single device; `None` when no
+    /// re-exec happens.
+    pub fn reexec_message(&self) -> Option<String> {
+        self.visible_devices_rewrite.map(|index| {
+            format!(
+                "halogen: starting the engine again with only device {index}, and this build runs on the Strix Halo GPU ({})",
+                self.device.name
+            )
+        })
+    }
+}
+
+/// The wording the reference prints when the re-exec fails and the
+/// process continues with every GPU in view.
+pub fn reexec_failure_message(error: &str) -> String {
+    format!("halogen: could not start the engine again ({error}); it runs with every GPU in view, as before")
 }
 
 /// Resolves a `HALOGEN_GPU_DEVICE` request against the enumerated
@@ -955,9 +982,23 @@ pub fn select_device(devices: &[DeviceEntry], env: &DeviceEnv) -> Result<DeviceS
             None
         };
     Ok(DeviceSelection {
-        device,
+        device: device.clone(),
         visible_devices_rewrite,
+        banner_shown: should_show_banner(devices, &device, env),
     })
+}
+
+/// Whether the reference prints the device banner: it does so whenever
+/// the selection is not the trivial single-device default (more than one
+/// device in view, a non-zero device, or an explicit non-empty
+/// `HALOGEN_GPU_DEVICE` request).
+fn should_show_banner(devices: &[DeviceEntry], device: &DeviceEntry, env: &DeviceEnv) -> bool {
+    devices.len() > 1
+        || device.index != 0
+        || env
+            .halogen_gpu_device
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
 }
 
 /// The full lifecycle port: select the device, then bind it through
@@ -1192,36 +1233,105 @@ mod tests {
         assert_eq!(ffi::HIPBLASLT_SYMBOLS.len(), 13);
         assert_eq!(ffi::HIPBLASLT_EXT_SYMBOLS.len(), 3);
         // Every catalogue symbol must appear in this file's FFI surface.
+        // The HIP runtime and hipblasLt C APIs are declared as
+        // `pub fn <name>`; the mangled C++ hipblaslt_ext API is declared
+        // via `#[link_name = "<mangled name>"]` attributes on the
+        // Rust-side names, so a bare `pub fn <mangled name>` search would
+        // miss them.
         let source = include_str!("hip.rs");
         for symbol in ffi::HIP_RUNTIME_SYMBOLS
             .iter()
             .chain(ffi::HIPBLASLT_SYMBOLS.iter())
-            .chain(ffi::HIPBLASLT_EXT_SYMBOLS.iter())
         {
             assert!(
-                source.contains(symbol),
+                source.contains(&format!("pub fn {symbol}")),
                 "imported symbol {symbol} has no FFI declaration"
             );
         }
-        // Cross-check the catalogues against the evidence JSON. The nix
-        // build's source filter excludes docs/, so the check is
-        // best-effort there.
+        for symbol in ffi::HIPBLASLT_EXT_SYMBOLS.iter() {
+            assert!(
+                source.contains(&format!("#[link_name = \"{symbol}\"]")),
+                "imported symbol {symbol} has no FFI declaration"
+            );
+        }
+        // Cross-check the catalogues against the evidence JSON: the union
+        // of the three const arrays must match the `hip_symbols` list
+        // exactly, in both directions. The nix build's source filter
+        // excludes docs/, so the check is best-effort there.
         let json_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/analysis/evidence/flash_serve/npu/hip-imported-symbols.json"
         );
-        if let Ok(json) = std::fs::read_to_string(json_path) {
-            for symbol in ffi::HIP_RUNTIME_SYMBOLS
-                .iter()
-                .chain(ffi::HIPBLASLT_SYMBOLS.iter())
-                .chain(ffi::HIPBLASLT_EXT_SYMBOLS.iter())
-            {
-                assert!(
-                    json.contains(&format!("\"{symbol}\"")),
-                    "catalogue symbol {symbol} is not in the evidence JSON"
-                );
-            }
-        }
+        let Ok(json) = std::fs::read_to_string(json_path) else {
+            return;
+        };
+        let catalogue = hip_symbols_from_json(&json)
+            .expect("the evidence JSON must contain a hip_symbols array");
+        let declared: std::collections::BTreeSet<&str> = ffi::HIP_RUNTIME_SYMBOLS
+            .iter()
+            .chain(ffi::HIPBLASLT_SYMBOLS.iter())
+            .chain(ffi::HIPBLASLT_EXT_SYMBOLS.iter())
+            .copied()
+            .collect();
+        let listed: std::collections::BTreeSet<&str> =
+            catalogue.iter().map(String::as_str).collect();
+        assert_eq!(
+            declared, listed,
+            "the ffi symbol constants drift from the import catalogue"
+        );
+    }
+
+    // Extract the quoted strings from the `hip_symbols` array of the
+    // evidence JSON. The crate has no JSON parser dependency, so this
+    // walks the array by hand: everything between `"hip_symbols": [` and
+    // the closing `]` is a comma-separated list of quoted names.
+    fn hip_symbols_from_json(json: &str) -> Option<Vec<String>> {
+        let (_, rest) = json.split_once("\"hip_symbols\"")?;
+        let (_, rest) = rest.split_once('[')?;
+        let (body, _) = rest.split_once(']')?;
+        let names = body
+            .split(',')
+            .map(str::trim)
+            .map_while(|entry| {
+                let (open, entry) = entry.split_once('"')?;
+                debug_assert!(open.is_empty(), "entries must start with a quote");
+                let (name, close) = entry.split_once('"')?;
+                debug_assert!(close.is_empty(), "entries must end with a quote");
+                Some(name.to_owned())
+            })
+            .collect::<Vec<_>>();
+        (!names.is_empty()).then_some(names)
+    }
+
+    #[test]
+    fn the_reexec_message_names_the_device_the_engine_restarts_on() {
+        // The reference prints the re-exec line alongside the banner
+        // (`fprintf "%s\n%s\n"`); the port only has a meaningful message
+        // when a rewrite rule actually picked a single device.
+        let rewritten = DeviceSelection {
+            device: device(1, "gfx1151 (Radeon 8060S)"),
+            visible_devices_rewrite: Some(1),
+            banner_shown: true,
+        };
+        assert_eq!(
+            rewritten.reexec_message().as_deref(),
+            Some("halogen: starting the engine again with only device 1, and this build runs on the Strix Halo GPU (gfx1151 (Radeon 8060S))")
+        );
+
+        let passthrough = DeviceSelection {
+            device: device(0, "gfx1151 (Radeon 8060S)"),
+            visible_devices_rewrite: None,
+            banner_shown: true,
+        };
+        assert_eq!(passthrough.reexec_message(), None);
+    }
+
+    #[test]
+    fn the_reexec_failure_message_falls_back_to_every_gpu_in_view() {
+        assert_eq!(
+            reexec_failure_message("no such file"),
+            "halogen: could not start the engine again (no such file); it runs with every GPU in view, as before"
+        );
     }
 
     fn device(index: i32, name: &str) -> DeviceEntry {
@@ -1266,8 +1376,10 @@ mod tests {
             Err(crate::ROCM_NO_GPU.to_string())
         );
 
-        // HIP="1,2": the enumeration HIP offers starts at physical device
-        // 1, and the default request (`first`) selects it.
+        // HIP="1,2": HIP makes physical devices 1 and 2 visible,
+        // remapping them to HIP indices 0 and 1; the fixture lists the
+        // devices with their physical indices and the default request
+        // (`first`) selects the first entry.
         let devices = vec![device(1, "gfx1151"), device(2, "gfx9 gfx")];
         let env = DeviceEnv {
             hip_visible_devices: Some("1,2".to_string()),

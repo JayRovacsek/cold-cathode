@@ -197,6 +197,9 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
         eprintln!("{ROCM_NO_GPU}");
         return 1;
     }
+    // Port-original wording (not a reference string): like the `log_info`
+    // lines, the `halogen: backend: {label}` line is the port's own
+    // phrasing chosen to surface the selected backend.
     log_info(&format!("halogen: backend: {}", hip::active().label()));
     // All env-var checks sit behind the GPU check (matrix note, env group).
     if let Err(message) = validate_env() {
