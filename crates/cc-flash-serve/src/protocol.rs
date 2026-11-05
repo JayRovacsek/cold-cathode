@@ -433,49 +433,115 @@ impl<'a> ServeState<'a> {
     }
 }
 
-/// Run one parsed `GEN` request against the serve state (the
-/// [`gen_response_with`] body with the state's forward pass and MTP
-/// engine injected — review 🟡-6 wires them through instead of
-/// rebuilding them per request).
-///
-/// The reference reserves prompt plus max_tokens inside the context
-/// (spec §3 banner), so a request whose `n_prompt + max_tokens` exceeds
-/// `--ctx` answers the refusal shape ([`done_line`] with reason `error`
-/// and [`OVER_CONTEXT_MESSAGE`]) instead of generating. Otherwise the
-/// generation loop is the port's forward entry point plus sampling layer
-/// (`crate::forward`, `crate::sampling`) via [`generate_tokens`],
-/// stopping early with reason `stop` when a drawn token is in the
-/// request's eos set and with reason `length` when the budget runs out.
-/// The `G` grammar line is only emitted by the reference's grammar
-/// subsystem (off here, per `info_line`), and `C` lines answer `CSTAT`,
-/// not `GEN`.
-fn gen_response(request: &GenRequest, state: &ServeState<'_>) -> String {
-    let forward = state
-        .forward
-        .expect("handle_line only builds a GEN response with a resident forward");
-    gen_response_with(request, &state.info, forward, state.mtp.as_ref())
+/// A destination for the engine's reply lines, delivered line by line as
+/// soon as each is ready. The reference never batches a `GEN` reply: the
+/// connection-handler decompile
+/// ([`evidence/flash_serve/engine/conn-handler-FUN_01ee0e20.json`](../../../docs/analysis/evidence/flash_serve/engine/conn-handler-FUN_01ee0e20.json))
+/// shows the raw `send(fd, buf + sent, len - sent, …)` write loop with no
+/// user-space buffering, and the live front-end consumes `T` lines as
+/// they arrive (serve_api's SSE forwarding with keepalive/gap tracking —
+/// `0 SSE frames and 0 chars sent in 18.2s, … 1 keepalives` — only makes
+/// sense against an engine that streams each token line while generation
+/// runs, spec flash_serve-engine.md §8). The port mirrors that contract:
+/// [`SocketSink`] writes and flushes every line on emit, and a
+/// `Vec<String>` collects the same lines for the string-returning API
+/// ([`handle_line`], [`gen_response_with`]).
+pub trait ReplySink {
+    /// Deliver one complete protocol line (without its newline) as soon as
+    /// it is ready. `false` means the sink is gone (a dead socket): the
+    /// caller must stop generating rather than keep producing lines.
+    fn emit(&mut self, line: &str) -> bool;
 }
 
-/// The [`gen_response`] body with the forward pass and the optional MTP
-/// engine injected (the MTP wiring, `crate::mtp`): when `mtp` is `Some`
-/// and the request has a prompt (the reference's warm-sequence rule,
-/// spec flash_serve-mtp-kv-npu.md §1), generation runs the speculative
-/// draft/verify loop and the `D` line carries its `rounds`/`commit`
-/// accounting; otherwise the single-token loop ([`generate_tokens`])
-/// answers with `0 0` accounting.
+impl ReplySink for Vec<String> {
+    fn emit(&mut self, line: &str) -> bool {
+        self.push(line.to_string());
+        true
+    }
+}
+
+/// The production [`ReplySink`]: every `emit` writes `line` + `\n` to the
+/// socket and flushes, so each token reaches the front-end the moment the
+/// engine samples it (the reference's per-line `send` contract — the
+/// earlier shape built the whole `GEN` reply in memory and wrote it once
+/// after generation completed, so a slow first token starved the
+/// front-end's SSE stream; see [`gen_response_into`]).
+pub struct SocketSink<W: Write> {
+    writer: W,
+}
+
+impl<W: Write> SocketSink<W> {
+    pub fn new(writer: W) -> Self {
+        SocketSink { writer }
+    }
+}
+
+impl<W: Write> ReplySink for SocketSink<W> {
+    fn emit(&mut self, line: &str) -> bool {
+        writeln!(self.writer, "{line}").is_ok() && self.writer.flush().is_ok()
+    }
+}
+
+/// The `GEN` answer with the state's forward pass and the optional MTP
+/// engine injected (the MTP wiring, `crate::mtp`): the reference reserves
+/// prompt plus max_tokens inside the context (spec §3 banner), so a
+/// request whose `n_prompt + max_tokens` exceeds `--ctx` answers the
+/// refusal shape ([`done_line`] with reason `error` and
+/// [`OVER_CONTEXT_MESSAGE`]) instead of generating. Otherwise, when `mtp`
+/// is `Some` and the request has a prompt (the reference's warm-sequence
+/// rule, spec flash_serve-mtp-kv-npu.md §1), generation runs the
+/// speculative draft/verify loop and the `D` line carries its
+/// `rounds`/`commit` accounting; otherwise the single-token loop
+/// ([`generate_tokens`]) answers with `0 0` accounting, stopping early
+/// with reason `stop` when a drawn token is in the request's eos set and
+/// with reason `length` when the budget runs out. The `G` grammar line is
+/// only emitted by the reference's grammar subsystem (off here, per
+/// `info_line`), and `C` lines answer `CSTAT`, not `GEN`.
+///
+/// Collects the reply into a `String` (the [`handle_line`] shape); the
+/// serve path streams it line by line through [`gen_response_into`]
+/// instead.
 pub(crate) fn gen_response_with(
     request: &GenRequest,
     info: &EngineInfo,
     forward: &forward::Forward<'_>,
     mtp: Option<&crate::mtp::MtpEngine<'_>>,
 ) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    gen_response_into(request, info, forward, mtp, &mut lines);
+    lines.join("\n")
+}
+
+/// The [`gen_response_with`] body streaming each reply line into `sink`
+/// the moment it is ready (the reference's per-token write contract,
+/// [`ReplySink`]): the `P` line, then every `T` line as its token is
+/// sampled, then the `D` line. Returns `false` when the sink died
+/// mid-generation (a client hangup): generation stops with the lines
+/// already delivered, matching the reference's behaviour once its
+/// `send` fails.
+///
+/// CPU token latency (H2, measured by reasoning from bytes): the real
+/// forward pass reads the full 66 687 351 992 B quantised weight set
+/// once per token (scalar bf16 gemv across the 48-layer stack,
+/// `forward::logits`), so at single-core memory bandwidth (~10–20 GB/s,
+/// less with scalar dequant) one token costs seconds to a minute on
+/// CPU — the first streamed `T` line of a cold CPU request legitimately
+/// arrives that late; the old batched reply hid even completed tokens
+/// until the whole generation finished.
+fn gen_response_into(
+    request: &GenRequest,
+    info: &EngineInfo,
+    forward: &forward::Forward<'_>,
+    mtp: Option<&crate::mtp::MtpEngine<'_>>,
+    sink: &mut dyn ReplySink,
+) -> bool {
     let n_prompt = request.ids.len() as i64;
     if request
         .max_tokens
         .checked_add(n_prompt)
         .is_none_or(|total| total > info.ctx)
     {
-        return done_line(
+        return sink.emit(&done_line(
             request.req,
             "error",
             n_prompt,
@@ -485,15 +551,16 @@ pub(crate) fn gen_response_with(
             OVER_CONTEXT_MESSAGE,
             0,
             0,
-        );
+        ));
     }
     let params = request.sample.clone().unwrap_or_else(SampleParams::greedy);
-    let mut lines = Vec::new();
     if request.progress {
         // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
         // p_line_progress :1062–1065): the stub's prefill is the prompt
         // itself — processed/total carry its length, cache and time 0.
-        lines.push(format!("P {} {n_prompt} {n_prompt} 0 0", request.req));
+        if !sink.emit(&format!("P {} {n_prompt} {n_prompt} 0 0", request.req)) {
+            return false;
+        }
     }
     // The reference's prompt-load progress line (see [`prefill_line`]):
     // the port's prefill completes with the prompt itself, so the line
@@ -502,31 +569,25 @@ pub(crate) fn gen_response_with(
         crate::log_info(&prefill_line(request.req, n_prompt, n_prompt));
     }
     let started = Instant::now();
-    let (token_lines, n_gen, reason, rounds, commit) = match mtp
-        .filter(|_| !request.ids.is_empty())
-        .and_then(|engine| engine.generate(request, &params, request.max_tokens as usize, started))
-    {
-        Some(generation) => (
-            generation.lines,
-            generation.n_gen,
-            generation.reason,
-            generation.rounds,
-            generation.committed,
-        ),
-        None => {
-            let (lines, n_gen, reason) = generate_tokens(
-                request,
-                &params,
-                request.max_tokens as usize,
-                started,
-                &|context| forward.logits(context),
-            );
-            (lines, n_gen, reason, 0, 0)
-        }
-    };
+    let (n_gen, reason, rounds, commit) =
+        match mtp.filter(|_| !request.ids.is_empty()).and_then(|engine| {
+            engine.generate_into(request, &params, request.max_tokens as usize, started, sink)
+        }) {
+            Some(generation) => generation,
+            None => {
+                let (n_gen, reason) = generate_tokens(
+                    request,
+                    &params,
+                    request.max_tokens as usize,
+                    started,
+                    &|context| forward.logits(context),
+                    sink,
+                );
+                (n_gen, reason, 0, 0)
+            }
+        };
     let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
-    lines.extend(token_lines);
-    lines.push(done_line(
+    sink.emit(&done_line(
         request.req,
         reason,
         n_prompt,
@@ -536,16 +597,19 @@ pub(crate) fn gen_response_with(
         "",
         rounds,
         commit,
-    ));
-    lines.join("\n")
+    ))
 }
 
-/// The generation loop of [`gen_response`]: draws up to `limit` tokens
+/// The generation loop of [`gen_response_into`]: draws up to `limit` tokens
 /// using `logits` as the logits source — the forward pass in production,
-/// injectable so the `sample`-returns-`None` stop is testable. Returns
-/// the `T` lines, the generated-token count and the done reason (`stop`
-/// when a drawn token is in the request's eos set, `length` otherwise —
-/// also used when the logits source runs dry before the budget).
+/// injectable so the `sample`-returns-`None` stop is testable. Each
+/// drawn token's `T` line goes to `sink` immediately (write + flush on
+/// the socket, [`ReplySink`]), so the front-end sees every token the
+/// moment it is sampled; a dead sink (client hangup) stops the loop with
+/// the lines already delivered. Returns the generated-token count and
+/// the done reason (`stop` when a drawn token is in the request's eos
+/// set, `length` otherwise — also used when the logits source runs dry
+/// before the budget).
 /// `started` is the instant the request's generation began (the same one
 /// the `D` line's `decode_ms` measures); the loop emits the reference's
 /// 30 s generation ticks ([`GenProgress`], HALOGEN_LOG-gated) as the
@@ -556,9 +620,9 @@ fn generate_tokens(
     limit: usize,
     started: Instant,
     logits: &dyn Fn(&[i64]) -> Vec<f32>,
-) -> (Vec<String>, usize, &'static str) {
+    sink: &mut dyn ReplySink,
+) -> (usize, &'static str) {
     let mut rng = sampling::Rng::new(params.seed);
-    let mut lines = Vec::new();
     let mut context = request.ids.clone();
     let mut n_gen = 0usize;
     let mut reason = "length";
@@ -570,12 +634,16 @@ fn generate_tokens(
         // `T <req> <token> <logprob>` (serve_api t_line_logprob
         // :1066–1074); no top-k pairs — the port requests none.
         let token_id = token.index as i64;
-        lines.push(format!(
+        if !sink.emit(&format!(
             "T {} {} {}",
             request.req,
             token.index,
             fmt_g(token.logprob)
-        ));
+        )) {
+            // The client hung up mid-stream: stop generating (the
+            // reference's send failure ends the request the same way).
+            break;
+        }
         context.push(token_id);
         n_gen += 1;
         if let Some(tick) = progress.line(n_gen, started) {
@@ -586,13 +654,14 @@ fn generate_tokens(
             break;
         }
     }
-    (lines, n_gen, reason)
+    (n_gen, reason)
 }
 
 /// Answer one protocol line; `Some(reply)` (without the trailing newline)
 /// is written back and the connection stays open, `None` closes it. A
-/// `GEN` reply carries the whole streamed response (`T` lines plus the
-/// `D` line, newline-separated) in one write.
+/// `GEN` reply is the streamed response ([`gen_response_with`] collects
+/// the `T` lines plus the `D` line; the serve path streams them per line
+/// through [`handle_line_into`] instead of collecting).
 ///
 /// Commands, per the reference's verb set (the `<$PING`/`<$INFO` compare
 /// strings, binutils-strings.txt:282377–282378, the `GEN` case
@@ -602,7 +671,7 @@ fn generate_tokens(
 ///
 /// * `PING` → `PONG` (serve_api `probe_live` accepts only `PONG`).
 /// * `INFO` → the capability line (see [`info_line`]).
-/// * `GEN …` → the generation response (see [`gen_response`]): the
+/// * `GEN …` → the generation response (see [`gen_response_with`]): the
 ///   request grammar is parsed ([`parse_gen`]), the forward entry point
 ///   and sampling layer produce the tokens from the state's forward pass
 ///   (review 🟡-6), and the reply is framed as the `T`/`P`/`D` lines
@@ -623,37 +692,65 @@ pub fn handle_line(request: &str, state: &ServeState<'_>) -> Option<String> {
         "INFO" => Some(info_line(&state.info)),
         "GEN" => {
             let request = parse_gen(line)?;
-            state.forward?;
-            Some(gen_response(&request, state))
+            let forward = state.forward?;
+            Some(gen_response_with(
+                &request,
+                &state.info,
+                forward,
+                state.mtp.as_ref(),
+            ))
         }
         _ => None,
     }
 }
 
+/// The [`handle_line`] body streaming every reply line into `sink` as it
+/// becomes ready ([`ReplySink`]): `PING`/`INFO` emit their single line,
+/// `GEN` streams its `P`/`T`/`D` lines ([`gen_response_into`]). Returns
+/// `false` when the connection must close (an unknown or malformed verb,
+/// or a dead sink).
+fn handle_line_into(line: &str, state: &ServeState<'_>, sink: &mut dyn ReplySink) -> bool {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let Some(verb) = line.split_whitespace().next() else {
+        return false;
+    };
+    match verb {
+        "PING" => sink.emit("PONG"),
+        "INFO" => sink.emit(&info_line(&state.info)),
+        "GEN" => {
+            let (request, forward) = match (parse_gen(line), state.forward) {
+                (Some(request), Some(forward)) => (request, forward),
+                _ => return false,
+            };
+            gen_response_into(&request, &state.info, forward, state.mtp.as_ref(), sink)
+        }
+        _ => false,
+    }
+}
+
 /// Serve one connection to completion: answer lines until the protocol
-/// closes it (or EOF). The reply framing is one line per request with a
-/// trailing `\n` (a `GEN` reply is the multi-line streamed response,
-/// written as one buffer); `state` is the shared serve state (the INFO
-/// config, the forward pass and the MTP engine — review 🟡-6).
+/// closes it (or EOF). Every reply line is written and flushed the moment
+/// it is ready — `PING`/`INFO` as one line each, a `GEN` reply as its
+/// `P`/`T`/`D` lines streamed through [`handle_line_into`] (the
+/// reference's per-line `send` contract, [`ReplySink`]); `state` is the
+/// shared serve state (the INFO config, the forward pass and the MTP
+/// engine — review 🟡-6).
 pub fn serve_connection(stream: TcpStream, state: &ServeState<'_>) {
     let mut writer = match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return,
     };
     let mut reader = BufReader::new(stream);
+    let mut sink = SocketSink::new(&mut writer);
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let Some(reply) = handle_line(&line, state) else {
-            break;
-        };
-        if writer.write_all(reply.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+        if !handle_line_into(&line, state, &mut sink) {
             break;
         }
-        let _ = writer.flush();
     }
 }
 
@@ -722,7 +819,7 @@ pub fn serve_forever(listener: &TcpListener, state: &ServeState<'_>) {
 mod tests {
     use super::*;
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     fn fixture_info() -> EngineInfo {
@@ -1149,12 +1246,14 @@ mod tests {
         // The `sample`-returns-`None` stop (empty logits): no T lines,
         // n_gen 0, reason stays `length`.
         let request = parse_gen("GEN 1 3 0 0").expect("parses");
-        let (lines, n_gen, reason) = generate_tokens(
+        let mut lines: Vec<String> = Vec::new();
+        let (n_gen, reason) = generate_tokens(
             &request,
             &SampleParams::greedy(),
             3,
             Instant::now(),
             &|_| Vec::new(),
+            &mut lines,
         );
         assert!(lines.is_empty(), "T lines: {lines:?}");
         assert_eq!(n_gen, 0);
@@ -1362,5 +1461,95 @@ mod tests {
         reader.read_line(&mut done_line).expect("read D line");
         assert!(done_line.starts_with("D 1 length "), "{done_line:?}");
         drop(client);
+    }
+
+    /// A [`ReplySink`] that forwards every emitted line to the test over
+    /// an mpsc channel, so lines can be observed while the generation
+    /// loop is still running.
+    struct ChannelSink(mpsc::Sender<String>);
+
+    impl ReplySink for ChannelSink {
+        fn emit(&mut self, line: &str) -> bool {
+            self.0.send(line.to_string()).is_ok()
+        }
+    }
+
+    #[test]
+    fn generate_tokens_streams_each_t_line_before_the_loop_finishes() {
+        // The incremental-delivery proof (the 2026-11-06 live symptom:
+        // serve_api saw `0 SSE frames and 0 chars sent in 18.2s` because
+        // the old engine collected every T line and wrote the reply only
+        // after generation completed). The logits source pauses inside
+        // its second call until the test releases it, so the first T
+        // line can only be observed while the loop is still running.
+        let request = parse_gen("GEN 1 2 0 0").expect("parses");
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let generator = thread::spawn(move || {
+            let calls = std::cell::Cell::new(0usize);
+            let logits = move |_: &[i64]| -> Vec<f32> {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    // Pause after token 1: block until the test has read
+                    // the first T line and releases the run.
+                    let _ = release_rx.recv();
+                }
+                vec![0.0, -1.0] // greedy argmax: token 0
+            };
+            let mut sink = ChannelSink(line_tx);
+            generate_tokens(
+                &request,
+                &SampleParams::greedy(),
+                2,
+                Instant::now(),
+                &logits,
+                &mut sink,
+            )
+        });
+        // The first T line arrives while the generator is still paused
+        // inside the second token's logits call — the old collect-then-
+        // return shape could only produce it after the loop ended.
+        let first = line_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first T line arrives while generation is still running");
+        assert!(first.starts_with("T 1 "), "{first:?}");
+        // Nothing else exists yet: the second token is not sampled.
+        assert!(
+            line_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "no further line may be emitted while generation is paused"
+        );
+        // Release the generator: the second T line follows, then the
+        // loop ends with the full budget.
+        release_tx.send(()).expect("release the paused generator");
+        let second = line_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second T line after the release");
+        assert!(second.starts_with("T 1 "), "{second:?}");
+        assert_eq!(generator.join().expect("generator thread"), (2, "length"));
+        // Exactly two T lines were ever emitted (no D line: that belongs
+        // to gen_response_into, which the socket tests cover).
+        assert!(line_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn socket_sink_writes_and_flushes_every_line_immediately() {
+        // The write-per-line half of the contract (the reference's raw
+        // `send` per line, conn-handler decompile): each emit reaches the
+        // peer while the writer is still open — the old code built the
+        // whole reply in memory and flushed once at the end.
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let server = listener.accept().expect("accept").0;
+        let mut sink = SocketSink::new(server);
+        assert!(sink.emit("T 1 5 -0.5"), "emit to a live socket");
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .expect("the line is readable while the sink is still open");
+        assert_eq!(line, "T 1 5 -0.5\n");
     }
 }

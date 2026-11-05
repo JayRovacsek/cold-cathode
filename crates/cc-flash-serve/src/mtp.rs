@@ -769,6 +769,9 @@ impl<'a> MtpEngine<'a> {
     /// reference's 30 s generation ticks (`protocol::GenProgress`,
     /// HALOGEN_LOG-gated) as the token count advances — the same lines
     /// the single-token `protocol::generate_tokens` path emits.
+    /// Collects the `T` lines into [`MtpGeneration`]; the serve path
+    /// streams them line by line through [`Self::generate_into`] instead
+    /// (the reference's per-token write contract).
     pub fn generate(
         &self,
         request: &crate::protocol::GenRequest,
@@ -776,8 +779,37 @@ impl<'a> MtpEngine<'a> {
         limit: usize,
         started: std::time::Instant,
     ) -> Option<MtpGeneration> {
+        let mut lines: Vec<String> = Vec::new();
+        let (n_gen, reason, rounds, committed) =
+            self.generate_into(request, params, limit, started, &mut lines)?;
+        Some(MtpGeneration {
+            lines,
+            n_gen,
+            reason,
+            rounds,
+            committed,
+        })
+    }
+
+    /// The [`Self::generate`] loop streaming each `T` line into `sink`
+    /// the moment its token is accepted (the reference's per-token write
+    /// contract, [`crate::protocol::ReplySink`]). Returns the summary
+    /// (`n_gen`, `reason`, `rounds`, `committed`); `None` only when the
+    /// loop fails before emitting anything — the caller's fallback to
+    /// single-token decode, matching the old collect-then-return shape.
+    /// Once lines have been emitted they cannot be unsent, so a later
+    /// draft/verify failure ends the generation with the partial
+    /// accounting, and a dead sink (client hangup) stops the loop the
+    /// same way the reference's failed `send` ends a request.
+    pub fn generate_into(
+        &self,
+        request: &crate::protocol::GenRequest,
+        params: &SampleParams,
+        limit: usize,
+        started: std::time::Instant,
+        sink: &mut dyn crate::protocol::ReplySink,
+    ) -> Option<(usize, &'static str, usize, usize)> {
         let mut rng = Rng::new(params.seed);
-        let mut lines = Vec::new();
         let mut context = request.ids.clone();
         let mut n_gen = 0usize;
         let mut reason = "length";
@@ -803,8 +835,19 @@ impl<'a> MtpEngine<'a> {
             } else {
                 None
             };
-            let drafts = self.draft(n, &context, params, &mut rng, trunk_hidden.as_deref())?;
-            let (emitted, k) = self.verify(n, &context, &drafts, &mut rng).ok()?;
+            let drafts = match self.draft(n, &context, params, &mut rng, trunk_hidden.as_deref()) {
+                Some(drafts) => drafts,
+                // A first-round failure with nothing emitted keeps the
+                // caller's fallback; a later failure cannot unsend the
+                // lines already on the wire, so it ends the run.
+                None if rounds == 0 => return None,
+                None => break,
+            };
+            let (emitted, k) = match self.verify(n, &context, &drafts, &mut rng) {
+                Ok(pair) => pair,
+                Err(_) if rounds == 0 => return None,
+                Err(_) => break,
+            };
             rounds += 1;
             committed += k;
             // Tokens accepted after an eos within a round stay committed
@@ -814,12 +857,16 @@ impl<'a> MtpEngine<'a> {
             // `generate_tokens`' clean stop (review 💡-4).
             for token in emitted {
                 let token_id = token.index as i64;
-                lines.push(format!(
+                if !sink.emit(&format!(
                     "T {} {} {}",
                     request.req,
                     token.index,
                     crate::fmt_g(token.logprob)
-                ));
+                )) {
+                    // The client hung up mid-stream: stop with the lines
+                    // already delivered.
+                    return Some((n_gen, reason, rounds, committed));
+                }
                 context.push(token_id);
                 n_gen += 1;
                 if let Some(tick) = progress.line(n_gen, started) {
@@ -837,13 +884,7 @@ impl<'a> MtpEngine<'a> {
                 break;
             }
         }
-        Some(MtpGeneration {
-            lines,
-            n_gen,
-            reason,
-            rounds,
-            committed,
-        })
+        Some((n_gen, reason, rounds, committed))
     }
 }
 
