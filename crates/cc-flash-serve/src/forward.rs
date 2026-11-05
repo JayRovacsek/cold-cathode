@@ -3,32 +3,40 @@
 //! The reference's forward pass is `norm → qkv → rope → attention →
 //! projection → mlp` per layer over the hybrid `qwen4exp` architecture
 //! (spec §2/§3), executed on the GPU through nine embedded AMDGPU code
-//! objects. The head count / head dim / GQA configuration and the exact
-//! dtype table are still open spec gaps (spec §2 "Gaps register", §3
-//! `[D]` entries), so this module ships the entry point the `GEN` path
-//! calls today — a documented deterministic stub — with the shape the
-//! real attention/MLP math drops into once the head config lands.
+//! objects. This module implements the two paths the `GEN` contract uses:
 //!
-//! Stub contract (the parts the rest of the port depends on):
-//!
-//! * The vocabulary size comes from the loaded checkpoint's
-//!   `embed_tokens.weight` entry dims (`[vocab, hidden]` in the real
-//!   reference file); checkpoints without that entry fall back to the
-//!   frozen-spec vocab, 248 320 (spec §2 [RV]).
-//! * The logits are a deterministic pseudo-random distribution seeded by
-//!   an FNV-1a hash of the context ids (the reference's hash family,
-//!   spec §5). The stub deliberately does not interpret the quantised
-//!   weight payloads — the dtype table is a spec gap (§1) — so the real
-//!   numerics arrive by replacing [`Forward::logits`]'s body, not the
-//!   signature.
+//! * **Real path** ([`crate::model`] + [`crate::ops`]): embedding lookup,
+//!   the 48-layer stack (full-attention layers 3, 7, …, 47 with
+//!   `q_norm`/`k_norm` + half-rotary RoPE + GQA attention + `o_proj`;
+//!   the other 44 layers run the gated linear-attention block), the MoE
+//!   MLP after every block, the top-level hyper-connection mixer and the
+//!   `lm_head` gemv. Single-token decode first: prefill is a
+//!   single-token loop over the context (the reference's paged slot pool,
+//!   spec §5, is a later increment), and the per-sequence KV/delta/conv
+//!   state is memoised in [`Forward::cache`] so extending the context by
+//!   one token costs one token step, not a full recompute.
+//! * **Stub fallback** (the historical behaviour): checkpoints whose
+//!   weights cannot be run for real — the real
+//!   `qwen38-flash-next-v2-abliterated.hgn` stores its projections in
+//!   quantised dtypes (`q4c`/`ht`/`i4r`/`q6g64`) whose dequant codecs are
+//!   not yet specified (spec §1), and the port's own write-path fixtures
+//!   carry no layer tensors at all — fall back to the deterministic
+//!   FNV-1a-seeded pseudo-random distribution (the reference's hash
+//!   family, spec §5). The real numerics arrive by landing the quant
+//!   codecs in [`crate::bf16::decode_tensor`]; the fallback keeps the
+//!   `GEN` contract byte-stable until then.
 //!
 //! The signature takes the full context (prompt ids followed by the
 //! generated ids so far) and returns the next-token logits, which is the
 //! logical contract of the reference's prefill+decode loop; the
-//! KV-cache-backed incremental form (spec §5) replaces the body later
-//! without touching callers.
+//! KV-cache-backed incremental form (spec §5) replaces the cache
+//! implementation later without touching callers.
+
+use std::cell::RefCell;
 
 use crate::hgn;
+use crate::model::{self, Block, Model, NORM_EPS, ROPE_THETA};
+use crate::ops;
 use crate::sampling::Rng;
 
 /// Fallback vocabulary size when the checkpoint carries no
@@ -40,6 +48,32 @@ pub const DEFAULT_VOCAB_SIZE: usize = 248_320;
 pub struct Forward<'a> {
     checkpoint: &'a hgn::Checkpoint,
     vocab_size: usize,
+    /// The real model when the checkpoint exposes the full bf16/f32
+    /// tensor set (`model::load`); `None` selects the stub fallback
+    /// (module docs).
+    model: Option<Model>,
+    /// Per-sequence decode state (the in-memory stand-in for the
+    /// reference's slot pool, spec §5).
+    cache: RefCell<Option<Cache>>,
+}
+
+/// Memoised decode state for one context prefix.
+#[derive(Debug, Clone)]
+struct Cache {
+    context: Vec<i64>,
+    layers: Vec<LayerRuntime>,
+    logits: Vec<f32>,
+}
+
+/// Per-layer recurrent state: the accumulated (post-RoPE) keys/values for
+/// full-attention layers, the conv1d history and delta-rule states for
+/// linear-attention layers.
+#[derive(Debug, Clone)]
+struct LayerRuntime {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    conv_hist: Vec<f32>,
+    delta: Vec<f32>,
 }
 
 impl<'a> Forward<'a> {
@@ -50,6 +84,8 @@ impl<'a> Forward<'a> {
         Forward {
             checkpoint,
             vocab_size: vocab_size(checkpoint),
+            model: model::load(checkpoint),
+            cache: RefCell::new(None),
         }
     }
 
@@ -58,17 +94,53 @@ impl<'a> Forward<'a> {
         self.vocab_size
     }
 
-    /// The checkpoint the weights are read from (the future attention/MLP
-    /// math's weight source).
+    /// The checkpoint the weights are read from.
     pub fn checkpoint(&self) -> &hgn::Checkpoint {
         self.checkpoint
     }
 
+    /// The real model when the checkpoint is loadable (module docs);
+    /// `None` means [`Self::logits`] uses the stub fallback.
+    pub fn model(&self) -> Option<&Model> {
+        self.model.as_ref()
+    }
+
     /// Next-token logits for `context_ids` (prompt ids followed by the
-    /// generated ids so far). Stub implementation: module docs.
+    /// generated ids so far).
     pub fn logits(&self, context_ids: &[i64]) -> Vec<f32> {
-        let mut rng = Rng::from_u64(context_seed(context_ids));
-        (0..self.vocab_size).map(|_| rng.next_f32()).collect()
+        match &self.model {
+            Some(model) if !context_ids.is_empty() => self.real_logits(model, context_ids),
+            // Empty contexts have no token to run; the stub's hash of the
+            // (empty) context keeps the contract total.
+            _ => stub_logits(self.vocab_size, context_ids),
+        }
+    }
+
+    /// Real-path logits: reuse the cached prefix when the context only
+    /// grew, otherwise re-run the single-token prefill loop (module docs).
+    fn real_logits(&self, model: &Model, context: &[i64]) -> Vec<f32> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(cached) = cache.as_ref() {
+            if cached.context == context {
+                return cached.logits.clone();
+            }
+        }
+        let (start, mut layers) = match cache.take() {
+            Some(cached) if context.starts_with(&cached.context) => {
+                (cached.context.len(), cached.layers)
+            }
+            _ => (0, new_runtimes(model)),
+        };
+        let mut logits = vec![0.0; model.dims.vocab];
+        for (position, &token) in context.iter().enumerate().skip(start) {
+            logits = forward_token(model, token, position, &mut layers);
+        }
+        *cache = Some(Cache {
+            context: context.to_vec(),
+            layers,
+            logits: logits.clone(),
+        });
+        logits
     }
 }
 
@@ -85,6 +157,13 @@ pub fn vocab_size(checkpoint: &hgn::Checkpoint) -> usize {
         .unwrap_or(DEFAULT_VOCAB_SIZE)
 }
 
+/// Stub logits: an FNV-1a-seeded pseudo-random distribution over the
+/// vocabulary (module docs).
+fn stub_logits(vocab_size: usize, context_ids: &[i64]) -> Vec<f32> {
+    let mut rng = Rng::from_u64(context_seed(context_ids));
+    (0..vocab_size).map(|_| rng.next_f32()).collect()
+}
+
 /// FNV-1a over the context ids (the reference's hash family — spec §5
 /// quotes the same prime), seeding the stub's per-context distribution.
 fn context_seed(context_ids: &[i64]) -> u64 {
@@ -96,6 +175,155 @@ fn context_seed(context_ids: &[i64]) -> u64 {
         }
     }
     hash
+}
+
+/// Fresh per-layer runtimes for a new sequence (empty KV, zeroed conv
+/// history and delta states).
+fn new_runtimes(model: &Model) -> Vec<LayerRuntime> {
+    model
+        .layers
+        .iter()
+        .map(|layer| match &layer.block {
+            Block::Attention(_) => LayerRuntime {
+                k: Vec::new(),
+                v: Vec::new(),
+                conv_hist: Vec::new(),
+                delta: Vec::new(),
+            },
+            Block::Linear(linear) => LayerRuntime {
+                k: Vec::new(),
+                v: Vec::new(),
+                conv_hist: Vec::new(),
+                delta: vec![0.0; linear.v_heads * linear.v_head_dim * linear.head_dim],
+            },
+        })
+        .collect()
+}
+
+/// One token step: embedding lookup → 48 layers → final mixer → `lm_head`
+/// (spec §3; the per-layer stage order is `norm → qkv → rope → attention →
+/// projection → mlp` with the hyper-connection mixers around each block).
+fn forward_token(
+    model: &Model,
+    token: i64,
+    position: usize,
+    layers: &mut [LayerRuntime],
+) -> Vec<f32> {
+    let h = model.dims.hidden_per_stream;
+    // Out-of-range ids wrap into the table (the reference validates ids at
+    // the protocol layer; the port clamps defensively here).
+    let row = token.rem_euclid(model.dims.vocab as i64) as usize;
+    let embedding = &model.embed.data[row * h..(row + 1) * h];
+    // The top-level hyper-connection expands the embedding into the
+    // stream stack (the real file has no top-level `block_inject_weight`,
+    // so every stream starts at the raw embedding row — documented
+    // assumption, spec §2).
+    let mut streams = embedding.repeat(model.dims.num_streams);
+    for (index, layer) in model.layers.iter().enumerate() {
+        let (block_input, scaled, inject) = layer.attn_mixer.mix(&streams);
+        let block_out = match &layer.block {
+            Block::Attention(attn) => {
+                attention_block(attn, &block_input, position, &mut layers[index])
+            }
+            Block::Linear(linear) => linear_block(linear, &block_input, &mut layers[index]),
+        };
+        layer
+            .attn_mixer
+            .apply_block(&scaled, inject.as_deref(), &block_out, &mut streams);
+        let (mlp_input, mlp_scaled, mlp_inject) = layer.mlp_mixer.mix(&streams);
+        let mlp_out = layer.mlp.forward(&mlp_input);
+        layer
+            .mlp_mixer
+            .apply_block(&mlp_scaled, mlp_inject.as_deref(), &mlp_out, &mut streams);
+    }
+    // Final aggregation: the top-level mixer folds the stream stack into
+    // the single hidden vector the `lm_head` reads.
+    let (final_hidden, _, _) = model.final_mixer.mix(&streams);
+    model.lm_head.gemv(&final_hidden)
+}
+
+/// The full-attention block (`self_attn`, spec §3 `FUN_01fb3670`): the
+/// `q_proj` gemv computes all rows, the rope/attention path consumes the
+/// first half (the 24-vs-48 nuance, spec §2); per-head `q_norm`/`k_norm`,
+/// half-rotary RoPE, GQA attention over the cached keys/values, `o_proj`.
+fn attention_block(
+    attn: &model::AttnBlock,
+    x: &[f32],
+    position: usize,
+    runtime: &mut LayerRuntime,
+) -> Vec<f32> {
+    let all_q = attn.q.gemv(x);
+    let mut q = all_q[..attn.q.rows / 2].to_vec();
+    for head in q.chunks_mut(attn.head_dim) {
+        let normed = ops::rmsnorm(head, &attn.q_norm, NORM_EPS);
+        head.copy_from_slice(&normed);
+    }
+    let mut k = attn.k.gemv(x);
+    for head in k.chunks_mut(attn.head_dim) {
+        let normed = ops::rmsnorm(head, &attn.k_norm, NORM_EPS);
+        head.copy_from_slice(&normed);
+    }
+    let v = attn.v.gemv(x);
+    ops::rope_heads(&mut q, attn.head_dim, position, ROPE_THETA);
+    ops::rope_heads(&mut k, attn.head_dim, position, ROPE_THETA);
+    runtime.k.extend_from_slice(&k);
+    runtime.v.extend_from_slice(&v);
+    let out = ops::attention(
+        &q,
+        &runtime.k,
+        &runtime.v,
+        attn.q_heads,
+        attn.kv_heads,
+        attn.head_dim,
+        attn.head_dim,
+    );
+    attn.o.gemv(&out)
+}
+
+/// The gated linear-attention block (`linear_attn`, spec §3
+/// `FUN_01fa0700`): packed qkv gemv → depthwise conv1d (3-token history)
+/// → per-v-head decay/input gates → delta-rule recurrence → per-head norm
+/// with the `in_proj_z` output gate → `out_proj`. The v-head j ↔ q/k-head
+/// mapping follows the registered sub-gap note (v head j uses q/k head
+/// `j · q_heads / v_heads` — `j/3` in the real 16-vs-48 layout).
+fn linear_block(linear: &model::LinearBlock, x: &[f32], runtime: &mut LayerRuntime) -> Vec<f32> {
+    let qkv_raw = linear.qkv.gemv(x);
+    let convolved = ops::conv1d_step(
+        &linear.conv_w.data,
+        linear.conv_w.rows,
+        linear.conv_w.cols,
+        &mut runtime.conv_hist,
+        &qkv_raw,
+    );
+    let z = linear.z.gemv(x);
+    let a = linear.a.gemv(x);
+    let b = linear.b.gemv(x);
+    let hd = linear.head_dim;
+    let vhd = linear.v_head_dim;
+    let q_width = linear.q_heads * hd;
+    let k_width = linear.k_heads * hd;
+    let mut head_outs = vec![0.0; linear.v_heads * vhd];
+    for j in 0..linear.v_heads {
+        let q_head = (j * linear.q_heads) / linear.v_heads;
+        let k_head = (j * linear.k_heads) / linear.v_heads;
+        let q = &convolved[q_head * hd..(q_head + 1) * hd];
+        let k = &convolved[q_width + k_head * hd..q_width + (k_head + 1) * hd];
+        let v = &convolved[q_width + k_width + j * vhd..q_width + k_width + (j + 1) * vhd];
+        // α = exp(−exp(A_log) · softplus(a + dt_bias)), β = sigmoid(b)
+        // (spec §3 step 5, `k_dn_gates`).
+        let alpha = (-(-linear.a_log[j]).exp() * ops::softplus(a[j] + linear.dt_bias[j])).exp();
+        let beta = ops::sigmoid(b[j]);
+        let state = &mut runtime.delta[j * vhd * hd..(j + 1) * vhd * hd];
+        let mut o = ops::delta_rule_step(state, k, v, q, alpha, beta);
+        // Per-head norm `[head_dim]` with the gated `in_proj_z` output
+        // (RMSNormGated: `rmsnorm(o) · silu(z)`, the Qwen3-Next GDN form).
+        let normed = ops::rmsnorm(&o, &linear.norm, NORM_EPS);
+        for (i, value) in o.iter_mut().enumerate() {
+            *value = normed[i] * ops::silu(z[j * vhd + i]);
+        }
+        head_outs[j * vhd..(j + 1) * vhd].copy_from_slice(&o);
+    }
+    linear.out.gemv(&head_outs)
 }
 
 #[cfg(test)]
@@ -151,9 +379,13 @@ mod tests {
     }
 
     #[test]
-    fn logits_are_deterministic_per_context() {
+    fn stub_logits_are_deterministic_per_context() {
         let ck = fixture(8);
         let forward = Forward::new(&ck);
+        assert!(
+            forward.model().is_none(),
+            "embed-only fixtures take the stub path"
+        );
         let first = forward.logits(&[10, 20]);
         assert_eq!(first.len(), 8);
         assert_eq!(
@@ -174,5 +406,56 @@ mod tests {
             first.iter().all(|logit| (0.0..1.0).contains(logit)),
             "stub logits must be in [0, 1)"
         );
+    }
+
+    #[test]
+    fn real_forward_on_the_mini_checkpoint_returns_vocab_sized_logits() {
+        let ck = model::mini_checkpoint();
+        let forward = Forward::new(&ck);
+        assert!(
+            forward.model().is_some(),
+            "the mini fixture loads the real path"
+        );
+        assert_eq!(forward.vocab_size(), model::MINI_VOCAB);
+        let logits = forward.logits(&[1, 2, 3]);
+        assert_eq!(logits.len(), model::MINI_VOCAB);
+        assert!(
+            logits.iter().all(|logit| logit.is_finite()),
+            "logits {logits:?}"
+        );
+        assert_ne!(
+            logits,
+            stub_logits(model::MINI_VOCAB, &[1, 2, 3]),
+            "the real path must not return the stub distribution"
+        );
+    }
+
+    #[test]
+    fn real_forward_is_deterministic_and_incremental() {
+        let ck = model::mini_checkpoint();
+        let forward = Forward::new(&ck);
+        let first = forward.logits(&[1, 2]);
+        assert_eq!(
+            first,
+            forward.logits(&[1, 2]),
+            "cached context, same logits"
+        );
+        let extended = forward.logits(&[1, 2, 3]);
+        assert!(extended.iter().all(|logit| logit.is_finite()));
+        assert_ne!(first, extended, "extending the context changes the logits");
+        // A fresh forward recomputes the same logits (no hidden state).
+        let fresh = Forward::new(&ck);
+        assert_eq!(extended, fresh.logits(&[1, 2, 3]));
+        // A shorter (non-extending) context resets the cache and reruns.
+        assert_eq!(first, forward.logits(&[1, 2]));
+    }
+
+    #[test]
+    fn real_forward_wraps_out_of_range_token_ids() {
+        let ck = model::mini_checkpoint();
+        let forward = Forward::new(&ck);
+        let logits = forward.logits(&[model::MINI_VOCAB as i64 + 1]);
+        assert_eq!(logits.len(), model::MINI_VOCAB);
+        assert!(logits.iter().all(|logit| logit.is_finite()));
     }
 }

@@ -10,9 +10,12 @@
 
 #![warn(unsafe_op_in_unsafe_fn)]
 
+pub mod bf16;
 pub mod forward;
 pub mod gguf;
 pub mod hgn;
+pub mod model;
+pub mod ops;
 pub mod protocol;
 pub mod sampling;
 
@@ -33,8 +36,16 @@ const DEFAULT_BIND: &str = "127.0.0.1";
 const DEFAULT_SLOTS: i64 = 4;
 const DEFAULT_CTX: i64 = 32768;
 const DEFAULT_MAX_TOK: i64 = 8192;
-/// `HALOGEN_SPEC_N` implied by the default MTP depth (see commit notes).
-const DEFAULT_SPEC_N: i64 = 4;
+/// `HALOGEN_MTP_DEPTH` default (spec `flash_serve-mtp-kv-npu.md` §1.3:
+/// the decompile resolves `DEPTH = 2`; the frozen engine spec's 3 is the
+/// `DEPTH_HI` value, not `DEPTH`).
+pub const DEFAULT_MTP_DEPTH: i64 = 2;
+/// `HALOGEN_MTP_DEPTH_HI` default (spec `flash_serve-mtp-kv-npu.md`
+/// §1.3: 3 when `HALOGEN_MTP_DEPTH` is unset).
+pub const DEFAULT_MTP_DEPTH_HI: i64 = 3;
+/// `HALOGEN_SPEC_N` implied by the default MTP depth (`SPEC_N >= D + 1`,
+/// spec `flash_serve-mtp-kv-npu.md` §1.3).
+const DEFAULT_SPEC_N: i64 = DEFAULT_MTP_DEPTH + 1;
 const MAX_SLOTS: i64 = 64;
 const MIN_CTX: i64 = 16;
 const NATIVE_CTX: i64 = 262_144;
@@ -995,7 +1006,7 @@ mod tests {
             (
                 "HALOGEN_MTP_DEPTH",
                 "x",
-                "flash_serve: HALOGEN_MTP_DEPTH=x needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 4)",
+                "flash_serve: HALOGEN_MTP_DEPTH=x needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 3)",
             ),
             (
                 "HALOGEN_MTP_DEPTH_HI",
@@ -1010,7 +1021,7 @@ mod tests {
             (
                 "HALOGEN_SAMPLED_DEPTH",
                 "x",
-                "flash_serve: HALOGEN_SAMPLED_DEPTH=x needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 4)",
+                "flash_serve: HALOGEN_SAMPLED_DEPTH=x needs 1 <= D and HALOGEN_SPEC_N >= D + 1 (is 3)",
             ),
             (
                 "HALOGEN_ADMIT_SPLICE_FOR",
@@ -1044,7 +1055,7 @@ mod tests {
             ("HALOGEN_PLD", "1,2"),
             ("HALOGEN_PLD_ADAPT", "1,2.5,3"),
             ("HALOGEN_SPEC_ADAPT", "1,2.5,3"),
-            ("HALOGEN_MTP_DEPTH", "3"),
+            ("HALOGEN_MTP_DEPTH", "2"),
             ("HALOGEN_MTP_DEPTH_HI", "8"),
             ("HALOGEN_MTP_GATE_P", "0.9"),
             ("HALOGEN_SAMPLED_DEPTH", "7"),
