@@ -40,7 +40,6 @@
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -316,10 +315,43 @@ fn done_line(
 /// prompt plus max_tokens inside the context).
 const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 
-/// Run one parsed `GEN` request against the loaded checkpoint and frame
-/// the full streamed reply: the optional `P` progress line, one `T` line
-/// per generated token and the closing `D` line (all newline-separated, no
-/// trailing newline — `serve_connection` writes the terminator).
+/// The per-server state the protocol answers from (review 🟡-6): the
+/// INFO configuration, the forward pass over the loaded checkpoint and
+/// the MTP engine constructed once at server startup — replacing the
+/// per-`GEN` rebuild that reloaded and revalidated the head `.hgn` on
+/// every request (`gen_response` used to build a fresh
+/// `forward::Forward` + `MtpEngine::from_env` per call).
+#[derive(Debug)]
+pub struct ServeState<'a> {
+    /// The INFO capability state (see [`info_line`]).
+    pub info: EngineInfo,
+    /// The forward pass over the loaded checkpoint; `None` when the
+    /// serve path has no resident weights (the GGUF repack-only case —
+    /// `GEN` then closes the connection, see [`handle_line`]). The
+    /// caller owns the forward pass (`run_serve` keeps it alive for the
+    /// server's lifetime) so the MTP engine can hold the
+    /// `&'a Forward<'a>` its API requires.
+    pub forward: Option<&'a forward::Forward<'a>>,
+    /// The MTP engine built from the environment at startup (`None`
+    /// when MTP is off or the head is not staged,
+    /// [`crate::mtp::MtpEngine::from_env`]).
+    pub mtp: Option<crate::mtp::MtpEngine<'a>>,
+}
+
+impl<'a> ServeState<'a> {
+    /// Build the serve state from the INFO configuration and the
+    /// resident forward pass: the environment's MTP engine is
+    /// constructed once (review 🟡-6).
+    pub fn new(info: EngineInfo, forward: Option<&'a forward::Forward<'a>>) -> Self {
+        let mtp = forward.and_then(crate::mtp::MtpEngine::from_env);
+        ServeState { info, forward, mtp }
+    }
+}
+
+/// Run one parsed `GEN` request against the serve state (the
+/// [`gen_response_with`] body with the state's forward pass and MTP
+/// engine injected — review 🟡-6 wires them through instead of
+/// rebuilding them per request).
 ///
 /// The reference reserves prompt plus max_tokens inside the context
 /// (spec §3 banner), so a request whose `n_prompt + max_tokens` exceeds
@@ -332,10 +364,11 @@ const OVER_CONTEXT_MESSAGE: &str = "prompt plus max_tokens exceed the context";
 /// The `G` grammar line is only emitted by the reference's grammar
 /// subsystem (off here, per `info_line`), and `C` lines answer `CSTAT`,
 /// not `GEN`.
-fn gen_response(request: &GenRequest, info: &EngineInfo, checkpoint: &hgn::Checkpoint) -> String {
-    let forward = forward::Forward::new(checkpoint);
-    let engine = crate::mtp::MtpEngine::from_env(&forward);
-    gen_response_with(request, info, &forward, engine.as_ref())
+fn gen_response(request: &GenRequest, state: &ServeState<'_>) -> String {
+    let forward = state
+        .forward
+        .expect("handle_line only builds a GEN response with a resident forward");
+    gen_response_with(request, &state.info, forward, state.mtp.as_ref())
 }
 
 /// The [`gen_response`] body with the forward pass and the optional MTP
@@ -468,31 +501,27 @@ fn generate_tokens(
 /// * `INFO` → the capability line (see [`info_line`]).
 /// * `GEN …` → the generation response (see [`gen_response`]): the
 ///   request grammar is parsed ([`parse_gen`]), the forward entry point
-///   and sampling layer produce the tokens from `checkpoint`, and the
-///   reply is framed as the `T`/`P`/`D` lines serve_api's `_demux`
-///   (:1659–1679) consumes. With `checkpoint == None` (a GGUF served
-///   repack-only — the port's deferred weight load) the previous
-///   deferred behaviour stands and the connection closes; a malformed
-///   `GEN` line closes too.
+///   and sampling layer produce the tokens from the state's forward pass
+///   (review 🟡-6), and the reply is framed as the `T`/`P`/`D` lines
+///   serve_api's `_demux` (:1659–1679) consumes. With
+///   `state.forward == None` (a GGUF served repack-only — the port's
+///   deferred weight load) the previous deferred behaviour stands and
+///   the connection closes; a malformed `GEN` line closes too.
 /// * `HREL`, `VOCAB`, `MERGES` and every unknown verb → close. The
 ///   reference has no error-reply string for unrecognised verbs (it logs
 ///   `queued connection closed without a request`, :3761, when a connection
 ///   dies without one), so closing is the evidenced default; the front-end
 ///   reconnects via `_ensure` (:1774–1779).
-pub fn handle_line(
-    request: &str,
-    info: &EngineInfo,
-    checkpoint: Option<&hgn::Checkpoint>,
-) -> Option<String> {
+pub fn handle_line(request: &str, state: &ServeState<'_>) -> Option<String> {
     let line = request.trim_end_matches(['\r', '\n']);
     let verb = line.split_whitespace().next()?;
     match verb {
         "PING" => Some("PONG".to_string()),
-        "INFO" => Some(info_line(info)),
+        "INFO" => Some(info_line(&state.info)),
         "GEN" => {
             let request = parse_gen(line)?;
-            let checkpoint = checkpoint?;
-            Some(gen_response(&request, info, checkpoint))
+            state.forward?;
+            Some(gen_response(&request, state))
         }
         _ => None,
     }
@@ -501,13 +530,9 @@ pub fn handle_line(
 /// Serve one connection to completion: answer lines until the protocol
 /// closes it (or EOF). The reply framing is one line per request with a
 /// trailing `\n` (a `GEN` reply is the multi-line streamed response,
-/// written as one buffer); `checkpoint` is the loaded checkpoint the
-/// `GEN` path reads, `None` when the serve path has no resident weights.
-pub fn serve_connection(
-    stream: TcpStream,
-    info: &EngineInfo,
-    checkpoint: Option<&hgn::Checkpoint>,
-) {
+/// written as one buffer); `state` is the shared serve state (the INFO
+/// config, the forward pass and the MTP engine — review 🟡-6).
+pub fn serve_connection(stream: TcpStream, state: &ServeState<'_>) {
     let mut writer = match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return,
@@ -519,7 +544,7 @@ pub fn serve_connection(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let Some(reply) = handle_line(&line, info, checkpoint) else {
+        let Some(reply) = handle_line(&line, state) else {
             break;
         };
         if writer.write_all(reply.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
@@ -557,9 +582,9 @@ pub fn is_transient_accept_error(kind: ErrorKind) -> bool {
 /// The accept loop behind `run_serve`: bind succeeded, so answer every
 /// connection on its own thread (the reference serves `--slots` concurrent
 /// sessions; one thread per connection keeps a persistent probe connection
-/// from blocking new clients). `checkpoint` (shared via `Arc`) is the
-/// loaded checkpoint the `GEN` path reads; `None` when the serve path has
-/// no resident weights. Blocks until `incoming()` fails fatally.
+/// from blocking new clients). `state` (the INFO config, the forward pass
+/// and the MTP engine — review 🟡-6) is shared with every connection
+/// thread through the scope. Blocks until `incoming()` fails fatally.
 ///
 /// Transient accept errors must not end the loop: on Linux `accept()`
 /// returns `ECONNABORTED` when a peer resets a queued connection before
@@ -574,27 +599,27 @@ pub fn is_transient_accept_error(kind: ErrorKind) -> bool {
 /// exited silently — the observed symptom was the 66 GB weight `Vec`
 /// disappearing with no panic or error line after the front-end's first
 /// reconnect cycle.
-pub fn serve_forever(
-    listener: &TcpListener,
-    info: &EngineInfo,
-    checkpoint: Option<&Arc<hgn::Checkpoint>>,
-) {
-    for conn in listener.incoming() {
-        let stream = match conn {
-            Ok(stream) => stream,
-            Err(err) if is_transient_accept_error(err.kind()) => continue,
-            Err(_) => break,
-        };
-        let info = info.clone();
-        let checkpoint = checkpoint.cloned();
-        thread::spawn(move || serve_connection(stream, &info, checkpoint.as_deref()));
-    }
+pub fn serve_forever(listener: &TcpListener, state: &ServeState<'_>) {
+    // A scoped `thread::spawn` (review 🟡-6): the connection threads
+    // borrow the shared `ServeState` instead of cloning the old
+    // `(info, checkpoint)` pair per connection.
+    thread::scope(|scope| {
+        for conn in listener.incoming() {
+            let stream = match conn {
+                Ok(stream) => stream,
+                Err(err) if is_transient_accept_error(err.kind()) => continue,
+                Err(_) => break,
+            };
+            scope.spawn(move || serve_connection(stream, state));
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{SocketAddr, TcpListener};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn fixture_info() -> EngineInfo {
@@ -637,16 +662,13 @@ mod tests {
 
     #[test]
     fn ping_answers_pong() {
-        let info = fixture_info();
-        assert_eq!(handle_line("PING", &info, None).as_deref(), Some("PONG"));
-        assert_eq!(handle_line("PING\n", &info, None).as_deref(), Some("PONG"));
-        assert_eq!(
-            handle_line("PING\r\n", &info, None).as_deref(),
-            Some("PONG")
-        );
+        let state = ServeState::new(fixture_info(), None);
+        assert_eq!(handle_line("PING", &state).as_deref(), Some("PONG"));
+        assert_eq!(handle_line("PING\n", &state).as_deref(), Some("PONG"));
+        assert_eq!(handle_line("PING\r\n", &state).as_deref(), Some("PONG"));
         // The reference compares the verb exactly (serve_api sends `PING\n`).
-        assert_eq!(handle_line("ping", &info, None), None);
-        assert_eq!(handle_line("PINGO", &info, None), None);
+        assert_eq!(handle_line("ping", &state), None);
+        assert_eq!(handle_line("PINGO", &state), None);
     }
 
     #[test]
@@ -654,8 +676,8 @@ mod tests {
         // The exact 32-token line the reference's format string
         // (binutils-strings.txt:3752) produces for the fixture state;
         // token 17 (the `%s`) carries the version.
-        let info = fixture_info();
-        let reply = handle_line("INFO", &info, None).expect("INFO answers");
+        let state = ServeState::new(fixture_info(), None);
+        let reply = handle_line("INFO", &state).expect("INFO answers");
         assert_eq!(
             reply,
             "I 0 0 32768 0 8192 0 0 0 0 4 32768 1 1 1 0 0 0.18.21 0 0 hgn 0 0 0 0 0 - 2048 0 bf16 0 0"
@@ -719,20 +741,21 @@ mod tests {
     fn gen_without_resident_weights_closes() {
         // The GGUF serve path (repack-only, no resident weights) keeps the
         // deferred behaviour: close, never fake.
-        let info = fixture_info();
-        assert_eq!(handle_line("GEN 1 1 0 0", &info, None), None);
+        let state = ServeState::new(fixture_info(), None);
+        assert_eq!(handle_line("GEN 1 1 0 0", &state), None);
     }
 
     #[test]
     fn unknown_verbs_close_the_connection() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
-        assert_eq!(handle_line("HREL 1", &info, Some(&ck)), None);
-        assert_eq!(handle_line("VOCAB", &info, Some(&ck)), None);
-        assert_eq!(handle_line("MERGES 2 aGk=", &info, Some(&ck)), None);
-        assert_eq!(handle_line("BOGUS", &info, Some(&ck)), None);
-        assert_eq!(handle_line("", &info, Some(&ck)), None);
-        assert_eq!(handle_line("\n", &info, Some(&ck)), None);
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        assert_eq!(handle_line("HREL 1", &state), None);
+        assert_eq!(handle_line("VOCAB", &state), None);
+        assert_eq!(handle_line("MERGES 2 aGk=", &state), None);
+        assert_eq!(handle_line("BOGUS", &state), None);
+        assert_eq!(handle_line("", &state), None);
+        assert_eq!(handle_line("\n", &state), None);
     }
 
     #[test]
@@ -770,8 +793,9 @@ mod tests {
 
     #[test]
     fn malformed_gen_lines_close() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
         for line in [
             "GEN",
             "GEN {\"prompt\":\"hi\"}",
@@ -787,20 +811,16 @@ mod tests {
             // A SAMPLE clause with fewer than five fields fails the request.
             "GEN 1 1 0 0 SAMPLE 0.7 20",
         ] {
-            assert_eq!(
-                handle_line(line, &info, Some(&ck)),
-                None,
-                "{line} must close"
-            );
+            assert_eq!(handle_line(line, &state), None, "{line} must close");
         }
     }
 
     #[test]
     fn gen_reply_streams_t_lines_and_a_done_line() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
         let forward = forward::Forward::new(&ck);
-        let reply = handle_line("GEN 7 3 0 2 10 20", &info, Some(&ck)).expect("GEN answers");
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply = handle_line("GEN 7 3 0 2 10 20", &state).expect("GEN answers");
         let lines: Vec<&str> = reply.split('\n').collect();
         assert_eq!(lines.len(), 4, "3 T lines + the D line: {reply:?}");
         // The T lines carry the greedy tokens the forward stub produces,
@@ -831,16 +851,16 @@ mod tests {
 
     #[test]
     fn gen_reply_stops_at_an_eos_token() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
         let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
         let logits = forward.logits(&[10, 20]);
         let first_token =
             sampling::sample(&logits, &SampleParams::greedy(), &mut sampling::Rng::new(0))
                 .expect("sampled")
                 .index;
         let line = format!("GEN 1 5 1 {first_token} 2 10 20");
-        let reply = handle_line(&line, &info, Some(&ck)).expect("GEN answers");
+        let reply = handle_line(&line, &state).expect("GEN answers");
         let lines: Vec<&str> = reply.split('\n').collect();
         assert_eq!(lines.len(), 2, "one T line then the D line: {reply:?}");
         let done: Vec<&str> = lines[1].split_whitespace().collect();
@@ -850,9 +870,10 @@ mod tests {
 
     #[test]
     fn gen_reply_reports_a_progress_line_when_requested() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
-        let reply = handle_line("GEN 1 1 0 0 PROGRESS", &info, Some(&ck)).expect("GEN answers");
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply = handle_line("GEN 1 1 0 0 PROGRESS", &state).expect("GEN answers");
         let lines: Vec<&str> = reply.split('\n').collect();
         assert_eq!(lines.len(), 3, "P + T + D: {reply:?}");
         // `P <req> <processed> <total> <cache> <time_ms>` (serve_api
@@ -873,9 +894,10 @@ mod tests {
             ..fixture_info()
         };
         let ck = fixture_checkpoint(8);
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(info, Some(&forward));
         let ids = (0..17).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
-        let reply =
-            handle_line(&format!("GEN 4 1 0 17 {ids}"), &info, Some(&ck)).expect("GEN answers");
+        let reply = handle_line(&format!("GEN 4 1 0 17 {ids}"), &state).expect("GEN answers");
         let parts: Vec<&str> = reply.split_whitespace().collect();
         assert_eq!(
             parts.len(),
@@ -898,10 +920,10 @@ mod tests {
     fn gen_reply_refuses_when_max_tokens_overflows_the_context() {
         // A huge max_tokens (i64::MAX) plus one prompt id overflows the
         // i64 sum; the checked add must refuse, not panic or clamp.
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
-        let reply =
-            handle_line("GEN 3 9223372036854775807 0 1 5", &info, Some(&ck)).expect("GEN answers");
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply = handle_line("GEN 3 9223372036854775807 0 1 5", &state).expect("GEN answers");
         let parts: Vec<&str> = reply.split_whitespace().collect();
         assert_eq!(parts[2], "error");
         assert_eq!(parts[3], "1"); // n_prompt
@@ -910,9 +932,10 @@ mod tests {
 
     #[test]
     fn gen_reply_with_zero_max_tokens_answers_done_only() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
-        let reply = handle_line("GEN 9 0 0 2 10 20", &info, Some(&ck)).expect("GEN answers");
+        let forward = forward::Forward::new(&ck);
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply = handle_line("GEN 9 0 0 2 10 20", &state).expect("GEN answers");
         assert!(!reply.contains('\n'), "D-only reply: {reply:?}");
         let parts: Vec<&str> = reply.split_whitespace().collect();
         assert_eq!(parts.len(), 33, "D line {reply:?}");
@@ -938,11 +961,11 @@ mod tests {
 
     #[test]
     fn gen_reply_honours_the_sample_clause() {
-        let info = fixture_info();
         let ck = fixture_checkpoint(8);
         let forward = forward::Forward::new(&ck);
-        let reply = handle_line("GEN 2 1 0 1 5 SAMPLE 0.7 20 0.95 0.05 42", &info, Some(&ck))
-            .expect("GEN answers");
+        let state = ServeState::new(fixture_info(), Some(&forward));
+        let reply =
+            handle_line("GEN 2 1 0 1 5 SAMPLE 0.7 20 0.95 0.05 42", &state).expect("GEN answers");
         let lines: Vec<&str> = reply.split('\n').collect();
         // The sampled token matches the sampling layer run directly with
         // the clause's seed (the port's determinism contract).
@@ -1032,7 +1055,10 @@ mod tests {
         let expected_info = info_line(&info);
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        thread::spawn(move || serve_forever(&listener, &info, None));
+        thread::spawn(move || {
+            let state = ServeState::new(info, None);
+            serve_forever(&listener, &state)
+        });
         let mut client = TcpStream::connect(addr).expect("connect");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1057,7 +1083,11 @@ mod tests {
         let checkpoint = Arc::new(fixture_checkpoint(8));
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
         let addr = listener.local_addr().expect("addr");
-        thread::spawn(move || serve_forever(&listener, &info, Some(&checkpoint)));
+        thread::spawn(move || {
+            let forward = forward::Forward::new(&checkpoint);
+            let state = ServeState::new(info, Some(&forward));
+            serve_forever(&listener, &state)
+        });
         let mut client = TcpStream::connect(addr).expect("connect");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))

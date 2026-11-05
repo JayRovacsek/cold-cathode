@@ -49,8 +49,9 @@ const DEFAULT_MAX_TOK: i64 = 8192;
 /// `DEPTH_HI` value, not `DEPTH`).
 pub const DEFAULT_MTP_DEPTH: i64 = 2;
 /// `HALOGEN_MTP_DEPTH_HI` default (spec `flash_serve-mtp-kv-npu.md`
-/// §1.3: 3 when `HALOGEN_MTP_DEPTH` is unset).
-// TODO: implement the HI-forcing rule from MTP spec §1.3 (HI forced 0 unless DEPTH >= 2 and HI > DEPTH)
+/// §1.3: 3 when `HALOGEN_MTP_DEPTH` is unset; the HI-forcing rule —
+/// forced 0 unless `DEPTH >= 2` and `HI > DEPTH` — is implemented in
+/// `mtp::MtpConfig::from_env`).
 pub const DEFAULT_MTP_DEPTH_HI: i64 = 3;
 /// `HALOGEN_SPEC_N` implied by the default MTP depth (`SPEC_N >= D + 1`,
 /// spec `flash_serve-mtp-kv-npu.md` §1.3).
@@ -309,7 +310,13 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     // separately and served by the Python front-end, not this binary.
     match TcpListener::bind(addr) {
         Ok(listener) => {
-            protocol::serve_forever(&listener, &info, checkpoint.as_ref());
+            // The serve state is built once at startup (review 🟡-6):
+            // the forward pass plus the MTP engine from the environment
+            // (`mtp::MtpEngine::from_env`), shared with every connection
+            // instead of being rebuilt per GEN request.
+            let forward = checkpoint.as_deref().map(forward::Forward::new);
+            let state = protocol::ServeState::new(info, forward.as_ref());
+            protocol::serve_forever(&listener, &state);
             0
         }
         Err(err) => {
@@ -996,7 +1003,9 @@ mod tests {
 
     #[test]
     fn env_validations_match_spec_wording() {
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        // Review 💡-11: `into_inner` on a poisoned lock keeps the
+        // serialisation instead of panicking.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Each check is exercised through run_serve's order by calling the
         // validator directly (the GPU check gates it in the binary). The
         // invalid and valid sets share one test so parallel test threads

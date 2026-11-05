@@ -385,15 +385,20 @@ pub struct SlotRecord {
     pub layers: Vec<LayerRuntime>,
     /// The logits produced by the last token step.
     pub logits: Vec<f32>,
+    /// The pre-`lm_head` hidden vector of the last token step (the MTP
+    /// head's `hidden_states` input, spec §1.1): cached alongside the
+    /// logits so `Forward::hidden` serves the draft path in O(1) instead
+    /// of replaying the context (review 🟡-1).
+    pub hidden: Vec<f32>,
     /// Snapshots of the slot's shorter prefixes: entry `i` holds the layer
-    /// state and logits of the first `i` tokens (entry 0 is the empty
-    /// state captured by the first append). The deque holds exactly one
-    /// entry per uncommitted position ([`Self::uncommitted`]):
+    /// state, logits and hidden of the first `i` tokens (entry 0 is the
+    /// empty state captured by the first append). The deque holds exactly
+    /// one entry per uncommitted position ([`Self::uncommitted`]):
     /// [`Self::append_step`] pushes, [`Self::commit`] prunes the front
     /// (committed prefixes are no longer rollback targets) and
     /// [`Self::rollback`] pops the back, bounding retained memory to the
     /// uncommitted window.
-    pub prefixes: VecDeque<(Vec<LayerRuntime>, Vec<f32>)>,
+    pub prefixes: VecDeque<(Vec<LayerRuntime>, Vec<f32>, Vec<f32>)>,
 }
 
 impl Default for SlotRecord {
@@ -430,6 +435,7 @@ impl SlotRecord {
             context: Vec::new(),
             layers: Vec::new(),
             logits: Vec::new(),
+            hidden: Vec::new(),
             prefixes: VecDeque::new(),
         }
     }
@@ -458,10 +464,17 @@ impl SlotRecord {
         // The outgoing current state is the snapshot for the prefix
         // ending at the previous token (the empty state for the first
         // append), keeping `prefixes.len() == uncommitted()`.
-        self.prefixes
-            .push_back((self.layers.clone(), self.logits.clone()));
+        self.prefixes.push_back((
+            self.layers.clone(),
+            self.logits.clone(),
+            self.hidden.clone(),
+        ));
         let position = self.context.len();
-        let logits = crate::forward::forward_token(model, token, position, &mut self.layers);
+        // The same token step `forward_token` runs (hidden + `lm_head`),
+        // split so the pre-lm_head hidden is cached for the MTP head
+        // (review 🟡-1).
+        let hidden = crate::forward::forward_token_hidden(model, token, position, &mut self.layers);
+        let logits = model.lm_head.gemv(&hidden);
         self.context.push(token);
         self.keep_flags.push(true);
         self.commit_window[0] = self.commit_window[0].saturating_add(1);
@@ -469,6 +482,7 @@ impl SlotRecord {
         self.seq_len = self.context.len() as u64;
         self.position = self.context.len() as u64;
         self.logits = logits.clone();
+        self.hidden = hidden;
         Ok(logits)
     }
 
@@ -522,12 +536,13 @@ impl SlotRecord {
             ));
         }
         for _ in 0..n {
-            let (layers, logits) = self
+            let (layers, logits, hidden) = self
                 .prefixes
                 .pop_back()
                 .expect("n <= uncommitted() == prefixes.len()");
             self.layers = layers;
             self.logits = logits;
+            self.hidden = hidden;
             self.context.pop();
             self.keep_flags.pop();
         }

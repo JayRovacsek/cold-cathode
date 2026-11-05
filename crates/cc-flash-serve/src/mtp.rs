@@ -54,6 +54,29 @@
 //!   the slot's verify rings (`slot+0xb8`); the port's CPU model runs
 //!   the head's attention row-locally (the current row's K/V only), a
 //!   simplification of the ring layout the spec does not pin.
+//! * **Row pairing**: the reference's row `i` consumes the trunk hidden
+//!   at position `context.len() + i − 2` (the reference reads these from
+//!   the verify rings); the port feeds every head row the same
+//!   end-of-context hidden (the cached slot vector,
+//!   [`crate::forward::Forward::hidden`]), so rows 2..n pair the correct
+//!   draft embedding with a stale trunk hidden. Materialising the
+//!   per-row hiddens would require the head's own output hidden, which
+//!   [`MtpHead::logits`] does not expose.
+//! * **Missing-tensor wording**: the `"{name}: not found in the MTP head
+//!   checkpoint"` error string is a port fabrication — the spec pins the
+//!   reference's `%s: <check>` error shape but not this wording (see
+//!   [`MtpHead::load`]'s doc qualification).
+//! * **E2E fixture**: the end-to-end tests generate on the quantised
+//!   mini trunk (`model::mini_checkpoint_quantised`, hidden 64) with a
+//!   synthetic head fixture ([`MtpHead`] over `head_specs()`) — the real
+//!   `qwen38-flash-next-mtp.hgn` named by `HALOGEN_MTP_HEAD` is not
+//!   available in the test environment, so the fixtures stand in for
+//!   both checkpoints.
+//! * **Unported knobs**: the reference's S2 sampling knobs
+//!   (`HALOGEN_S2_NUCLEUS`, `HALOGEN_S2_QOFF`, `HALOGEN_S2_TSKEW`) and
+//!   its falsifier mode (`METHOD 37`) have no port counterpart, and
+//!   `HALOGEN_MTP_LAYER_SRC` is not read — the head's decoder layer is
+//!   hardcoded to `mtp.layers.0` (spec §1.1's tensor table).
 
 use std::collections::HashMap;
 
@@ -168,7 +191,11 @@ impl MtpConfig {
 
     /// The effective speculative depth: `min(DEPTH, SPEC_N − 1)`, or
     /// `SPEC_N − 1` when `HALOGEN_MTP_DEPTH` is unset (spec §1.3 "the
-    /// effective depth used by the gate struct"). Always ≥ 1.
+    /// effective depth used by the gate struct"). Always ≥ 1: the
+    /// `.max(1)` clamp deviates from the spec's `SPEC_N − 1 == 0` when
+    /// `SPEC_N == 1` (where the reference drafts nothing); the port
+    /// keeps one speculative row so every round still commits the live
+    /// row — harmless (documented, review 💡-9).
     pub fn draft_n(&self) -> usize {
         let cap = (self.spec_n - 1).max(1);
         if self.depth_set {
@@ -246,9 +273,11 @@ const HEAD_NORMS: [(&str, &str); 2] = [
 impl MtpHead {
     /// Port of `FUN_01f7dc50`: resolve the head's tensors by name against
     /// the head checkpoint and validate them against the spec §1.1 table
-    /// (the error wordings are the reference's exact strings). `trunk`
+    /// (wordings pinned by the spec are verbatim; the rest follow the
+    /// reference's `%s: <check>` shape — module docs). `trunk`
     /// supplies the FFN layout flag the head's must match (the
-    /// `engine+0x9e8+0x700` byte).
+    /// `engine+0x9e8+0x700` byte) and the embedding/hidden widths the
+    /// head's norms must match (review 🟡-3).
     pub fn load(trunk: &hgn::Checkpoint, head: &hgn::Checkpoint) -> Result<MtpHead, String> {
         let mut by_name: HashMap<&str, usize> = HashMap::new();
         for (index, entry) in head.entries.iter().enumerate() {
@@ -294,9 +323,23 @@ impl MtpHead {
         if !trunk_fused && !trunk_split {
             return Err("checkpoint: the trunk's FFN layout is unresolved".to_string());
         }
+        // Resolve the head's experts tensor before comparing layouts: a
+        // head with no experts tensors must report the missing-tensor
+        // wording, not the layout-mismatch one (review 💡-10).
         let head_fused = entry("mtp.layers.0.experts.gate_up_proj.weight").is_ok();
+        let head_split = entry("mtp.layers.0.experts.gate_proj.weight").is_ok();
+        if !head_fused && !head_split {
+            return Err(
+                "mtp.layers.0.experts.gate_up_proj.weight: not found in the MTP head checkpoint"
+                    .to_string(),
+            );
+        }
         if head_fused != trunk_fused {
-            return Err("mtp.layers.0: the head's FFN layout differs from the trunk's".to_string());
+            // The reference's `%s` is the resolved experts tensor name
+            // (review 💡-8).
+            return Err(
+                "mtp.layers.0.experts: the head's FFN layout differs from the trunk's".to_string(),
+            );
         }
 
         // The fused gate_up dtype rule (checked before the experts pair,
@@ -352,6 +395,34 @@ impl MtpHead {
             || fc_hidden.cols != norms["mtp.pre_fc_norm_hidden.weight"].len()
         {
             return Err("mtp.fc_hidden.weight: incompatible shape for the head layout".to_string());
+        }
+        // Trunk-side width checks (review 🟡-3): the head's embedding
+        // path consumes the trunk's embedding rows, so
+        // `pre_fc_norm_embedding` must match the trunk's embedding row
+        // width (`embed_tokens.weight`'s hidden width, spec §2) — a
+        // wrong-model head previously validated OK and debug-panicked in
+        // `ops::rmsnorm`. The trunk's hidden width is the same
+        // `hidden_per_stream` value, so the hidden path compares against
+        // it too.
+        let trunk_embed_width = trunk
+            .entries
+            .iter()
+            .find(|e| e.name() == "embed_tokens.weight")
+            .and_then(|e| usize::try_from(*e.dims().get(1)?).ok())
+            .ok_or_else(|| {
+                "checkpoint: the trunk's embed_tokens.weight is unresolved".to_string()
+            })?;
+        if norms["mtp.pre_fc_norm_embedding.weight"].len() != trunk_embed_width {
+            return Err(
+                "mtp.pre_fc_norm_embedding.weight: the head's embedding width differs from the trunk's"
+                    .to_string(),
+            );
+        }
+        if hidden != trunk_embed_width {
+            return Err(
+                "mtp.fc_hidden.weight: the head's hidden width differs from the trunk's"
+                    .to_string(),
+            );
         }
         if mixer_norm.len() != 2 * hidden
             || mixer_down.cols != 2 * hidden
@@ -519,6 +590,10 @@ pub fn accept_probability(p_target: f64, p_draft: f64, gate_p: f64) -> f64 {
 
 /// Draw the accept/reject decision for one draft token (one
 /// [`crate::sampling::Rng`] step — deterministic for a seed).
+/// Deviation (review 💡-5): the reference's `draft_sample` refuses
+/// `temperature == 0` (§1.2); the port's greedy mode (temperature 0)
+/// still scores acceptance through the same criterion, comparing the
+/// argmax tokens' probabilities from both distributions.
 pub fn accept_draft(p_target: f64, p_draft: f64, gate_p: f64, rng: &mut Rng) -> bool {
     rng.next_f64() < accept_probability(p_target, p_draft, gate_p)
 }
@@ -589,14 +664,17 @@ impl<'a> MtpEngine<'a> {
     /// `draft_sample` port: draw `n` tokens with their logprobs. Row 0
     /// (the live sequence, `q_row = -1`) comes from the trunk's logits;
     /// rows 1..n come from the head's forward over the trunk hidden and
-    /// the previous draft's embedding (spec §1.1).
+    /// the previous draft's embedding (spec §1.1). `trunk_hidden` is
+    /// `Some` whenever `n > 1` (the cached slot vector,
+    /// [`crate::forward::Forward::hidden`] — review 🟡-1); the `n == 1`
+    /// round uses the trunk logits alone, so callers pass `None`.
     pub fn draft(
         &self,
         n: usize,
         context: &[i64],
         params: &SampleParams,
         rng: &mut Rng,
-        trunk_hidden: &[f32],
+        trunk_hidden: Option<&[f32]>,
     ) -> Option<Vec<DraftToken>> {
         let mut drafts = Vec::with_capacity(n);
         // Row 0: the live sequence's logits (the shared lm_head on the
@@ -607,16 +685,22 @@ impl<'a> MtpEngine<'a> {
             token: first,
             logits: trunk_logits,
         });
-        for i in 1..n {
-            let position = context.len() + i;
-            let logits = self.head.logits(
-                self.model,
-                trunk_hidden,
-                position,
-                drafts[i - 1].token.index as i64,
-            );
-            let token = sampling::sample(&logits, params, rng)?;
-            drafts.push(DraftToken { token, logits });
+        if n > 1 {
+            let trunk_hidden = trunk_hidden?;
+            for i in 1..n {
+                // The row's RoPE position: the predicted token's own
+                // position (the trunk's rows use the input-token
+                // position — documented choice, review 💡-3).
+                let position = context.len() + i;
+                let logits = self.head.logits(
+                    self.model,
+                    trunk_hidden,
+                    position,
+                    drafts[i - 1].token.index as i64,
+                );
+                let token = sampling::sample(&logits, params, rng)?;
+                drafts.push(DraftToken { token, logits });
+            }
         }
         Some(drafts)
     }
@@ -625,7 +709,10 @@ impl<'a> MtpEngine<'a> {
     /// (the forward core's speculative write of the `n` token ids),
     /// apply the accept criterion and commit/roll back the slot. Returns
     /// the emitted tokens (the accepted prefix — row 0 is always
-    /// committed, module docs) and the committed count.
+    /// committed, module docs) and the committed count, or the
+    /// reference's `spec_verify(n=%d): …` wording when the call is
+    /// malformed (review 💡-1: `1 <= n <= HALOGEN_SPEC_N`, enough
+    /// drafts, and a warm sequence — a non-empty context).
     pub fn verify(
         &self,
         n: usize,
@@ -633,7 +720,20 @@ impl<'a> MtpEngine<'a> {
         drafts: &[DraftToken],
         rng: &mut Rng,
     ) -> Result<(Vec<SampledToken>, usize), String> {
-        assert!(n >= 1 && drafts.len() >= n, "verify({n}) needs {n} drafts");
+        // The reference's `spec_verify` gate (FUN_02008f60): the port
+        // replaces the verify-ring check with its own slot state but
+        // keeps the reference's wording and the `1 <= n <=
+        // HALOGEN_SPEC_N` bound (review 💡-1, replacing the old
+        // `assert!`).
+        let spec_n = usize::try_from(self.config.spec_n.max(0)).unwrap_or(usize::MAX);
+        if n < 1 || n > spec_n || drafts.len() < n || context.is_empty() {
+            return Err(format!(
+                "spec_verify(n={n}): needs the verify rings (HALOGEN_MTP=1 or a lookup / \
+                 grammar drafter), 1 <= n <= {spec_n} (HALOGEN_SPEC_N) and a warm sequence \
+                 (pos {})",
+                context.len()
+            ));
+        }
         // Speculative append: write all n draft rows to the slot (the
         // forward core's `hipMemcpyAsync(slot+0xda8, …, n·4)`), keeping
         // the per-position logits chain for scoring.
@@ -685,11 +785,26 @@ impl<'a> MtpEngine<'a> {
             } else {
                 self.config.draft_n().min(limit - n_gen).max(1)
             };
-            let trunk_hidden = forward::trunk_hidden(self.model, &context);
-            let drafts = self.draft(n, &context, params, &mut rng, &trunk_hidden)?;
+            // The trunk hidden the head rows consume (review 🟡-1): the
+            // cached slot vector (O(1) amortised, replacing the
+            // per-round full-context replay); the n == 1 round never
+            // uses it, so it is only fetched when the round drafts head
+            // rows (syncing the slot first so the cache matches).
+            let trunk_hidden = if n > 1 {
+                self.forward.logits(&context);
+                self.forward.hidden(&context)
+            } else {
+                None
+            };
+            let drafts = self.draft(n, &context, params, &mut rng, trunk_hidden.as_deref())?;
             let (emitted, k) = self.verify(n, &context, &drafts, &mut rng).ok()?;
             rounds += 1;
             committed += k;
+            // Tokens accepted after an eos within a round stay committed
+            // to the slot (verify commits the whole accepted prefix
+            // before emission, matching the reference's per-round
+            // commit); the port emits only up to the eos, matching
+            // `generate_tokens`' clean stop (review 💡-4).
             for token in emitted {
                 let token_id = token.index as i64;
                 lines.push(format!(
@@ -883,8 +998,10 @@ mod tests {
     #[test]
     fn mtp_config_from_env_matches_the_spec_surface() {
         // Shared with the lib.rs env test: Rust runs tests on parallel
-        // threads, so every env-mutating test takes the crate lock.
-        let _guard = crate::ENV_LOCK.lock().unwrap();
+        // threads, so every env-mutating test takes the crate lock
+        // (review 💡-11: `into_inner` on a poisoned lock keeps the
+        // serialisation instead of panicking).
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (key, value) in [
             ("HALOGEN_MTP", "1"),
             ("HALOGEN_MTP_DEPTH", "3"),
@@ -990,7 +1107,9 @@ mod tests {
 
     #[test]
     fn ffn_layout_mismatch_is_rejected() {
-        // The trunk is fused; a head with the split gate/up layout fails.
+        // The trunk is fused; a head with the split gate/up layout fails
+        // (the error prefix is the resolved experts tensor name,
+        // review 💡-8).
         let mut specs = head_specs();
         specs.retain(|spec| spec.0 != "mtp.layers.0.experts.gate_up_proj.weight");
         specs.push(HeadSpec(
@@ -1012,7 +1131,28 @@ mod tests {
         .expect_err("a split head on a fused trunk must fail");
         assert_eq!(
             err,
-            "mtp.layers.0: the head's FFN layout differs from the trunk's"
+            "mtp.layers.0.experts: the head's FFN layout differs from the trunk's"
+        );
+    }
+
+    #[test]
+    fn wrong_width_head_is_rejected() {
+        // A head whose embedding path is narrower than the trunk's
+        // embedding rows (norm + fc_embedding both 32-wide against the
+        // trunk's 64) passes the head-internal checks and must fail the
+        // trunk-side comparison (review 🟡-3) instead of debug-panicking
+        // in ops::rmsnorm.
+        let mut specs = head_specs();
+        specs[0] = HeadSpec("mtp.pre_fc_norm_embedding.weight", 1, vec![32], 0);
+        specs[2] = HeadSpec("mtp.fc_embedding.weight", 2, vec![64, 32], 0);
+        let err = MtpHead::load(
+            &trunk(),
+            &head_checkpoint("ccfs-mtp-head-narrow.hgn", &specs),
+        )
+        .expect_err("a head narrower than the trunk's embedding must fail");
+        assert_eq!(
+            err,
+            "mtp.pre_fc_norm_embedding.weight: the head's embedding width differs from the trunk's"
         );
     }
 
@@ -1064,7 +1204,7 @@ mod tests {
         let mut rng = Rng::new(42);
         let hidden = forward::trunk_hidden(engine.model, &context);
         let drafts = engine
-            .draft(3, &context, &params, &mut rng, &hidden)
+            .draft(3, &context, &params, &mut rng, Some(&hidden))
             .unwrap();
         let (emitted, k) = engine.verify(3, &context, &drafts, &mut rng).unwrap();
         assert_eq!(k, 3, "gate 1 accepts every scored draft");
@@ -1073,8 +1213,10 @@ mod tests {
             assert_eq!(token.index, drafts[i].token.index);
         }
         // The slot holds prompt(2) + drafts(3) rows with 3 committed:
-        // the remaining 2 prompt positions are still uncommitted, and
-        // nothing is left after committing them (the kvcache contract).
+        // the commit covers the two prompt rows and the first draft row,
+        // so the two remaining uncommitted rows are the accepted draft
+        // rows 2..3 — committing them empties the window (the kvcache
+        // contract).
         assert!(forward.commit(2).is_ok());
         assert!(forward.commit(1).is_err());
     }
@@ -1099,16 +1241,86 @@ mod tests {
         let mut rng = Rng::new(42);
         let hidden = forward::trunk_hidden(engine.model, &context);
         let drafts = engine
-            .draft(3, &context, &params, &mut rng, &hidden)
+            .draft(3, &context, &params, &mut rng, Some(&hidden))
             .unwrap();
         let (emitted, k) = engine.verify(3, &context, &drafts, &mut rng).unwrap();
         assert_eq!(k, 1, "gate 0 keeps only the always-committed row 0");
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].index, drafts[0].token.index);
         // prompt(2) + drafts(3) rows, rollback(2) dropped the rejected
-        // drafts, commit(1) committed row 0 → 2 prompt rows remain.
+        // drafts, commit(1) committed the first prompt row → the
+        // remaining uncommitted rows are the second prompt row and the
+        // accepted draft row 0 (not two prompt rows, review 💡-2).
         assert!(forward.commit(2).is_ok());
         assert!(forward.commit(1).is_err());
+    }
+
+    #[test]
+    fn verify_partial_accept_commits_the_seeded_prefix() {
+        // Review 💡-6: a mid-gate seeded round commits exactly the
+        // prefix the rng stream accepts (k = 2 of 3 for this seed), not
+        // just the all-accept / all-reject extremes.
+        let trunk = trunk();
+        let head_ck = head();
+        let head = MtpHead::load(&trunk, &head_ck).unwrap();
+        let forward = Forward::new(&trunk);
+        let config = MtpConfig {
+            enabled: true,
+            depth: 2,
+            depth_set: true,
+            depth_hi: 0,
+            spec_n: 3,
+            gate_p: 0.5,
+        };
+        let engine = MtpEngine::new(&forward, head, config).unwrap();
+        let context = vec![1i64, 2];
+        let params = SampleParams::greedy();
+        let mut rng = Rng::new(3);
+        let hidden = forward::trunk_hidden(engine.model, &context);
+        let drafts = engine
+            .draft(3, &context, &params, &mut rng, Some(&hidden))
+            .unwrap();
+        let (emitted, k) = engine.verify(3, &context, &drafts, &mut rng).unwrap();
+        assert_eq!(k, 2, "seeded mid-gate round accepts rows 0..1 only");
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].index, drafts[0].token.index);
+        assert_eq!(emitted[1].index, drafts[1].token.index);
+        // prompt(2) + drafts(3) rows, rollback(1) dropped the rejected
+        // draft row 2, verify's commit(2) committed the prompt rows →
+        // the accepted draft rows 0 and 1 remain uncommitted (the same
+        // accounting shape as the forced-reject round, review 💡-2).
+        assert!(forward.commit(2).is_ok());
+        assert!(forward.commit(1).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_a_malformed_request_with_the_reference_wording() {
+        // Review 💡-1: the public verify returns the reference's
+        // `spec_verify(n=%d): …` wording instead of panicking.
+        let trunk = trunk();
+        let head = MtpHead::load(&trunk, &head()).unwrap();
+        let forward = Forward::new(&trunk);
+        let config = MtpConfig {
+            enabled: true,
+            depth: 2,
+            depth_set: true,
+            depth_hi: 0,
+            spec_n: 3,
+            gate_p: 1.0,
+        };
+        let engine = MtpEngine::new(&forward, head, config).unwrap();
+        let err = engine
+            .verify(4, &[1, 2], &[], &mut Rng::new(1))
+            .expect_err("n above HALOGEN_SPEC_N must be refused");
+        assert_eq!(
+            err,
+            "spec_verify(n=4): needs the verify rings (HALOGEN_MTP=1 or a lookup / grammar \
+             drafter), 1 <= n <= 3 (HALOGEN_SPEC_N) and a warm sequence (pos 2)"
+        );
+        let err = engine
+            .verify(0, &[1, 2], &[], &mut Rng::new(1))
+            .expect_err("n = 0 must be refused");
+        assert!(err.starts_with("spec_verify(n=0):"));
     }
 
     #[test]

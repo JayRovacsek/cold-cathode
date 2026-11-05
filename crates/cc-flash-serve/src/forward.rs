@@ -33,7 +33,7 @@
 //! KV-cache-backed incremental form (spec §5) replaces the cache
 //! implementation later without touching callers.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use crate::hgn;
 use crate::kvcache::{self, LayerRuntime, SlotPool, SlotRecord};
@@ -56,8 +56,11 @@ pub struct Forward<'a> {
     model: Option<Model>,
     /// The decode cache as a single-slot pool (the reference's slot pool,
     /// spec §2, ported in [`crate::kvcache`]): created on the first real
-    /// logits call, holding the current sequence's slot record.
-    pool: RefCell<Option<SlotPool>>,
+    /// logits call, holding the current sequence's slot record. A
+    /// `Mutex` (not `RefCell`) so `Forward` is `Sync` and the serve path
+    /// can share one instance (plus the [`crate::mtp::MtpEngine`] built
+    /// from it) across connection threads (review 🟡-6).
+    pool: Mutex<Option<SlotPool>>,
 }
 
 impl<'a> Forward<'a> {
@@ -69,7 +72,7 @@ impl<'a> Forward<'a> {
             checkpoint,
             vocab_size: vocab_size(checkpoint),
             model: model::load(checkpoint),
-            pool: RefCell::new(None),
+            pool: Mutex::new(None),
         }
     }
 
@@ -106,7 +109,7 @@ impl<'a> Forward<'a> {
     /// speculatively become committed). Errors when nothing is cached or
     /// `n` exceeds the uncommitted positions (mirroring [`Self::rollback`]).
     pub fn commit(&self, n: usize) -> Result<(), String> {
-        let mut pool = self.pool.borrow_mut();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         match pool.as_mut() {
             Some(pool) => pool.slots_mut()[0].commit(n),
             None => Err(format!("commit({n}): no cached sequence to commit")),
@@ -118,17 +121,34 @@ impl<'a> Forward<'a> {
     /// rolled back on rejection). Errors when there is no cached sequence
     /// or `n` exceeds the uncommitted positions.
     pub fn rollback(&self, n: usize) -> Result<(), String> {
-        let mut pool = self.pool.borrow_mut();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         match pool.as_mut() {
             Some(pool) => pool.slots_mut()[0].rollback(n),
             None => Err(format!("rollback({n}): no cached sequence to roll back")),
         }
     }
 
+    /// The cached pre-`lm_head` hidden state for `context_ids` (the MTP
+    /// head's `hidden_states` input, spec §1.1): the slot's stored vector
+    /// when the context matches the cached sequence, so the draft path
+    /// reads it in O(1) instead of replaying the whole context every
+    /// round (review 🟡-1; [`trunk_hidden`] remains the fresh-replay
+    /// fallback). `None` for stub checkpoints (no real model) or a
+    /// context the slot does not hold. The vector is cloned out from
+    /// behind the pool lock (the slot keeps ownership).
+    pub fn hidden(&self, context_ids: &[i64]) -> Option<Vec<f32>> {
+        if self.model.is_none() || context_ids.is_empty() {
+            return None;
+        }
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = pool.as_ref()?.slots().first()?;
+        (slot.context == context_ids).then(|| slot.hidden.clone())
+    }
+
     /// Real-path logits: reuse the cached prefix when the context only
     /// grew, otherwise re-run the single-token prefill loop (module docs).
     fn real_logits(&self, model: &Model, context: &[i64]) -> Vec<f32> {
-        let mut pool = self.pool.borrow_mut();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if pool.is_none() {
             *pool = Some(SlotPool::single(
                 model,
@@ -242,20 +262,6 @@ pub(crate) fn forward_token_hidden(
     // Final aggregation: the top-level mixer folds the stream stack into
     // the single hidden vector the `lm_head` reads.
     model.final_mixer.mix(&streams).0
-}
-
-/// One token step: embedding lookup → 48 layers → final mixer → `lm_head`
-/// (spec §3 — the [`forward_token_hidden`] pipeline plus the shared
-/// `lm_head` projection).
-pub(crate) fn forward_token(
-    model: &Model,
-    token: i64,
-    position: usize,
-    layers: &mut [LayerRuntime],
-) -> Vec<f32> {
-    model
-        .lm_head
-        .gemv(&forward_token_hidden(model, token, position, layers))
 }
 
 /// The full-attention block (`self_attn`, spec §3 `FUN_01fb3670`): the
