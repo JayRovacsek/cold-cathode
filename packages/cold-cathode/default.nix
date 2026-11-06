@@ -2,6 +2,8 @@
   lib,
   rustPlatform,
   rocmPackages,
+  binutils,
+  halogen-flash-server,
 }:
 
 rustPlatform.buildRustPackage {
@@ -37,6 +39,26 @@ rustPlatform.buildRustPackage {
     "-Clink-arg=-Wl,-rpath,${rocmPackages.hipblaslt}/lib:${rocmPackages.clr}/lib"
   ];
   dontPatchELF = true;
+
+  # The GPU code objects the port loads through the hipModule* API: the
+  # reference binary's `.hip_fatbin` section, extracted at build time
+  # into this output (docs/analysis/evidence/flash_serve/engine/
+  # fatbin-inventory.md). `preBuild` exports the path so `src/fatbin.rs`
+  # bakes it in via `option_env!("HALOGEN_FATBIN")` (a plain derivation
+  # attribute would reach rustc as the literal `$out/...`, since shell
+  # variables are not re-expanded inside env var values); a runtime
+  # `HALOGEN_FATBIN` still wins. The `/dev/null` output argument
+  # discards objcopy's copied object: the store input is read-only, so
+  # objcopy cannot write its default `<input>.o` next to it.
+  preBuild = ''
+    export HALOGEN_FATBIN=$out/share/cold-cathode/flash_serve.hipfb
+  '';
+  postInstall = ''
+    mkdir -p $out/share/cold-cathode
+    ${binutils}/bin/objcopy \
+      --dump-section .hip_fatbin=$out/share/cold-cathode/flash_serve.hipfb \
+      ${halogen-flash-server}/bin/flash_serve /dev/null
+  '';
 
   meta.mainProgram = "cold-cathode";
 }

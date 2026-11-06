@@ -340,6 +340,54 @@ pub mod ffi {
         ) -> hipError_t;
     }
 
+    // --- the module API (code-object loading) --------------------------------
+    //
+    // The `hipModule*` entry points the fatbin loader ([`crate::fatbin`])
+    // uses to load the reference's shipped GPU code objects. They live in
+    // the same `libamdhip64.so.7` but are not part of the reference's
+    // import catalogue (the binary embeds its code objects in the
+    // `.hip_fatbin` section instead of loading them at runtime), so they
+    // are catalogued separately in [`HIP_MODULE_SYMBOLS`].
+
+    pub type hipModule_t = *mut c_void;
+    pub type hipFunction_t = *mut c_void;
+
+    extern "C" {
+        pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> hipError_t;
+        pub fn hipModuleLoadDataEx(
+            module: *mut hipModule_t,
+            image: *const c_void,
+            numOptions: c_uint,
+            options: *mut c_void,
+            optionValues: *mut *mut c_void,
+        ) -> hipError_t;
+        pub fn hipModuleGetFunction(
+            func: *mut hipFunction_t,
+            module: hipModule_t,
+            name: *const c_char,
+        ) -> hipError_t;
+        pub fn hipModuleLaunchKernel(
+            func: hipFunction_t,
+            gridDimX: c_uint,
+            gridDimY: c_uint,
+            gridDimZ: c_uint,
+            blockDimX: c_uint,
+            blockDimY: c_uint,
+            blockDimZ: c_uint,
+            sharedMemBytes: c_uint,
+            stream: hipStream_t,
+            kernelParams: *mut *mut c_void,
+            extra: *mut *mut c_void,
+        ) -> hipError_t;
+        pub fn hipModuleGetGlobal(
+            devPtr: *mut *mut c_void,
+            bytes: *mut usize,
+            module: hipModule_t,
+            name: *const c_char,
+        ) -> hipError_t;
+        pub fn hipModuleUnload(module: hipModule_t) -> hipError_t;
+    }
+
     pub const RTLD_LAZY: c_int = 1;
 
     extern "C" {
@@ -413,6 +461,18 @@ pub mod ffi {
         "_ZN13hipblaslt_ext17getAlgosFromIndexEPvRSt6vectorIiSaIiEERS1_I33_hipblasLtMatmulHeuristicResult_tSaIS5_EE",
         "_ZN13hipblaslt_ext23getSolutionNameFromAlgoB5cxx11EPvR22_hipblasLtMatmulAlgo_t",
     ];
+
+    /// The 6 `hipModule*` entry points the fatbin loader uses to load the
+    /// reference's code objects (exported by the same library, but not
+    /// part of the import catalogue the reference binary itself links).
+    pub const HIP_MODULE_SYMBOLS: [&str; 6] = [
+        "hipModuleLoadData",
+        "hipModuleLoadDataEx",
+        "hipModuleGetFunction",
+        "hipModuleLaunchKernel",
+        "hipModuleGetGlobal",
+        "hipModuleUnload",
+    ];
 }
 
 // ---------------------------------------------------------------------------
@@ -436,8 +496,9 @@ macro_rules! bind {
     }};
 }
 
-/// The 36 HIP runtime entry points, resolved from `libamdhip64.so.7`.
-/// The hipBLASLt surface (the `ffi::HIPBLASLT_SYMBOLS` /
+/// The 36 HIP runtime entry points plus the 6 `hipModule*` entry points
+/// (the [`ffi::HIP_MODULE_SYMBOLS`] family), resolved from
+/// `libamdhip64.so.7`. The hipBLASLt surface (the `ffi::HIPBLASLT_SYMBOLS` /
 /// `ffi::HIPBLASLT_EXT_SYMBOLS` families) lives in `libhipblaslt.so.1`;
 /// the port declares it in [`ffi`] for surface completeness and loads it
 /// through the same dlopen pattern when the matmul path is exercised.
@@ -516,6 +577,40 @@ pub struct HipRuntime {
     pub hipStreamSynchronize: unsafe extern "C" fn(ffi::hipStream_t) -> ffi::hipError_t,
     pub hipStreamWaitEvent:
         unsafe extern "C" fn(ffi::hipStream_t, ffi::hipEvent_t, c_uint) -> ffi::hipError_t,
+    pub hipModuleLoadData:
+        unsafe extern "C" fn(*mut ffi::hipModule_t, *const c_void) -> ffi::hipError_t,
+    pub hipModuleLoadDataEx: unsafe extern "C" fn(
+        *mut ffi::hipModule_t,
+        *const c_void,
+        c_uint,
+        *mut c_void,
+        *mut *mut c_void,
+    ) -> ffi::hipError_t,
+    pub hipModuleGetFunction: unsafe extern "C" fn(
+        *mut ffi::hipFunction_t,
+        ffi::hipModule_t,
+        *const c_char,
+    ) -> ffi::hipError_t,
+    pub hipModuleLaunchKernel: unsafe extern "C" fn(
+        ffi::hipFunction_t,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_uint,
+        ffi::hipStream_t,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> ffi::hipError_t,
+    pub hipModuleGetGlobal: unsafe extern "C" fn(
+        *mut *mut c_void,
+        *mut usize,
+        ffi::hipModule_t,
+        *const c_char,
+    ) -> ffi::hipError_t,
+    pub hipModuleUnload: unsafe extern "C" fn(ffi::hipModule_t) -> ffi::hipError_t,
 }
 
 impl HipRuntime {
@@ -745,6 +840,63 @@ impl HipRuntime {
                 handle,
                 "hipStreamWaitEvent",
                 unsafe extern "C" fn(ffi::hipStream_t, ffi::hipEvent_t, c_uint) -> ffi::hipError_t
+            ),
+            hipModuleLoadData: bind!(
+                handle,
+                "hipModuleLoadData",
+                unsafe extern "C" fn(*mut ffi::hipModule_t, *const c_void) -> ffi::hipError_t
+            ),
+            hipModuleLoadDataEx: bind!(
+                handle,
+                "hipModuleLoadDataEx",
+                unsafe extern "C" fn(
+                    *mut ffi::hipModule_t,
+                    *const c_void,
+                    c_uint,
+                    *mut c_void,
+                    *mut *mut c_void,
+                ) -> ffi::hipError_t
+            ),
+            hipModuleGetFunction: bind!(
+                handle,
+                "hipModuleGetFunction",
+                unsafe extern "C" fn(
+                    *mut ffi::hipFunction_t,
+                    ffi::hipModule_t,
+                    *const c_char,
+                ) -> ffi::hipError_t
+            ),
+            hipModuleLaunchKernel: bind!(
+                handle,
+                "hipModuleLaunchKernel",
+                unsafe extern "C" fn(
+                    ffi::hipFunction_t,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    ffi::hipStream_t,
+                    *mut *mut c_void,
+                    *mut *mut c_void,
+                ) -> ffi::hipError_t
+            ),
+            hipModuleGetGlobal: bind!(
+                handle,
+                "hipModuleGetGlobal",
+                unsafe extern "C" fn(
+                    *mut *mut c_void,
+                    *mut usize,
+                    ffi::hipModule_t,
+                    *const c_char,
+                ) -> ffi::hipError_t
+            ),
+            hipModuleUnload: bind!(
+                handle,
+                "hipModuleUnload",
+                unsafe extern "C" fn(ffi::hipModule_t) -> ffi::hipError_t
             ),
         })
     }
@@ -1232,6 +1384,7 @@ mod tests {
         assert_eq!(ffi::HIP_RUNTIME_SYMBOLS.len(), 36);
         assert_eq!(ffi::HIPBLASLT_SYMBOLS.len(), 13);
         assert_eq!(ffi::HIPBLASLT_EXT_SYMBOLS.len(), 3);
+        assert_eq!(ffi::HIP_MODULE_SYMBOLS.len(), 6);
         // Every catalogue symbol must appear in this file's FFI surface.
         // The HIP runtime and hipblasLt C APIs are declared as
         // `pub fn <name>`; the mangled C++ hipblaslt_ext API is declared
@@ -1242,6 +1395,7 @@ mod tests {
         for symbol in ffi::HIP_RUNTIME_SYMBOLS
             .iter()
             .chain(ffi::HIPBLASLT_SYMBOLS.iter())
+            .chain(ffi::HIP_MODULE_SYMBOLS.iter())
         {
             assert!(
                 source.contains(&format!("pub fn {symbol}")),

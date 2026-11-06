@@ -16,7 +16,11 @@
     {
       packages.x86_64-linux = {
         halogen-flash-server = pkgs.callPackage ./packages/halogen-flash-server/default.nix { };
-        cold-cathode = pkgs.callPackage ./packages/cold-cathode/default.nix { };
+        cold-cathode = pkgs.callPackage ./packages/cold-cathode/default.nix {
+          # The port extracts the reference binary's `.hip_fatbin`
+          # section at build time (packages/cold-cathode/default.nix).
+          halogen-flash-server = self.packages.x86_64-linux.halogen-flash-server;
+        };
       };
 
       devShells.x86_64-linux.default = pkgs.mkShell {

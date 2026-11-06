@@ -12,6 +12,7 @@
 
 pub mod bf16;
 pub mod codecs;
+pub mod fatbin;
 pub mod forward;
 pub mod gguf;
 pub mod hgn;
@@ -200,7 +201,22 @@ fn run_serve(argv0: &str, args: &[String]) -> i32 {
     // Port-original wording (not a reference string): like the `log_info`
     // lines, the `halogen: backend: {label}` line is the port's own
     // phrasing chosen to surface the selected backend.
-    log_info(&format!("halogen: backend: {}", hip::active().label()));
+    let backend = hip::active();
+    log_info(&format!("halogen: backend: {}", backend.label()));
+    // The reference's GPU code objects (`.hip_fatbin`): on the HIP
+    // backend, report the registry the loader built (or why it is
+    // absent) under the same `HALOGEN_LOG` rules. The CPU path never
+    // touches the fatbin.
+    if backend == hip::Backend::Hip {
+        match fatbin::init() {
+            Ok(registry) => log_info(&format!(
+                "halogen: fatbin: {} modules, {} kernels",
+                registry.module_count(),
+                registry.kernel_count()
+            )),
+            Err(reason) => log_warn(&format!("halogen: fatbin: {reason} not loaded")),
+        }
+    }
     // All env-var checks sit behind the GPU check (matrix note, env group).
     if let Err(message) = validate_env() {
         eprintln!("{message}");
