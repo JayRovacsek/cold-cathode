@@ -1,5 +1,14 @@
 # cold-cathode
 
+> [!WARNING]
+> **Work in progress.** The CLI contracts for all five entry points are
+> implemented and verified by differential testing, and on ROCm hosts the
+> engine now loads the reference's shipped AMDGPU code objects — but the
+> GPU compute path (running generation through those kernels) is still
+> under construction, so generation latency does not yet match upstream
+> halogen. Treat this repository as an in-progress proof of concept, not a
+> drop-in replacement.
+
 ## What this is
 
 **cold-cathode** is a Rust reimplementation of the `halogen-flash-server`
@@ -140,5 +149,9 @@ Current state of the work:
 - Known caveat: the `.hgn` writer format (HGN1 checkpoint layout) was
   decompiled but the writer remains unverified against the original — noted in
   the `halogen-tools` spec.
-- The `init` branch is pending final review; `main` is untouched until the
-  review passes and the merge is approved.
+- The GPU compute path is under active construction: the engine loads the
+  reference's shipped AMDGPU code objects on ROCm hosts (module registry
+  in place), but routing the forward pass through those kernels — and the
+  resulting generation-latency parity with upstream — is still in progress.
+- Changes land on `main` through reviewed commits from the `init` working
+  branch.
