@@ -14,11 +14,11 @@
 let
   image = dockerTools.pullImage {
     imageName = "ghcr.io/peonist-ai/halogen-flash-server";
-    imageDigest = "sha256:21006e5347f974241fd11e7bac5fc31759a4187f8267f7b52d8b564986b69821";
-    outputHash = "sha256-vIKv/zxO1RhVYWOqiQjXqeuZrR7kTo/szFrLth+XS7Y=";
+    imageDigest = "sha256:65ff9ea3f8a819f465b196cf519b72856c9da76413e16ffea837a4f54dc59f44";
+    outputHash = "sha256-j2Nwb76VoG142DkkrWCpv92v/R7yTOXwaD9OG6IeVPg=";
     outputHashAlgo = "sha256";
     finalImageName = "halogen-flash-server";
-    finalImageTag = "0.18.21";
+    finalImageTag = "0.19.0";
   };
 
   python3Env = python3.withPackages (
@@ -36,13 +36,13 @@ let
 in
 stdenv.mkDerivation {
   pname = "halogen-flash-server";
-  version = "0.18.21";
+  version = "0.19.0";
 
   src = fetchFromGitHub {
     owner = "peonist-ai";
     repo = "halogen-flash-server";
-    rev = "v0.18.21";
-    hash = "sha256:1cznd2k5w89bimf405va49gd6mq48591qmqy1icd2axz6n8fd77p";
+    rev = "v0.19.0";
+    hash = "sha256:sha256-+cvURiTtfP325QKjRTLlMI52CuqkgBDDXri6f/P4EMI=";
   };
 
   buildInputs = [
