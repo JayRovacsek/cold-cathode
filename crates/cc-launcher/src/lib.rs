@@ -19,6 +19,18 @@
 //! the live wrapper values: the spec declares the live wrapper the contract
 //! ("Variance vs the plan's Appendix A").
 //!
+//! # v0.20.5 launcher additions (objectives O1–O8)
+//!
+//! The vendored package is bumped to v0.20.5; the entrypoint additions of
+//! that release are ported here: the `HALOGEN_AGENT_GUARD` mode parsing and
+//! model injection (O1), the v0.20.5 `cache_gib` reply-end accounting (O2,
+//! exposed as `cache_gib` while the rest of `kv_budget_note` stays
+//! deferred), the new `FE_ONLY_FLAGS` entries (O3), the `--host ::` API bind
+//! (O4), the NPU `vis`/`aud` part handling (O5), the bundled-XRT helpers
+//! (O6), the NPU stall watchdog (O7) and the rc-76 host-floor backoff (O8).
+//! The rest of the NPU orchestration (`start_npu_engine`, `npu_launch`,
+//! `npu_preflight`) remains deferred; these helpers are its ported pieces.
+//!
 //! # Sibling binary resolution
 //!
 //! The reference launcher reaches its siblings through store paths and the
@@ -68,12 +80,12 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Stdio};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -171,10 +183,18 @@ const FE_ONLY_FLAGS: &[&str] = &[
     "HALOGEN_TOP_P",
     "HALOGEN_CACHE_LEAD",
     "HALOGEN_TOOL_DEFER",
+    // v0.20.5 (entrypoint lines 1031–1036):
+    "HALOGEN_RENDER_ONCE",
+    "HALOGEN_TOKENIZE_SPLIT",
+    "HALOGEN_TOOL_NONE_MASK",
+    "HALOGEN_TOKENIZER_NATIVE",
     "HALOGEN_FORK_AUTO_END_ONLY",
     "HALOGEN_FORK_AUTO_KEEPS",
     "HALOGEN_FORK_HANDLES",
     "HALOGEN_FORK_MAP",
+    "HALOGEN_FORK_UNMATCHED_RELEASE",
+    "HALOGEN_AGENT_GUARD",
+    "HALOGEN_MODEL_NAME_CHECK",
 ];
 
 /// The reference package root, used as the fallback for the Python
@@ -195,6 +215,10 @@ pub fn run(argv: &[String]) -> i32 {
     // Layer 2 pre-dispatch (spec §Layer 2), in entrypoint order.
     set_default("HSA_DISABLE_COREDUMP_ON_EXCEPTION", "1"); // line 5
                                                            // line 6 `ulimit -c 0`: not reproducible in std-only Rust (see module docs).
+    if let Err(code) = agent_guard() {
+        // v0.20.5 lines 8–27 (right after the coredump export).
+        return code;
+    }
     oom_adj_raise(); // lines 8–24
     set_default("HALOGEN_VERBOSE", "0"); // line 30
     let checkpoint = resolve_checkpoint("/models"); // lines 32–47
@@ -1035,6 +1059,510 @@ fn gtt_gib_under(sys: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// v0.20.5 additions (objectives O1, O2, O5–O8)
+// ---------------------------------------------------------------------------
+
+/// `HALOGEN_AGENT_GUARD` mode parsing (v0.20.5 entrypoint lines 8–27, right
+/// after the coredump export). `off`/`0`/`false`/`no`/`none` (any case) are
+/// a no-op; `watch`/`hold` inject the guard models into
+/// `HALOGEN_NPU_MODELS`; anything else exits 1 with the exact notice.
+fn agent_guard() -> Result<(), i32> {
+    let raw = env::var("HALOGEN_AGENT_GUARD").unwrap_or_default();
+    // bash `tr 'A-Z' 'a-z'`: ASCII-only lowercasing.
+    let mode = raw.to_ascii_lowercase();
+    match mode.as_str() {
+        "" | "0" | "off" | "false" | "no" | "none" => return Ok(()),
+        "watch" | "hold" => {}
+        _ => {
+            eprintln!("halogen: HALOGEN_AGENT_GUARD={raw} is not a mode: use off, watch or hold");
+            return Err(1);
+        }
+    }
+    let existing = env::var("HALOGEN_NPU_MODELS").unwrap_or_default();
+    env::set_var("HALOGEN_NPU_MODELS", agent_guard_inject(&mode, &existing));
+    if mode == "hold" {
+        eprintln!("halogen: HALOGEN_AGENT_GUARD={raw}: halogen-spotter-0.6b (reads tool results) and decider-4b (whether a tool acts outside the conversation) are served on the NPU");
+    } else {
+        eprintln!("halogen: HALOGEN_AGENT_GUARD={raw}: halogen-spotter-0.6b (reads tool results) is served on the NPU");
+    }
+    Ok(())
+}
+
+/// The injection loop (lines 13–20): each guard model is appended to the
+/// comma list only when `,models,` does not already contain `,model,`; an
+/// empty list takes the model without a leading comma. Existing entries are
+/// extended, never duplicated.
+fn agent_guard_inject(mode: &str, existing: &str) -> String {
+    let set = if mode == "hold" {
+        "halogen-spotter-0.6b decider-4b"
+    } else {
+        "halogen-spotter-0.6b"
+    };
+    let mut models = existing.to_string();
+    for ag in set.split_whitespace() {
+        let wrapped = format!(",{models},");
+        if wrapped.contains(&format!(",{ag},")) {
+            continue;
+        }
+        if models.is_empty() {
+            models = ag.to_string();
+        } else {
+            models = format!("{models},{ag}");
+        }
+    }
+    models
+}
+
+/// `cache_gib` from `kv_budget_note` (v0.20.5 entrypoint line 111) as a
+/// function of the derived engine's `ENG_SLOTS`/`ENG_CTX` plus the
+/// environment: the awk's `${VAR:-default}` inputs are resolved, then its
+/// expression applied. The reply-end term (`rp`, HALOGEN_CACHE_REPLY,
+/// suppressed when HALOGEN_PROMPT_CACHE=1) is the 0.20.5 addition. The
+/// string comparisons (`ip`, `s3`, `fu`, `rp`, `pm`) follow awk's string
+/// semantics; `s`, `br`, `rr`, `n` take awk's numeric semantics (a
+/// non-numeric value counts as 0).
+pub fn cache_gib(slots: &str, ctx: &str) -> String {
+    let get = |key: &str, default: &str| {
+        env::var(key)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let prompt_cache = get("HALOGEN_PROMPT_CACHE", "2");
+    let cache_inplace = get("HALOGEN_CACHE_INPLACE", "1");
+    let cache_file = env::var("HALOGEN_CACHE_FILE").unwrap_or_default();
+    let entries = env::var("HALOGEN_CACHE_ENTRIES").unwrap_or_default();
+    let branches = get("HALOGEN_CACHE_BRANCHES", "2");
+    let snap3 = get("HALOGEN_CACHE_SNAP3", "1");
+    let full = get("HALOGEN_CACHE_FULL", "1");
+    let reply = get("HALOGEN_CACHE_REPLY", "1");
+    let kv_rows = if env::var("HALOGEN_KV8").unwrap_or_default() == "1" {
+        "13832"
+    } else {
+        "26624"
+    };
+    let n = if entries.is_empty() {
+        let per_slot = 1.0
+            + awk_num(&branches) * (if snap3 == "0" { 1.0 } else { 2.0 })
+            + (if full == "0" { 0.0 } else { 1.0 })
+            + (if reply == "0" || prompt_cache == "1" {
+                0.0
+            } else {
+                1.0
+            });
+        awk_num(slots) * per_slot
+    } else {
+        awk_num(&entries)
+    };
+    let gib = if prompt_cache == "0" || !cache_file.is_empty() {
+        0.0
+    } else if cache_inplace != "0" {
+        n * 115.0 * 1048576.0 / 1073741824.0
+    } else {
+        awk_num(ctx) * awk_num(kv_rows) / 1073741824.0
+    };
+    format!("{gib:.1}")
+}
+
+/// awk's numeric coercion of a value used arithmetically: a non-numeric
+/// string counts as 0 (the port does not emulate awk's leading-number
+/// prefix, e.g. `12abc`; no live case presents one).
+fn awk_num(value: &str) -> f64 {
+    value.parse::<f64>().unwrap_or(0.0)
+}
+
+/// One `file` line of the image's NPU record (`npu_pin_files`, entrypoint
+/// line 1116): the path under `/models/npu/<id>/`, the size in bytes and
+/// the sha256.
+pub struct NpuPin {
+    pub path: String,
+    pub size: u64,
+    pub sha: String,
+}
+
+/// `npu_pin_files` (entrypoint line 1116): the file records of one model id
+/// parsed out of the models.txt text.
+pub fn npu_pin_files(record: &str, id: &str) -> Vec<NpuPin> {
+    let mut pins = Vec::new();
+    for line in record.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 5 && fields[0] == "file" && fields[1] == id {
+            if let Ok(size) = fields[3].parse() {
+                pins.push(NpuPin {
+                    path: fields[2].to_string(),
+                    size,
+                    sha: fields[4].to_string(),
+                });
+            }
+        }
+    }
+    pins
+}
+
+/// `npu_model_ready`'s pin filter (v0.20.5 entrypoint lines 1307–1311):
+/// `devices` now also takes the vis/ and aud/ pins; `vis` and `aud` are the
+/// new part types; any other part keeps every pin.
+pub fn npu_part_pins<'a>(part: &str, pins: &'a [NpuPin]) -> Vec<&'a NpuPin> {
+    pins.iter()
+        .filter(|pin| match part {
+            "devices" => {
+                pin.path.starts_with("devices/")
+                    || pin.path.starts_with("vis/")
+                    || pin.path.starts_with("aud/")
+            }
+            "vis" => pin.path.starts_with("vis/"),
+            "aud" => pin.path.starts_with("aud/"),
+            _ => true,
+        })
+        .collect()
+}
+
+/// `npu_model_ready`'s path list (v0.20.5 entrypoint lines 1326–1332) for a
+/// part: the recorded pins when present (and verifiable or downloadable),
+/// else the part's fallback set — `vis/devices.hnpm` and
+/// `aud/devices.hnpm` are the 0.20.5 additions.
+pub fn npu_part_paths(
+    part: &str,
+    id: &str,
+    pins: &[&NpuPin],
+    verify: bool,
+    download: bool,
+    own: &str,
+) -> Vec<String> {
+    if !pins.is_empty() && (verify || download) {
+        return pins.iter().map(|pin| pin.path.clone()).collect();
+    }
+    match part {
+        "vis" => vec!["vis/devices.hnpm".to_string()],
+        "aud" => vec!["aud/devices.hnpm".to_string()],
+        "devices" => vec!["devices/devices.hnpm".to_string()],
+        _ if own != id => vec![format!("{id}.hnpw"), "tokenizer/tokenizer.json".to_string()],
+        _ => vec![
+            "devices/devices.hnpm".to_string(),
+            format!("{id}.hnpw"),
+            "tokenizer/tokenizer.json".to_string(),
+        ],
+    }
+}
+
+/// `npu_model_ready`'s .elf check (v0.20.5 entrypoint lines 1347–1360): the
+/// exact error when the part's directory under `d` holds no .elf file;
+/// `None` when the check passes or the part needs none.
+pub fn npu_elf_error(part: &str, id: &str, d: &str, own_is_id: bool) -> Option<String> {
+    let (dir, message) = match part {
+        "vis" => (
+            format!("{d}/vis"),
+            format!("halogen npu: {id}: {d}/vis/ holds no .elf file (the NPU's program for the model's vision tower)"),
+        ),
+        "aud" => (
+            format!("{d}/aud"),
+            format!("halogen npu: {id}: {d}/aud/ holds no .elf file (the NPU's program for the model's audio encoder)"),
+        ),
+        _ if part == "devices" || own_is_id => (
+            format!("{d}/devices"),
+            format!("halogen npu: {id}: {d}/devices/ holds no .elf file (the NPU's program for the model)"),
+        ),
+        _ => return None,
+    };
+    if dir_has_elf(&dir) {
+        None
+    } else {
+        Some(message)
+    }
+}
+
+/// bash `ls "$dir/"*.elf` succeeding: any entry ending in `.elf`.
+fn dir_has_elf(dir: &str) -> bool {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".elf"))
+        })
+        .unwrap_or(false)
+}
+
+/// The vis part's `NPU_NEED_K` accounting (v0.20.5 entrypoint lines
+/// 1396–1399): the `du -sk` of the model's vis directory, then the early
+/// return.
+pub fn npu_vis_need_k(d: &str) -> u64 {
+    du_k(&format!("{d}/vis"))
+}
+
+/// `du -sk` as a 1 KiB-block count: every file's size rounded up to a KiB,
+/// summed recursively (the port's approximation, cf. `du_h`'s note).
+fn du_k(dir: &str) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![PathBuf::from(dir)];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                stack.push(child);
+            } else {
+                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total += len.div_ceil(1024).max(1);
+            }
+        }
+    }
+    total
+}
+
+/// `npu_finetune_ready`'s convert flags (v0.20.5 entrypoint line 1463):
+/// `--vis`/`--aud` with their directories when the fine-tune's base carries
+/// them.
+pub fn npu_convert_flags(vis: Option<&str>, aud: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(tower) = vis {
+        args.push("--vis".to_string());
+        args.push(tower.to_string());
+    }
+    if let Some(encoder) = aud {
+        args.push("--aud".to_string());
+        args.push(encoder.to_string());
+    }
+    args
+}
+
+/// The v0.20.5 image's NPU record directory (the `npu/xrt.sha256` and
+/// `npu/xrt.version` files). The vendored package ships no /opt/xilinx/xrt,
+/// so the host-mount fallback is the live path and the image-XRT branch
+/// stays data-driven: it only fires when these files exist.
+const NPU_RECORD_DIR: &str =
+    "/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu";
+
+/// The three XRT libraries `npu_xrt_own` checks (entrypoint line 1472).
+const XRT_LIBS: [&str; 3] = [
+    "libxrt_coreutil.so.2",
+    "libxrt_core.so.2",
+    "libxrt_driver_xdna.so.2",
+];
+
+/// `npu_xrt_own` (v0.20.5 entrypoint lines 1469–1478): how many of the
+/// three XRT libraries under `lib_dir` hash-match the image's record. The
+/// record's absence answers 0 (the vendored package ships none).
+pub fn npu_xrt_own(record: &str, lib_dir: &str, sha256_prog: &str) -> u32 {
+    let Ok(contents) = fs::read_to_string(record) else {
+        return 0;
+    };
+    XRT_LIBS
+        .iter()
+        .filter(|lib| {
+            let want = record_line_hash(&contents, lib);
+            let got = sha256_of(sha256_prog, &format!("{lib_dir}/{lib}"));
+            !want.is_empty() && Some(want) == got
+        })
+        .count() as u32
+}
+
+/// `npu_xrt_own` at the entrypoint's baked paths (v0.20.5 lines 1470–1471
+/// with `_hg_root` empty): the image's record against `/opt/xilinx/xrt/lib`.
+pub fn npu_xrt_own_default(sha256_prog: &str) -> u32 {
+    npu_xrt_own(
+        &format!("{NPU_RECORD_DIR}/xrt.sha256"),
+        "/opt/xilinx/xrt/lib",
+        sha256_prog,
+    )
+}
+
+/// The sha256 recorded for a library name (awk `$2 == f {print $1}`).
+fn record_line_hash(contents: &str, name: &str) -> String {
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hash), Some(file)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if file == name {
+            return hash.to_string();
+        }
+    }
+    String::new()
+}
+
+/// `${_hg_sha256:-sha256sum}`: the file's hash via the helper program;
+/// `None` when the file or the program is missing.
+fn sha256_of(prog: &str, path: &str) -> Option<String> {
+    let out = Command::new(prog).arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let first = String::from_utf8(out.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .to_string();
+    Some(first)
+}
+
+/// The mixed-mount refusal (v0.20.5 entrypoint lines 1504–1507): a partial
+/// match means a host's libraries were mounted over some of the image's.
+pub fn npu_xrt_mixed_error(own: u32, ownv: &str) -> Option<String> {
+    (own == 1 || own == 2).then(|| format!("halogen npu: /opt/xilinx/xrt/lib mixes a host's XRT libraries with this image's XRT {ownv}. Mount all three of them, or none: with no mount the image uses its own."))
+}
+
+/// The startup naming (v0.20.5 entrypoint lines 1534–1538): "XRT <ver>
+/// (this image's)" when all three libraries match the record, else the
+/// host's naming derived from the mounted file's name.
+pub fn npu_xrt_name(ownv: &str, own: u32, mounted: &str) -> String {
+    if own == 3 {
+        return format!("XRT {ownv} (this image's)");
+    }
+    let version = mounted
+        .strip_prefix("libxrt_coreutil.so.")
+        .unwrap_or(mounted);
+    if version.contains('.') {
+        format!("XRT {version} (the host's)")
+    } else {
+        "the host's XRT (its version is not in the mounted file's name)".to_string()
+    }
+}
+
+/// The fallback hint on an engine that exited before ready (v0.20.5
+/// entrypoint lines 1671–1673), printed when it ran on the image's own XRT.
+pub fn npu_engine_exit_hint(xrt_v: &str, kernel: &str, drv: &str) -> String {
+    format!("  It ran on {xrt_v} against the host's kernel {kernel}, driver amdxdna {drv}. If that driver is what refused it, use the host's XRT: -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro, or for a distribution's packages the mounts in the NPU page's host section.")
+}
+
+/// The `HALOGEN_NPU_KILL_S` gate of `start_npu_engine` (v0.20.5 entrypoint
+/// lines 1661–1663): `${HALOGEN_NPU_KILL_S:-1800}` substitutes the default
+/// for a set-but-empty value too (bash's `''` case is unreachable), so only
+/// a non-numeric value yields the exact error (the caller exits 1).
+pub fn parse_npu_kill_s(raw: Option<String>) -> Result<u64, String> {
+    let value = raw
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1800".to_string());
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "halogen npu: HALOGEN_NPU_KILL_S={value} is not a number of seconds (0 = off)"
+        ));
+    }
+    Ok(value.parse().unwrap_or(0))
+}
+
+/// `npu_running_ms` (v0.20.5 entrypoint lines 1710–1717) as a pure parse of
+/// the INFO reply: the digits after `"running_ms":`, `None` when the field
+/// is absent or empty.
+pub fn parse_running_ms(line: &str) -> Option<u64> {
+    let rest = line.split_once("\"running_ms\":")?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// `npu_running_ms` (v0.20.5 entrypoint lines 1710–1717): the INFO 0 probe
+/// of the NPU engine's port (bash's `/dev/tcp` with a 5s read timeout).
+pub fn npu_running_ms(port: &str) -> Option<u64> {
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    (&stream).write_all(b"INFO 0\n").ok()?;
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    parse_running_ms(&line)
+}
+
+/// `npu_stall_watchdog` (v0.20.5 entrypoint lines 1718–1758): the background
+/// poller. A job holding the NPU past `limit` seconds gets TERM then KILL
+/// (the restart itself lives in the `all` mode's loop); D-state threads
+/// defer the kill; `parent` bounds the loop (bash's `$$`).
+pub fn npu_stall_watchdog(port: &str, limit: u64, step: u64, pidfile: &str, parent: u32) {
+    if limit == 0 {
+        println!("halogen npu: stall watchdog OFF (HALOGEN_NPU_KILL_S=0)");
+        return;
+    }
+    println!("halogen npu: stall watchdog on: one job holding the NPU for {limit} s takes the NPU engine down and starts it again (HALOGEN_NPU_KILL_S)");
+    let start = Instant::now();
+    let mut killed = String::new();
+    let mut dlast = Duration::ZERO;
+    while wd_alive(parent) {
+        sleep(Duration::from_secs(step));
+        let pid = fs::read_to_string(pidfile)
+            .ok()
+            .and_then(|raw| raw.lines().next().map(str::to_string))
+            .unwrap_or_default();
+        let Ok(pid_num) = pid.trim().parse::<u32>() else {
+            continue; // bash `case "$pid" in ''|*[!0-9]*) continue`
+        };
+        let pid = pid_num.to_string();
+        if !wd_alive(pid_num) || pid == killed {
+            continue;
+        }
+        let Some(ms) = npu_running_ms(port) else {
+            continue;
+        };
+        let s = ms / 1000;
+        if s < limit {
+            continue;
+        }
+        if wd_state(pid_num) == "D" {
+            let now = start.elapsed();
+            if dlast.is_zero() || now - dlast >= Duration::from_secs(60) {
+                dlast = now;
+                eprintln!("halogen npu: one job has held the NPU for {s} s (HALOGEN_NPU_KILL_S={limit}) and a thread of the NPU engine is in uninterruptible sleep (state D, inside the kernel). Not taken down: SIGKILL does not reach it and killing the engine there is what leaves the driver holding its memory (issue #79). Deferred; checked again in {step} s.");
+            }
+            continue;
+        }
+        eprintln!("halogen npu: one job has held the NPU for {s} s (HALOGEN_NPU_KILL_S={limit}); the device is not coming back. Stopping the NPU engine; it is started again (HALOGEN_NPU_RESTARTS) and the Flash engine serves on. Requests waiting for the NPU are answered 503.");
+        kill_pid(&pid, "TERM");
+        let mut t = 0;
+        while wd_alive(pid_num) && t < 10 {
+            // bash `${_hg_npu_term_s:-10}`
+            sleep(Duration::from_secs(1));
+            t += 1;
+        }
+        if wd_alive(pid_num) {
+            if wd_state(pid_num) == "D" {
+                eprintln!("halogen npu: the NPU engine did not exit on SIGTERM and a thread of it is now in uninterruptible sleep (state D); SIGKILL deferred (issue #79).");
+            } else {
+                eprintln!("halogen npu: the NPU engine did not exit on SIGTERM within {t} s; sending SIGKILL");
+                kill_pid(&pid, "KILL");
+            }
+        }
+        killed = pid;
+    }
+}
+
+/// bash `wd_alive` (entrypoint line 856): the /proc directory exists and the
+/// main thread is not a zombie.
+fn wd_alive(pid: u32) -> bool {
+    let proc = env::var("_hg_proc")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/proc".to_string());
+    Path::new(&proc).join(pid.to_string()).is_dir() && wd_state(pid) != "Z"
+}
+
+/// bash `kill -SIG "$pid"` for a pid that is not our child: the `kill`
+/// binary (std has no kill for foreign pids without libc).
+fn kill_pid(pid: &str, sig: &str) {
+    let _ = Command::new("kill").arg(format!("-{sig}")).arg(pid).spawn();
+}
+
+/// The rc-76 memory-floor exit of `npu_again` (v0.20.5 entrypoint line
+/// 1783): a floor exit costs no restart count.
+pub fn npu_floor_exit(rc: i32) -> bool {
+    rc == 76
+}
+
+/// The floor retry backoff (v0.20.5 entrypoint lines 1785–1786): the delay
+/// doubles from the 30 s default (or `_hg_npu_room_s`) up to the 300 s cap.
+pub fn npu_room_s(current: u64, room_default: u64) -> u64 {
+    (if current > 0 {
+        current.saturating_mul(2)
+    } else {
+        room_default
+    })
+    .min(300)
+}
+
+/// The floor notice (v0.20.5 entrypoint line 1787), verbatim.
+pub fn npu_floor_notice(room_s: u64) -> String {
+    format!("halogen npu: the host is under the NPU engine's memory floor (HALOGEN_NPU_HOST_FLOOR_GIB; its line is above): trying again in {room_s} s, until there is room. Its routes answer 503 until then and the Flash engine serves on")
+}
+
+// ---------------------------------------------------------------------------
 // Mode implementations (spec: "The dispatch table")
 // ---------------------------------------------------------------------------
 
@@ -1078,7 +1606,8 @@ fn start_all(eng: &Engine, checkpoint: &str) -> i32 {
         // The script path comes first (entrypoint: `python3 "$_hg_serve_api"
         // "${API_ARGS[@]}" &`), matching the `api` and `bench` modes.
         let mut api_args = vec![share_file("serve_api.py").display().to_string()];
-        api_args.extend(eng.api_args(&tokenizer, "0.0.0.0", &format!("127.0.0.1:{}", eng.port)));
+        // v0.20.5 (entrypoint line 1862): the `all` mode binds the API to `::`.
+        api_args.extend(eng.api_args(&tokenizer, "::", &format!("127.0.0.1:{}", eng.port)));
         let api_args: Vec<&str> = api_args.iter().map(String::as_str).collect();
         spawn(&python, &api_args, &[])
     });
@@ -1127,7 +1656,8 @@ fn start_api(eng: &Engine, checkpoint: &str) -> i32 {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("127.0.0.1:{}", eng.port));
     let mut args = vec![share_file("serve_api.py").display().to_string()];
-    args.extend(eng.api_args(&tokenizer, "0.0.0.0", &engine));
+    // v0.20.5 (entrypoint line 1100): the `api` mode binds to `::`.
+    args.extend(eng.api_args(&tokenizer, "::", &engine));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     exec_program(&python, &args, &[])
 }
@@ -1358,9 +1888,18 @@ fn split_file<'a>(rest: &'a [String], checkpoint: &str) -> (String, &'a [String]
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// Serialises the socket tests: `closed_port` frees an ephemeral port
+    /// and immediately probes it, so a sibling test binding in that window
+    /// can make the probe succeed (the flake). A shared lock keeps every
+    /// bind/probe pair atomic across the suite. The poison recovery keeps a
+    /// failing test from cascading into the others.
+    static SOCKET_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// A port nothing listens on: bind an ephemeral listener and drop it,
     /// so a connect to it is refused (the state `wait_for_engine` polls).
+    /// Callers hold `SOCKET_TEST_LOCK` for the bind→drop→probe sequence.
     fn closed_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .expect("ephemeral bind")
@@ -1371,6 +1910,9 @@ mod tests {
 
     #[test]
     fn socket_accepts_true_for_a_listening_port() {
+        let _guard = SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
         let addr = listener.local_addr().expect("listener address");
         assert!(socket_accepts(&addr.to_string()));
@@ -1378,6 +1920,9 @@ mod tests {
 
     #[test]
     fn socket_accepts_false_for_a_closed_port() {
+        let _guard = SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         assert!(!socket_accepts(&format!("127.0.0.1:{}", closed_port())));
     }
 
@@ -1385,6 +1930,9 @@ mod tests {
     fn wait_for_engine_returns_true_once_the_socket_accepts() {
         // The engine child stays alive and the socket accepts on the first
         // probe, so the helper returns true at t=0 without sleeping.
+        let _guard = SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
         let port = listener.local_addr().expect("listener address").port();
         let mut engine = Command::new("sh")
@@ -1402,6 +1950,9 @@ mod tests {
         // `try_wait` reports the same fact and the helper returns false —
         // the dispatch table's "1 if the engine never comes up". The
         // pre-wait reaps the child so the test never depends on scheduling.
+        let _guard = SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let mut engine = Command::new("sh")
             .args(["-c", "exit 0"])
             .spawn()
@@ -1415,6 +1966,9 @@ mod tests {
         // HALOGEN_ENGINE_WAIT_S=1 with the 2s poll: the first probe runs at
         // t=0 (below the limit), the second at t=2 — the expiry wording and
         // false (entrypoint lines 763–769). Takes ~2s (the poll interval).
+        let _guard = SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let previous = env::var("HALOGEN_ENGINE_WAIT_S").ok();
         env::set_var("HALOGEN_ENGINE_WAIT_S", "1");
         let mut engine = Command::new("sh")
@@ -1474,5 +2028,408 @@ mod tests {
         fs::create_dir_all(root.join("class")).expect("empty class dir");
         assert_eq!(gtt_gib_under(&root), "?");
         fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    // -- v0.20.5 additions ---------------------------------------------------
+
+    #[test]
+    fn agent_guard_modes_update_the_environment_in_order() {
+        // One test for all env-mutating branches: Rust runs tests in parallel
+        // threads over a shared process environment, so these must not race.
+        let previous = env::var("HALOGEN_AGENT_GUARD").ok();
+        let previous_models = env::var("HALOGEN_NPU_MODELS").ok();
+
+        // Off modes leave HALOGEN_NPU_MODELS untouched.
+        for raw in [
+            "", "0", "off", "OFF", "false", "FALSE", "no", "none", "NoNe",
+        ] {
+            env::set_var("HALOGEN_AGENT_GUARD", raw);
+            env::set_var("HALOGEN_NPU_MODELS", "decider-4b");
+            assert_eq!(agent_guard(), Ok(()), "raw {raw:?} must be a no-op");
+            assert_eq!(
+                env::var("HALOGEN_NPU_MODELS").ok().as_deref(),
+                Some("decider-4b")
+            );
+        }
+
+        // An unknown mode exits 1 and leaves the list alone.
+        env::set_var("HALOGEN_AGENT_GUARD", "watchme");
+        env::set_var("HALOGEN_NPU_MODELS", "decider-4b");
+        assert_eq!(agent_guard(), Err(1));
+        assert_eq!(
+            env::var("HALOGEN_NPU_MODELS").ok().as_deref(),
+            Some("decider-4b")
+        );
+
+        // WATCH (case-insensitive) injects the spotter into an empty list.
+        env::set_var("HALOGEN_AGENT_GUARD", "WATCH");
+        env::remove_var("HALOGEN_NPU_MODELS");
+        assert_eq!(agent_guard(), Ok(()));
+        assert_eq!(
+            env::var("HALOGEN_NPU_MODELS").ok().as_deref(),
+            Some("halogen-spotter-0.6b")
+        );
+
+        // HOLD adds both beside an existing entry, without duplication.
+        env::set_var("HALOGEN_AGENT_GUARD", "Hold");
+        env::set_var("HALOGEN_NPU_MODELS", "x,halogen-spotter-0.6b");
+        assert_eq!(agent_guard(), Ok(()));
+        assert_eq!(
+            env::var("HALOGEN_NPU_MODELS").ok().as_deref(),
+            Some("x,halogen-spotter-0.6b,decider-4b")
+        );
+
+        match previous {
+            Some(value) => env::set_var("HALOGEN_AGENT_GUARD", value),
+            None => env::remove_var("HALOGEN_AGENT_GUARD"),
+        }
+        match previous_models {
+            Some(value) => env::set_var("HALOGEN_NPU_MODELS", value),
+            None => env::remove_var("HALOGEN_NPU_MODELS"),
+        }
+    }
+
+    #[test]
+    fn agent_guard_inject_watch_appends_spotter_once() {
+        assert_eq!(agent_guard_inject("watch", ""), "halogen-spotter-0.6b");
+        assert_eq!(
+            agent_guard_inject("watch", "decider-4b"),
+            "decider-4b,halogen-spotter-0.6b"
+        );
+        // Already present (inside the list or at either end) → unchanged.
+        assert_eq!(
+            agent_guard_inject("watch", "x,halogen-spotter-0.6b,y"),
+            "x,halogen-spotter-0.6b,y"
+        );
+        assert_eq!(
+            agent_guard_inject("watch", "halogen-spotter-0.6b"),
+            "halogen-spotter-0.6b"
+        );
+    }
+
+    #[test]
+    fn agent_guard_inject_hold_appends_both_models() {
+        assert_eq!(
+            agent_guard_inject("hold", ""),
+            "halogen-spotter-0.6b,decider-4b"
+        );
+        assert_eq!(
+            agent_guard_inject("hold", "decider-4b"),
+            "decider-4b,halogen-spotter-0.6b"
+        );
+        assert_eq!(
+            agent_guard_inject("hold", "halogen-spotter-0.6b,decider-4b"),
+            "halogen-spotter-0.6b,decider-4b"
+        );
+    }
+
+    #[test]
+    fn cache_gib_counts_the_reply_entry_with_the_0_20_5_terms() {
+        // Defaults: n = s * (1 + 2*2 + 1 + 1) = 4 * 7 = 28 entries; in-place
+        // → 28 * 115 MiB = 3220/1024 GiB = 3.144… → "3.1".
+        let previous: Vec<(&str, Option<String>)> = [
+            "HALOGEN_PROMPT_CACHE",
+            "HALOGEN_CACHE_INPLACE",
+            "HALOGEN_CACHE_FILE",
+            "HALOGEN_CACHE_ENTRIES",
+            "HALOGEN_CACHE_BRANCHES",
+            "HALOGEN_CACHE_SNAP3",
+            "HALOGEN_CACHE_FULL",
+            "HALOGEN_CACHE_REPLY",
+            "HALOGEN_KV8",
+        ]
+        .iter()
+        .map(|key| (*key, env::var(key).ok()))
+        .collect();
+        for key in [
+            "HALOGEN_PROMPT_CACHE",
+            "HALOGEN_CACHE_INPLACE",
+            "HALOGEN_CACHE_FILE",
+            "HALOGEN_CACHE_ENTRIES",
+            "HALOGEN_CACHE_BRANCHES",
+            "HALOGEN_CACHE_SNAP3",
+            "HALOGEN_CACHE_FULL",
+            "HALOGEN_CACHE_REPLY",
+            "HALOGEN_KV8",
+        ] {
+            env::remove_var(key);
+        }
+        assert_eq!(cache_gib("4", "262144"), "3.1");
+        // HALOGEN_CACHE_REPLY=0 drops the reply-end entry: n = 4 * 6 = 24.
+        env::set_var("HALOGEN_CACHE_REPLY", "0");
+        assert_eq!(cache_gib("4", "262144"), "2.7");
+        // HALOGEN_PROMPT_CACHE=1 also suppresses it (the `pm` guard), even
+        // with the reply term unset: n = 4 * 6 = 24.
+        env::remove_var("HALOGEN_CACHE_REPLY");
+        env::set_var("HALOGEN_PROMPT_CACHE", "1");
+        assert_eq!(cache_gib("4", "262144"), "2.7");
+        // A cache file zeroes the whole figure.
+        env::set_var("HALOGEN_CACHE_FILE", "/var/tmp/halogen-cache.snapshot");
+        assert_eq!(cache_gib("4", "262144"), "0.0");
+        // An explicit entry count bypasses the derivation.
+        env::remove_var("HALOGEN_CACHE_FILE");
+        env::remove_var("HALOGEN_PROMPT_CACHE");
+        env::set_var("HALOGEN_CACHE_ENTRIES", "10");
+        assert_eq!(cache_gib("4", "262144"), "1.1");
+        for (key, value) in previous {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn fe_only_flags_gained_the_0_20_5_entries() {
+        for flag in [
+            "HALOGEN_RENDER_ONCE",
+            "HALOGEN_TOKENIZE_SPLIT",
+            "HALOGEN_TOOL_NONE_MASK",
+            "HALOGEN_TOKENIZER_NATIVE",
+            "HALOGEN_FORK_UNMATCHED_RELEASE",
+            "HALOGEN_AGENT_GUARD",
+            "HALOGEN_MODEL_NAME_CHECK",
+        ] {
+            assert!(FE_ONLY_FLAGS.contains(&flag), "{flag} missing");
+        }
+    }
+
+    #[test]
+    fn npu_pin_files_parses_the_record_for_one_id() {
+        let record = "model decider-4b repo=x task=decision\n\
+                      file decider-4b devices/devices.hnpm 62341 c58e\n\
+                      file decider-4b vis/devices.hnpm 100 abcd\n\
+                      file other-id devices/devices.hnpm 1 2\n\
+                      file decider-4b decider-4b.hnpw 5692927608 b4bb";
+        let pins = npu_pin_files(record, "decider-4b");
+        assert_eq!(pins.len(), 3);
+        assert_eq!(pins[0].path, "devices/devices.hnpm");
+        assert_eq!(pins[0].size, 62341);
+        assert_eq!(pins[2].path, "decider-4b.hnpw");
+    }
+
+    #[test]
+    fn npu_part_devices_now_includes_vis_and_aud_pins() {
+        let pins = npu_pin_files(
+            "file m devices/devices.hnpm 1 a\nfile m vis/devices.hnpm 2 b\n\
+             file m aud/devices.hnpm 3 c\nfile m m.hnpw 4 d\n\
+             file m tokenizer/tokenizer.json 5 e",
+            "m",
+        );
+        let devices: Vec<&str> = npu_part_pins("devices", &pins)
+            .iter()
+            .map(|pin| pin.path.as_str())
+            .collect();
+        assert_eq!(
+            devices,
+            [
+                "devices/devices.hnpm",
+                "vis/devices.hnpm",
+                "aud/devices.hnpm"
+            ]
+        );
+        assert_eq!(npu_part_pins("vis", &pins).len(), 1);
+        assert_eq!(npu_part_pins("aud", &pins).len(), 1);
+    }
+
+    #[test]
+    fn npu_part_paths_covers_the_new_vis_and_aud_fallbacks() {
+        let empty: Vec<&NpuPin> = Vec::new();
+        assert_eq!(
+            npu_part_paths("vis", "m", &empty, true, false, "m"),
+            ["vis/devices.hnpm"]
+        );
+        assert_eq!(
+            npu_part_paths("aud", "m", &empty, true, false, "m"),
+            ["aud/devices.hnpm"]
+        );
+        assert_eq!(
+            npu_part_paths("devices", "m", &empty, true, false, "m"),
+            ["devices/devices.hnpm"]
+        );
+        assert_eq!(
+            npu_part_paths("all", "m", &empty, true, false, "base"),
+            ["m.hnpw", "tokenizer/tokenizer.json"]
+        );
+        assert_eq!(
+            npu_part_paths("all", "m", &empty, true, false, "m"),
+            ["devices/devices.hnpm", "m.hnpw", "tokenizer/tokenizer.json"]
+        );
+    }
+
+    #[test]
+    fn npu_elf_error_reports_the_exact_vis_and_aud_messages() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("elf-fixture-{}", process::id()));
+        fs::create_dir_all(root.join("vis")).expect("vis dir");
+        fs::create_dir_all(root.join("aud")).expect("aud dir");
+        let d = root.display().to_string();
+        // Empty directories → the exact 0.20.5 messages.
+        assert_eq!(
+            npu_elf_error("vis", "m", &d, false).expect("vis error"),
+            format!("halogen npu: m: {d}/vis/ holds no .elf file (the NPU's program for the model's vision tower)")
+        );
+        assert_eq!(
+            npu_elf_error("aud", "m", &d, false).expect("aud error"),
+            format!("halogen npu: m: {d}/aud/ holds no .elf file (the NPU's program for the model's audio encoder)")
+        );
+        fs::write(root.join("vis").join("u0.elf"), "x").expect("elf file");
+        assert_eq!(npu_elf_error("vis", "m", &d, false), None);
+        // A part with no check needed → None.
+        assert_eq!(npu_elf_error("all", "m", &d, false), None);
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn npu_convert_flags_appends_vis_and_aud() {
+        assert_eq!(npu_convert_flags(None, None), Vec::<String>::new());
+        assert_eq!(
+            npu_convert_flags(Some("/models/npu/b/vis"), None),
+            ["--vis", "/models/npu/b/vis"]
+        );
+        assert_eq!(
+            npu_convert_flags(Some("/models/npu/b/vis"), Some("/models/npu/a/aud")),
+            ["--vis", "/models/npu/b/vis", "--aud", "/models/npu/a/aud"]
+        );
+    }
+
+    #[test]
+    fn npu_vis_need_k_sums_the_vis_directory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("vis-needk-{}", process::id()));
+        fs::create_dir_all(root.join("vis")).expect("vis dir");
+        fs::write(root.join("vis").join("devices.hnpm"), vec![0u8; 2048]).expect("file");
+        fs::write(root.join("vis").join("u0.elf"), vec![0u8; 1024]).expect("file");
+        assert_eq!(npu_vis_need_k(&root.display().to_string()), 3);
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn npu_xrt_own_is_data_driven_about_the_record() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("xrt-fixture-{}", process::id()));
+        fs::create_dir_all(&root).expect("fixture dir");
+        // Missing record → 0 (the vendored package's live path).
+        assert_eq!(
+            npu_xrt_own(
+                &root.join("missing.sha256").display().to_string(),
+                &root.display().to_string(),
+                "sha256sum"
+            ),
+            0
+        );
+        // Record present but the library missing → still 0.
+        fs::write(root.join("xrt.sha256"), "aa libxrt_coreutil.so.2\n").expect("record");
+        assert_eq!(
+            npu_xrt_own(
+                &root.join("xrt.sha256").display().to_string(),
+                &root.display().to_string(),
+                "sha256sum"
+            ),
+            0
+        );
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn npu_xrt_own_counts_a_hash_match() {
+        // Fixture inside the crate's `.tmp/`: hash a real file with the same
+        // helper the entrypoint uses, then check the record against it.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".tmp")
+            .join(format!("xrt-match-{}", process::id()));
+        fs::create_dir_all(&root).expect("fixture dir");
+        fs::write(root.join("libxrt_coreutil.so.2"), "xrt contents").expect("lib file");
+        let hash = Command::new("sha256sum")
+            .arg(root.join("libxrt_coreutil.so.2"))
+            .output()
+            .expect("sha256sum")
+            .stdout;
+        let hash = String::from_utf8(hash).expect("utf8");
+        let hash = hash.split_whitespace().next().expect("hash").to_string();
+        fs::write(
+            root.join("xrt.sha256"),
+            format!("{hash} libxrt_coreutil.so.2\n"),
+        )
+        .expect("record");
+        assert_eq!(
+            npu_xrt_own(
+                &root.join("xrt.sha256").display().to_string(),
+                &root.display().to_string(),
+                "sha256sum"
+            ),
+            1
+        );
+        fs::remove_dir_all(&root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn npu_xrt_mixed_and_naming_follow_the_0_20_5_rules() {
+        assert!(npu_xrt_mixed_error(0, "2.25").is_none());
+        assert!(npu_xrt_mixed_error(3, "2.25").is_none());
+        assert_eq!(
+            npu_xrt_mixed_error(2, "2.25").expect("mixed"),
+            "halogen npu: /opt/xilinx/xrt/lib mixes a host's XRT libraries with this image's XRT 2.25. Mount all three of them, or none: with no mount the image uses its own."
+        );
+        assert_eq!(
+            npu_xrt_name("2.25", 3, "whatever"),
+            "XRT 2.25 (this image's)"
+        );
+        // bash strips only the full `libxrt_coreutil.so.` prefix; a name
+        // without a dot after that keeps the whole name as the "version".
+        assert_eq!(
+            npu_xrt_name("", 0, "libxrt_coreutil.so.2.25"),
+            "XRT 2.25 (the host's)"
+        );
+        assert_eq!(
+            npu_xrt_name("", 0, "libxrt_coreutil"),
+            "the host's XRT (its version is not in the mounted file's name)"
+        );
+    }
+
+    #[test]
+    fn npu_kill_s_validation_follows_the_reference_case() {
+        // `:-` semantics: a set-but-empty value also takes the default
+        // (bash's `''` case is unreachable once the default substituted).
+        assert_eq!(parse_npu_kill_s(None), Ok(1800)); // unset → `:-1800`
+        assert_eq!(parse_npu_kill_s(Some(String::new())), Ok(1800));
+        assert_eq!(parse_npu_kill_s(Some("60".to_string())), Ok(60));
+        assert_eq!(parse_npu_kill_s(Some("0".to_string())), Ok(0));
+        assert_eq!(
+            parse_npu_kill_s(Some("abc".to_string())),
+            Err(
+                "halogen npu: HALOGEN_NPU_KILL_S=abc is not a number of seconds (0 = off)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_running_ms_extracts_the_field() {
+        assert_eq!(
+            parse_running_ms(r#"{"running_ms":12345,"x":1}"#),
+            Some(12345)
+        );
+        assert_eq!(parse_running_ms(r#"{"other":1}"#), None);
+        assert_eq!(parse_running_ms(r#"{"running_ms":}"#), None);
+        assert_eq!(parse_running_ms(r#"{"running_ms":9z}"#), Some(9));
+    }
+
+    #[test]
+    fn npu_floor_backoff_doubles_to_the_cap() {
+        assert!(npu_floor_exit(76));
+        assert!(!npu_floor_exit(1));
+        assert_eq!(npu_room_s(0, 30), 30);
+        assert_eq!(npu_room_s(30, 30), 60);
+        assert_eq!(npu_room_s(240, 30), 300);
+        assert_eq!(npu_room_s(300, 30), 300);
+        // The floor notice names the doubled delay.
+        assert_eq!(
+            npu_floor_notice(60),
+            "halogen npu: the host is under the NPU engine's memory floor (HALOGEN_NPU_HOST_FLOOR_GIB; its line is above): trying again in 60 s, until there is room. Its routes answer 503 until then and the Flash engine serves on"
+        );
     }
 }
