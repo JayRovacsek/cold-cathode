@@ -30,8 +30,10 @@ pub mod xrt;
 /// Main usage, verbatim (316-byte embedded string, `fwrite` in `main` [D]).
 const MAIN_USAGE: &str = "usage: halogen-npu selftest bf16|norm|head|resid ... | replay DIR [REPS] | serve DEVICES_DIR WEIGHTS [ORDER] [--model DEVICES_DIR WEIGHTS]... | listen DEVICES_DIR WEIGHTS HOST:PORT [ORDER] [--model DEVICES_DIR WEIGHTS]... | probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale]\n";
 
-/// `probe`/`convert` sub-usage, verbatim (170-byte embedded string [D]).
-const PROBE_USAGE: &str = "usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]\n";
+/// `probe`/`convert` sub-usage, verbatim (v0.20.5 embedded string, probed
+/// against the reference; the 0.18.21 form lacked the `--vis`/`--aud`
+/// groups).
+const PROBE_USAGE: &str = "usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--vis DIR (a vision tower's set)] [--aud DIR (a speech encoder's set)] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]\n";
 
 /// `flux` sub-usage, verbatim [S].
 const FLUX_USAGE: &str = "usage: halogen-npu flux noise SEED RES OUT | taef2 TAEF2 Z H W OUT_RGB [OUT_F32] | dit DEVDIR WEIGHTS RES STEP X CTX OUT [REPS] | image DEVDIR WEIGHTS RES SEED CTX OUT_RGB [OUT_LATENTS] [REPS] | enc TAEF2 RGB W H OUT_Z | edit DEVDIR WEIGHTS SIZE SEED CTX OUT_RGB [options]\n";
@@ -60,6 +62,196 @@ const CACHE_USAGE: &str = "usage: halogen-npu cache ecopy IN OUT CAP\n";
 
 /// Tail appended to every checkpoint-inspection error [RV].
 const MODEL_TAIL: &str = "; the NPU serves fine-tunes of Qwen3.5-0.8B and 4B (decision; the 4B size also as an embedding model), Qwen3-Embedding-0.6B and 4B (embedding), Qwen3-Reranker-0.6B and 4B (rerank) and Qwen3Guard-Gen-0.6B (moderation)";
+
+// ---------------------------------------------------------------------------
+// v0.20.5 speech-out (aout) additions — CLI/env-visible plumbing only. The
+// codec numerics are out of scope (objectives O36–O38); the port accepts,
+// validates and stores exactly what the reference reads.
+// ---------------------------------------------------------------------------
+
+/// `strtol(v, NULL, 10)` semantics — the grammar the port applies to every
+/// numeric `HALOGEN_NPU_*` flag (matching the established numeric env
+/// parsing in `cc-flash-serve`): leading whitespace, optional sign, leading
+/// digits; no digits yields 0; overflow clamps to `i64::MIN`/`i64::MAX`.
+fn npu_num(value: &str) -> i64 {
+    let trimmed = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let end = digits.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if end == 0 {
+        return 0;
+    }
+    let magnitude: i128 = digits[..end].parse().unwrap_or(i128::MAX);
+    if negative {
+        if -magnitude < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            -magnitude as i64
+        }
+    } else if magnitude > i64::MAX as i128 {
+        i64::MAX
+    } else {
+        magnitude as i64
+    }
+}
+
+/// The v0.20.5 speech-out (aout) flags (O36, plumbing only). Defaults and
+/// clamps mirror the reference's reads: every numeric flag is `strtol`-
+/// parsed with an empty value treated as unset; `CHUNK` and
+/// `CODEC_THREADS` default 4, `FIRST` 1, `THREADS` 16, `FRAMES` 0; a set
+/// value clamps to 1 when non-positive (`FRAMES` excepted, stored as-is);
+/// `DUMP` is a string (the dump file prefix, stored directly).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AoutFlags {
+    pub chunk: i64,
+    pub first: i64,
+    pub frames: i64,
+    pub threads: i64,
+    pub codec_threads: i64,
+    pub dump: String,
+}
+
+/// The reference's empty-string check after getenv: an empty value counts
+/// as unset for every numeric aout flag.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
+}
+
+impl AoutFlags {
+    /// Parse from the six raw values (`None` = unset). Split from
+    /// [`AoutFlags::from_env`] so the grammar is testable without racing
+    /// the process environment.
+    pub fn parse(
+        chunk: Option<&str>,
+        first: Option<&str>,
+        frames: Option<&str>,
+        threads: Option<&str>,
+        codec_threads: Option<&str>,
+        dump: Option<&str>,
+    ) -> Self {
+        let clamped = |v: Option<&str>, default: i64| match non_empty(v) {
+            Some(v) => npu_num(v).max(1),
+            None => default,
+        };
+        Self {
+            chunk: clamped(chunk, 4),
+            first: clamped(first, 1),
+            frames: non_empty(frames).map_or(0, npu_num),
+            threads: clamped(threads, 16),
+            codec_threads: clamped(codec_threads, 4),
+            dump: dump.unwrap_or_default().to_string(),
+        }
+    }
+
+    /// Read the six aout flags from the environment (the engine paths that
+    /// consume them are XRT-gated; the port stops at validation).
+    pub fn from_env() -> Self {
+        Self::parse(
+            env::var("HALOGEN_NPU_AOUT_CHUNK").ok().as_deref(),
+            env::var("HALOGEN_NPU_AOUT_FIRST").ok().as_deref(),
+            env::var("HALOGEN_NPU_AOUT_FRAMES").ok().as_deref(),
+            env::var("HALOGEN_NPU_AOUT_THREADS").ok().as_deref(),
+            env::var("HALOGEN_NPU_AOUT_CODEC_THREADS").ok().as_deref(),
+            env::var("HALOGEN_NPU_AOUT_DUMP").ok().as_deref(),
+        )
+    }
+}
+
+/// v0.20.5 [S] media-request validation errors (O38). The malformed-
+/// soundtrack/clip messages are prefixes: the reference appends the
+/// offending entry's id after the trailing space.
+const MEDIA_MALFORMED: &str = "a malformed media request";
+const SOUNDTRACK_MALFORMED: &str = "a malformed soundtrack in ";
+const CLIP_MALFORMED: &str = "a malformed audio clip in ";
+const CLIP_NOT_BASE64: &str = "an audio clip is not base64";
+
+/// Validate one speech-out media request (v0.20.5 [S] plumbing, O38; the
+/// codec numerics are out of scope). The request is a flat list of words:
+/// an audio clip is `a ID START BASE64`, a soundtrack is `as ID COUNT
+/// v1 v2 ... BASE64` (COUNT span values, per the v0.20.5 client grammar).
+/// Error paths: an empty request or unknown entry kind → the request
+/// itself is malformed; a truncated soundtrack → malformed soundtrack; a
+/// truncated clip → malformed audio clip; a payload outside the base64
+/// alphabet → not base64.
+pub fn validate_media_request(words: &[&str]) -> Result<(), String> {
+    if words.is_empty() {
+        return Err(MEDIA_MALFORMED.to_string());
+    }
+    let mut i = 0;
+    while i < words.len() {
+        let id = words.get(i + 1).copied().unwrap_or("");
+        match words[i] {
+            "a" => {
+                // a ID START BASE64
+                if i + 4 > words.len() {
+                    return Err(format!("{CLIP_MALFORMED}{id}"));
+                }
+                if !is_base64(words[i + 3]) {
+                    return Err(CLIP_NOT_BASE64.to_string());
+                }
+                i += 4;
+            }
+            "as" => {
+                // as ID COUNT (COUNT values) BASE64
+                let Some(count) = words.get(i + 2).and_then(|v| v.parse::<usize>().ok()) else {
+                    return Err(format!("{SOUNDTRACK_MALFORMED}{id}"));
+                };
+                // A huge count must not overflow the bound check; an
+                // out-of-range end is just a truncated soundtrack.
+                let Some(end) = count.checked_add(i + 4) else {
+                    return Err(format!("{SOUNDTRACK_MALFORMED}{id}"));
+                };
+                if end > words.len() {
+                    return Err(format!("{SOUNDTRACK_MALFORMED}{id}"));
+                }
+                if !is_base64(words[end - 1]) {
+                    return Err(CLIP_NOT_BASE64.to_string());
+                }
+                i = end;
+            }
+            _ => return Err(MEDIA_MALFORMED.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Standard-alphabet base64 check (non-empty, `A-Za-z0-9+/` with optional
+/// `=` padding, length a multiple of 4).
+fn is_base64(value: &str) -> bool {
+    !value.is_empty()
+        && value.len().is_multiple_of(4)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// v0.20.5 [S] the weights stamp written by `convert` (O37): version 1,
+/// staged through `<OUT>.stamp.tmp` and renamed to `<OUT>.stamp`.
+const WEIGHTS_STAMP: &str = "1\n";
+
+/// v0.20.5 [S] warning when the stamp cannot be written (O37); `%s` is
+/// replaced with the stamp path (the reference prints it to stdout with
+/// `printf`).
+const STAMP_WRITE_WARN: &str =
+    "halogen-npu convert: could not write %s, so the next start converts again\n";
+
+/// v0.20.5 [S] write the weights stamp (version 1) for OUT (O37): staged
+/// through `<OUT>.stamp.tmp` and renamed to `<OUT>.stamp`; a failed write
+/// removes the temp file and yields the warning text (the reference's
+/// printf), leaving the convert exit code unaffected either way.
+fn write_weights_stamp(out: &str) -> Option<String> {
+    let stamp = format!("{out}.stamp");
+    let tmp = format!("{stamp}.tmp");
+    match fs::write(&tmp, WEIGHTS_STAMP).and_then(|()| fs::rename(&tmp, &stamp)) {
+        Ok(()) => None,
+        Err(_) => {
+            let _ = fs::remove_file(&tmp);
+            Some(STAMP_WRITE_WARN.replace("%s", &stamp))
+        }
+    }
+}
 
 /// Entry point: `argv` includes `argv[0]` (the program path as invoked);
 /// returns the process exit code.
@@ -211,8 +403,8 @@ fn devices_manifest(dir: &str) -> i32 {
 }
 
 /// `probe MODEL_DIR` / `convert MODEL_DIR DEVICES_DIR OUT [--name ID]
-/// [--source SRC] [--if-stale] [--fold FILE --enc FILE --tokenizer FILE]` —
-/// shared handler `FUN_0022f180` [D].
+/// [--source SRC] [--if-stale] [--vis DIR] [--aud DIR] [--fold FILE --enc
+/// FILE --tokenizer FILE]` — shared handler `FUN_0022f180` [D].
 fn probe_convert(argv: &[String]) -> i32 {
     if argv[1] == "probe" {
         // [D] `probe DIR` (argc == 3) inspects DIR; `probe` alone and
@@ -224,14 +416,58 @@ fn probe_convert(argv: &[String]) -> i32 {
     }
     // convert: needs MODEL_DIR DEVICES_DIR OUT (argc >= 5) else sub-usage 1
     // [RV]/[D] (`convert /nonexistent` → sub-usage; the handler requires
-    // param_1 > 3, i.e. argc >= 5). Optional flags from argv[4..]
-    // (--name/--source/--fold/--enc/--tokenizer take values, --if-stale is
-    // boolean) are parsed by the reference [D]; the port accepts and ignores
-    // them (their error wording is not part of the documented contract).
+    // param_1 > 3, i.e. argc >= 5). Optional flags from argv[5..] are
+    // parsed by the reference (v0.20.5 probes): --name/--source/--vis/
+    // --aud/--fold/--enc/--tokenizer take one value, --if-stale is boolean;
+    // a value-taking flag without its value, an unknown flag or an extra
+    // positional yields the unknown-argument error, exit 2.
     if argv.len() < 5 {
         return usage(PROBE_USAGE, 1);
     }
-    inspect_model(&argv[2])
+    if let Some(arg) = convert_unknown_argument(argv, 5) {
+        return usage(
+            &format!("halogen-npu: convert: unknown argument {arg}\n"),
+            2,
+        );
+    }
+    // v0.20.5 [S] stamping (O37): the weights stamp (version 1) for OUT is
+    // written only when the conversion proceeds — the reference emits no
+    // stamp output when the checkpoint inspection fails (probed), so the
+    // stamp write follows a successful inspection (the conversion itself is
+    // XRT-gated); a failed write only warns, the exit code is unchanged.
+    let code = inspect_model(&argv[2]);
+    if code != 0 {
+        return code;
+    }
+    if let Some(warning) = write_weights_stamp(&argv[4]) {
+        print!("{warning}");
+    }
+    code
+}
+
+/// Convert flag grammar (v0.20.5): `--name`/`--source`/`--vis`/`--aud`/
+/// `--fold`/`--enc`/`--tokenizer` take one value each, `--if-stale` is
+/// boolean. Returns the offending argument when a value-taking flag is
+/// missing its value, an unknown flag or an extra positional appears (the
+/// reference reports `halogen-npu: convert: unknown argument <arg>`,
+/// exit 2; probed against the v0.20.5 reference with the xrt-stub).
+fn convert_unknown_argument(argv: &[String], start: usize) -> Option<&str> {
+    let mut i = start;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        match arg {
+            "--if-stale" => i += 1,
+            "--name" | "--source" | "--vis" | "--aud" | "--fold" | "--enc" | "--tokenizer" => {
+                // A missing value counts as the unknown argument itself.
+                if i + 1 >= argv.len() {
+                    return Some(arg);
+                }
+                i += 2;
+            }
+            _ => return Some(arg),
+        }
+    }
+    None
 }
 
 /// Checkpoint inspection (`FUN_001fad90`): every documented form exits 2 —
@@ -423,5 +659,264 @@ mod tests {
         let cleanup = fs::remove_dir_all(&dir);
         assert_eq!(code, 0);
         cleanup.expect("clean up scratch dir");
+    }
+
+    // -- v0.20.5 speech-out (aout) plumbing (O36–O38) ---------------------
+
+    #[test]
+    fn aout_flags_default_to_the_reference_values_when_unset() {
+        // Defaults read from the v0.20.5 binary: CHUNK/CODEC_THREADS 4,
+        // FIRST 1, THREADS 16, FRAMES 0, DUMP unset → empty.
+        let flags = AoutFlags::parse(None, None, None, None, None, None);
+        assert_eq!(flags.chunk, 4);
+        assert_eq!(flags.first, 1);
+        assert_eq!(flags.frames, 0);
+        assert_eq!(flags.threads, 16);
+        assert_eq!(flags.codec_threads, 4);
+        assert_eq!(flags.dump, "");
+    }
+
+    #[test]
+    fn aout_flags_parse_the_strtol_grammar() {
+        // strtol(v, NULL, 10): whitespace, sign and leading digits; a
+        // trailing junk suffix is ignored.
+        let flags = AoutFlags::parse(
+            Some("12"),
+            Some(" 7 "),
+            Some("+3"),
+            Some("9abc"),
+            Some("8"),
+            None,
+        );
+        assert_eq!(flags.chunk, 12);
+        assert_eq!(flags.first, 7);
+        assert_eq!(flags.frames, 3);
+        assert_eq!(flags.threads, 9);
+        assert_eq!(flags.codec_threads, 8);
+    }
+
+    #[test]
+    fn aout_flags_clamp_non_positive_values_to_one() {
+        // A set value <= 0 clamps to 1; FRAMES is stored as-is.
+        let flags = AoutFlags::parse(
+            Some("0"),
+            Some("-2"),
+            Some("-3"),
+            Some("0"),
+            Some("-1"),
+            None,
+        );
+        assert_eq!(flags.chunk, 1);
+        assert_eq!(flags.first, 1);
+        assert_eq!(flags.frames, -3);
+        assert_eq!(flags.threads, 1);
+        assert_eq!(flags.codec_threads, 1);
+    }
+
+    #[test]
+    fn aout_flags_treat_empty_values_as_unset() {
+        // The reference's empty-string check after getenv.
+        let flags = AoutFlags::parse(Some(""), Some(""), Some(""), Some(""), Some(""), Some(""));
+        assert_eq!(flags, AoutFlags::parse(None, None, None, None, None, None));
+    }
+
+    #[test]
+    fn aout_flags_overflow_clamps_to_i64_max() {
+        let flags = AoutFlags::parse(
+            Some("99999999999999999999999"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(flags.chunk, i64::MAX);
+    }
+
+    #[test]
+    fn aout_dump_is_a_string() {
+        let flags = AoutFlags::parse(None, None, None, None, None, Some("/var/tmp/aout.bin"));
+        assert_eq!(flags.dump, "/var/tmp/aout.bin");
+    }
+
+    #[test]
+    fn media_request_accepts_a_clip_and_a_soundtrack() {
+        assert!(validate_media_request(&["a", "1", "0", "aGVsbG8="]).is_ok());
+        // as ID COUNT v1 v2 BASE64 (COUNT = 2 span values).
+        assert!(validate_media_request(&["as", "2", "2", "10", "20", "aGVsbG8="]).is_ok());
+    }
+
+    #[test]
+    fn media_request_rejects_an_unknown_entry_kind() {
+        assert_eq!(
+            validate_media_request(&[]),
+            Err(MEDIA_MALFORMED.to_string())
+        );
+        assert_eq!(
+            validate_media_request(&["zz", "1"]),
+            Err(MEDIA_MALFORMED.to_string())
+        );
+    }
+
+    #[test]
+    fn media_request_rejects_a_truncated_audio_clip() {
+        // a ID START BASE64 — the payload is missing.
+        assert_eq!(
+            validate_media_request(&["a", "3", "0"]),
+            Err(format!("{CLIP_MALFORMED}3"))
+        );
+    }
+
+    #[test]
+    fn media_request_rejects_a_truncated_soundtrack() {
+        // as ID COUNT ... BASE64 — COUNT = 2 values but only one arrives.
+        assert_eq!(
+            validate_media_request(&["as", "4", "2", "10", "aGVsbG8="]),
+            Err(format!("{SOUNDTRACK_MALFORMED}4"))
+        );
+    }
+
+    #[test]
+    fn media_request_rejects_a_huge_soundtrack_count_without_overflow() {
+        // A count past usize::MAX - i - 4 must yield the malformed error,
+        // not an overflow panic.
+        assert_eq!(
+            validate_media_request(&["as", "1", "18446744073709551615", "aGVsbG8="]),
+            Err(format!("{SOUNDTRACK_MALFORMED}1"))
+        );
+    }
+
+    #[test]
+    fn media_request_rejects_a_non_base64_payload() {
+        assert_eq!(
+            validate_media_request(&["a", "1", "0", "not base64!"]),
+            Err(CLIP_NOT_BASE64.to_string())
+        );
+    }
+
+    #[test]
+    fn convert_writes_the_weights_stamp_via_a_temp_file() {
+        // The stamp file for OUT holds version 1; the temp file is consumed
+        // by the rename.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp")
+            .join("cc-halogen-npu-stamp");
+        fs::create_dir_all(&dir).expect("create .tmp scratch dir");
+        let out = dir.join("converted.hnpm");
+        assert_eq!(write_weights_stamp(out.to_str().unwrap()), None);
+        assert_eq!(
+            fs::read_to_string(dir.join("converted.hnpm.stamp")).expect("stamp file"),
+            "1\n"
+        );
+        assert!(fs::File::open(dir.join("converted.hnpm.stamp.tmp")).is_err());
+        fs::remove_dir_all(&dir).expect("clean up scratch dir");
+    }
+
+    #[test]
+    fn convert_warns_when_the_stamp_cannot_be_written() {
+        // Unwritable OUT → the byte-exact warning (with the stamp path
+        // substituted for %s); the exit code stays the documented 2.
+        let warning = write_weights_stamp("/nonexistent-dir/out").expect("warning");
+        assert_eq!(
+            warning,
+            "halogen-npu convert: could not write /nonexistent-dir/out.stamp, so the next start converts again\n"
+        );
+        assert_eq!(
+            run(&argv(&[
+                "convert",
+                "/nonexistent",
+                "/nonexistent",
+                "/nonexistent-dir/out"
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    fn probe_usage_matches_the_v0_20_5_reference_string() {
+        // Byte-exact v0.20.5 sub-usage (probed against the reference; the
+        // 0.18.21 form lacked the --vis/--aud groups).
+        assert_eq!(
+            PROBE_USAGE,
+            "usage: halogen-npu probe MODEL_DIR | convert MODEL_DIR DEVICES_DIR OUT [--name ID] [--source SRC] [--if-stale] [--vis DIR (a vision tower's set)] [--aud DIR (a speech encoder's set)] [--fold FILE --enc FILE --tokenizer FILE (a speech model)]\n"
+        );
+    }
+
+    /// Runs the convert flag grammar over the arguments after the three
+    /// positionals (`convert A B C` = argv[1..5], program name included).
+    fn convert_flags(args: &[&str]) -> Option<String> {
+        let mut argv = argv(&["convert", "A", "B", "C"]);
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        convert_unknown_argument(&argv, 5).map(str::to_string)
+    }
+
+    #[test]
+    fn convert_accepts_the_vis_and_aud_flags() {
+        assert_eq!(convert_flags(&["--vis", "X"]), None);
+        assert_eq!(convert_flags(&["--aud", "Y"]), None);
+        assert_eq!(convert_flags(&["--vis", "X", "--aud", "Y"]), None);
+        assert_eq!(convert_flags(&["--aud", "Y", "--vis", "X"]), None);
+        // Combined with the other flags (probed combo).
+        assert_eq!(
+            convert_flags(&[
+                "--name",
+                "N",
+                "--vis",
+                "X",
+                "--aud",
+                "Y",
+                "--if-stale",
+                "--source",
+                "S"
+            ]),
+            None
+        );
+        // The reference still proceeds to the checkpoint inspection.
+        assert_eq!(
+            run(&argv(&[
+                "convert",
+                "/nonexistent",
+                "/nonexistent",
+                "/nonexistent-dir/out",
+                "--vis",
+                "X",
+                "--aud",
+                "Y"
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    fn convert_rejects_vis_or_aud_without_a_value() {
+        // Each takes one DIR; a missing value yields the unknown-argument
+        // error naming the flag (probed).
+        assert_eq!(convert_flags(&["--vis"]), Some("--vis".to_string()));
+        assert_eq!(convert_flags(&["--aud"]), Some("--aud".to_string()));
+        assert_eq!(
+            convert_flags(&["--vis", "X", "--aud"]),
+            Some("--aud".to_string())
+        );
+    }
+
+    #[test]
+    fn convert_rejects_unknown_flags_and_extra_positionals() {
+        assert_eq!(convert_flags(&["--bogus"]), Some("--bogus".to_string()));
+        assert_eq!(convert_flags(&["extra"]), Some("extra".to_string()));
+    }
+
+    #[test]
+    fn convert_accepts_if_stale_and_the_existing_value_flags() {
+        assert_eq!(convert_flags(&["--if-stale"]), None);
+        assert_eq!(convert_flags(&["--name", "X"]), None);
+        assert_eq!(convert_flags(&["--source", "X"]), None);
+        assert_eq!(
+            convert_flags(&["--fold", "F", "--enc", "E", "--tokenizer", "T"]),
+            None
+        );
+        assert_eq!(
+            convert_flags(&["--tokenizer"]),
+            Some("--tokenizer".to_string())
+        );
     }
 }
