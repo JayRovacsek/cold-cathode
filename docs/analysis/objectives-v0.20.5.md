@@ -24,41 +24,45 @@ from these objectives; only their API-visible plumbing is listed.
 
 ## 1. Launcher (`libexec/halogen-entrypoint.sh` → `cc-launcher`)
 
-- [ ] **O1 — `HALOGEN_AGENT_GUARD` mode parsing.** Accept `off`/`watch`/`hold`
+- [x] **O1 — `HALOGEN_AGENT_GUARD` mode parsing.** Accept `off`/`watch`/`hold`
       (case-insensitive, plus `0`/`false`/`no`/`none`); `watch` injects
       `halogen-spotter-0.6b` into `HALOGEN_NPU_MODELS`, `hold` also injects
       `decider-4b`; an unknown mode exits 1 with the exact notice.
       Evidence: `entrypoint.diff` L7–26.
-- [ ] **O2 — Reply-cache memory accounting.** `cache_gib` counts one extra
+- [x] **O2 — Reply-cache memory accounting.** `cache_gib` counts one extra
       cache entry per slot for the reply-end cache when
       `HALOGEN_PROMPT_CACHE != 1` and `HALOGEN_CACHE_REPLY` is unset.
       Evidence: `entrypoint.diff` L36.
-- [ ] **O3 — New `FE_ONLY_FLAGS` entries.** Strip `HALOGEN_RENDER_ONCE`,
+- [x] **O3 — New `FE_ONLY_FLAGS` entries.** Strip `HALOGEN_RENDER_ONCE`,
       `HALOGEN_TOKENIZE_SPLIT`, `HALOGEN_TOOL_NONE_MASK`,
       `HALOGEN_TOKENIZER_NATIVE`, `HALOGEN_FORK_UNMATCHED_RELEASE`,
       `HALOGEN_AGENT_GUARD`, `HALOGEN_MODEL_NAME_CHECK` from the engine
       environment. Evidence: `entrypoint.diff` L71–77.
-- [ ] **O4 — IPv6 API bind.** Serve with `--host ::` instead of `0.0.0.0`
+- [x] **O4 — IPv6 API bind.** Serve with `--host ::` instead of `0.0.0.0`
       in all serve modes. Evidence: `entrypoint.diff` L108, 464, 494.
-- [ ] **O5 — `vis`/`aud` NPU download parts.** `npu_model_ready` gains
+- [x] **O5 — `vis`/`aud` NPU download parts.** `npu_model_ready` gains
       vision/audio part types with their own `devices.hnpm`/`.elf` checks
       and `NPU_NEED_K` accounting; `npu_finetune_ready` passes `--vis`/
       `--aud` to convert. Evidence: `entrypoint.diff` L133–176, 194–217.
-- [ ] **O6 — Bundled-XRT handling (`npu_xrt_own`).** Verify the three XRT
+- [x] **O6 — Bundled-XRT handling (`npu_xrt_own`).** Verify the three XRT
       libs against `npu/xrt.sha256`, refuse mixed host/image mounts, name
       "this image's XRT" at startup. Note: the vendored package does not
       ship `/opt/xilinx/xrt`, so implement the host-mount fallback path.
       Evidence: `entrypoint.diff` L223–273.
-- [ ] **O7 — NPU stall watchdog (`HALOGEN_NPU_KILL_S`).** Background poller
+- [x] **O7 — NPU stall watchdog (`HALOGEN_NPU_KILL_S`).** Background poller
       reads `running_ms` via `INFO 0`; a job holding the NPU past the
       limit (default 1800 s) gets TERM→KILL and a restart; D-state threads
       defer the kill; pidfile `/tmp/halogen-npu.pid`. Evidence:
       `entrypoint.diff` L360–408.
-- [ ] **O8 — Host-floor backoff restart (rc 76).** A memory-floor exit costs
+- [x] **O8 — Host-floor backoff restart (rc 76).** A memory-floor exit costs
       no restart count; retries back off 30 s → 300 s doubling
       (`NPU_PAUSED`, `NPU_ROOM_S`). Evidence: `entrypoint.diff` L439–448.
 
 ## 2. API front-end (`serve_api.py` → `cc-flash-serve` / contract surface)
+
+> **Status:** satisfied by the vendored v0.20.5 package — plan R4 reuses the
+> Python front-end as data, so these need no Rust port work; the bump already
+> delivered them.
 
 - [ ] **O9 — Agent guard module.** Port `agent_guard.py` (Guard class,
       watch/hold modes, spotter classification: ACT_WORDS, threshold 0.25,
@@ -110,6 +114,10 @@ from these objectives; only their API-visible plumbing is listed.
 
 ## 3. NPU surface (`npu_api.py` / `npu_sets.py` / `models.txt`)
 
+> **Status:** satisfied by the vendored v0.20.5 package — plan R4 reuses the
+> Python front-end and `models.txt` as data, so these need no Rust port work;
+> the bump already delivered them.
+
 - [ ] **O22 — d1-2B media + box/boxes/estimate questions.** `box`
       (5 slots), `boxes` (≤16 instances), `estimate` with range/step grid;
       `d1_media`/`d1_picture`/`d1_video` with vision_start/image/video
@@ -144,26 +152,26 @@ from these objectives; only their API-visible plumbing is listed.
 
 ## 4. Engine-visible flags (`flash_serve` / `halogen-npu` strings)
 
-- [ ] **O32 — Reply-end cache bookkeeping (API-visible part).** Refusal and
+- [x] **O32 — Reply-end cache bookkeeping (API-visible part).** Refusal and
       drop reasons ("a reply-end entry", "dropped: its history",
       "req %ld reply entry: …") and the prompt-cache budget line
       `…+ %d reply]`. KV internals stay out of scope.
       Evidence: `strings-new-only-flash_serve.txt`.
-- [ ] **O33 — Think-block end-of-turn close (API-visible part).**
+- [x] **O33 — Think-block end-of-turn close (API-visible part).**
       `HALOGEN_THINK_EOT_CLOSE` plumbing, "NOCALL needs GUARD".
       Evidence: `strings-new-only-flash_serve.txt`.
-- [ ] **O34 — Answer-guard heading rule flag.** `HALOGEN_ANSWER_GUARD_HEADING`
+- [x] **O34 — Answer-guard heading rule flag.** `HALOGEN_ANSWER_GUARD_HEADING`
       plumbing only. Evidence: `strings-new-only-flash_serve.txt`.
-- [ ] **O35 — KV-pool shortening warning.** "kv pool: request %ld was
+- [x] **O35 — KV-pool shortening warning.** "kv pool: request %ld was
       shortened by the room its region had left…" log behaviour.
       Evidence: `strings-new-only-flash_serve.txt`.
-- [ ] **O36 — NPU speech-out flags (plumbing).** `HALOGEN_NPU_AOUT_{CHUNK,
+- [x] **O36 — NPU speech-out flags (plumbing).** `HALOGEN_NPU_AOUT_{CHUNK,
       FIRST,FRAMES,THREADS,CODEC_THREADS,DUMP}` accepted; codec numerics
       out of scope. Evidence: `newenvs-halogen-npu.txt`.
-- [ ] **O37 — Convert stamping.** "halogen-npu convert: could not write %s,
+- [x] **O37 — Convert stamping.** "halogen-npu convert: could not write %s,
       so the next start converts again" / "weights stamp 1" behaviour.
       Evidence: `strings-new-only-halogen-npu.txt`.
-- [ ] **O38 — Media validation errors.** "a malformed media request/
+- [x] **O38 — Media validation errors.** "a malformed media request/
       soundtrack/audio clip", "an audio clip is not base64" error paths.
       Evidence: `strings-new-only-halogen-npu.txt`.
 
