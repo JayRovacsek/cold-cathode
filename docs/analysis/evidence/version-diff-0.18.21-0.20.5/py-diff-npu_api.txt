@@ -1,0 +1,1778 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/npu_api.py	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/npu_api.py	1970-01-01 10:00:01.000000000 +1000
+@@ -1,6 +1,8 @@
+ # halogen-flash-server: source shipped as-is, comments stripped. The README is the documentation.
+ import asyncio
++import base64
+ import collections
++import contextlib
+ import contextvars
+ import hashlib
+ import io
+@@ -93,6 +95,21 @@
+         return NpuError(503, f"the NPU engine is busy: {why}", "engine_busy")
+     return NpuError(502, f"the NPU engine answered {verb} with: {r[:200]}", "engine_error")
+ 
++def _gen_refused(w):
++    why = " ".join(w[2:])
++    e = _host_low(" ".join(w))
++    if e:
++        return e
++    if why.startswith("not enough NPU memory"):
++        return NpuError(503, why, "npu_memory")
++    if why.startswith("busy"):
++        return NpuError(503, f"the NPU engine is busy: {why}", "engine_busy")
++    if why == "the NPU engine closed the connection":
++        return NpuError(503, why, "engine_unavailable")
++    if why.startswith("a line longer than"):
++        return NpuError(400, f"this request is too long for the NPU engine: {why}", "invalid_request_error")
++    return NpuError(500, f"the NPU engine refused the generation: {why}", "server_error")
++
+ EMB_MEDIA_BYTES = 32 * 1024 * 1024
+ 
+ def _emb_item(x):
+@@ -213,7 +230,7 @@
+         im = im.resize((w, h), Image.BICUBIC)
+     return h, w, im.tobytes()
+ 
+-def image_open(url):
++def image_open(url, max_pixels=None):
+     import base64
+     import binascii
+     import io
+@@ -239,11 +256,14 @@
+     from PIL import Image
+     try:
+         im = Image.open(io.BytesIO(raw))
+-    except Exception:
++    except Exception as e:
++        n = re.search(r"\((\d+) pixels\)", str(e)) if max_pixels and isinstance(e, Image.DecompressionBombError) else None
++        if n:
++            raise _bad(f"the image is {n.group(1)} pixels; the largest taken is {max_pixels} pixels")
+         raise _bad("the image cannot be decoded (PNG, JPEG, WebP, GIF or BMP)")
+     W0, H0 = im.size
+-    if W0 < 1 or H0 < 1 or W0 * H0 > EMB_IMAGE_PIXELS:
+-        raise _bad(f"the image is {W0}x{H0}; the largest taken is {EMB_IMAGE_PIXELS} pixels")
++    if W0 < 1 or H0 < 1 or W0 * H0 > (max_pixels or EMB_IMAGE_PIXELS):
++        raise _bad(f"the image is {W0}x{H0}; the largest taken is {max_pixels or EMB_IMAGE_PIXELS} pixels")
+     try:
+         im.load()
+         return im.convert("RGB")
+@@ -277,6 +297,323 @@
+         im = im.resize((w, h), Image.BICUBIC)
+     return h, w, im.tobytes()
+ 
++D1_PIXELS = 1638400
++D1_PROC = (65536, 16777216)
++D1_VIDEO = (4096, 25165824)
++
++def d1_size(H0, W0, lo, hi, factor=32):
++    if max(H0, W0) > 200 * min(H0, W0):
++        raise _bad(f"the picture is {W0}x{H0}; an aspect ratio over 200 is not taken")
++    h, w = round(H0 / factor) * factor, round(W0 / factor) * factor
++    if h * w > hi:
++        b = math.sqrt(H0 * W0 / hi)
++        h, w = max(factor, math.floor(H0 / b / factor) * factor), max(factor, math.floor(W0 / b / factor) * factor)
++    elif h * w < lo:
++        b = math.sqrt(lo / (H0 * W0))
++        h, w = math.ceil(H0 * b / factor) * factor, math.ceil(W0 * b / factor) * factor
++    return max(factor, h), max(factor, w)
++
++def _media_url(it):
++    if isinstance(it, str):
++        return it
++    if isinstance(it, dict):
++        return it.get("url") or (it.get("image_url") or {}).get("url") or it.get("image")
++    return None
++
++def d1_picture(url, max_tokens):
++    import numpy as np
++    from PIL import Image
++    im = image_open(url)
++    W0, H0 = im.size
++    cap = min(D1_PIXELS, max_tokens * 256)
++    if W0 * H0 > cap:
++        sc = math.sqrt(cap / (W0 * H0))
++        im = im.resize((max(1, int(W0 * sc)), max(1, int(H0 * sc))), Image.BICUBIC)
++        W0, H0 = im.size
++    h, w = d1_size(H0, W0, D1_PROC[0], min(D1_PROC[1], max_tokens * 256))
++    if (w, h) != (W0, H0):
++        im = im.resize((w, h), Image.BICUBIC)
++    return h, w, np.asarray(im, dtype=np.uint8)
++
++def d1_video(item, max_tokens, max_rows, max_frames=768, info=None):
++    import numpy as np
++    from PIL import Image
++    import npu_sets as NS
++    frames, fps = item.get("frames") or item.get("video"), item.get("fps")
++    if not isinstance(frames, list) or len(frames) < 2:
++        raise _bad("a video is {\"type\": \"video\", \"frames\": [2 or more pictures], \"fps\": its frame rate}")
++    if not isinstance(fps, (int, float)) or isinstance(fps, bool) or not (math.isfinite(fps) and fps > 0):
++        raise _bad("a video's `fps` must be a positive number")
++    if len(frames) > 4096:
++        raise _bad("a video takes at most 4096 frames here")
++    ix, times = NS.video_plan(len(frames), float(fps), hi=max_frames)
++    if info is not None:
++        info["starts"] = [ix[i] / round(float(fps), 6) for i in range(0, len(ix), 2)]
++    ims = [image_open(_media_url(frames[i])) for i in ix]
++    W0, H0 = ims[0].size
++    if any(im.size != (W0, H0) for im in ims):
++        raise _bad("a video's frames must all be one size")
++    k = len(ix)
++    h, w = NS.video_size(k, H0, W0, *D1_VIDEO)
++    nt = len(times)
++    while (h // 32) * (w // 32) * nt > max_rows or (h // 16) * (w // 16) > max_tokens:
++        if h <= 32 and w <= 32:
++            raise _bad(f"this video's {nt} temporal frames do not fit the model's {max_rows} tokens")
++        if w >= h and w > 32:
++            w -= 32
++        else:
++            h -= 32
++    out = [np.asarray(im.resize((w, h), Image.BICUBIC) if im.size != (w, h) else im, dtype=np.uint8) for im in ims]
++    if len(out) % 2:
++        out.append(out[-1])
++    return h, w, out, times
++
++VL_PROC = (65536, 16777216)
++
++def vl_picture(url, max_tokens, proc=VL_PROC):
++    import numpy as np
++    from PIL import Image
++    im = image_open(url, OVIS_IMAGE_PIXELS if proc == OVIS_PROC else None)
++    W0, H0 = im.size
++    h, w = d1_size(H0, W0, proc[0], min(proc[1], max_tokens * 256))
++    if (w, h) != (W0, H0):
++        im = im.resize((w, h), Image.BICUBIC)
++    return h, w, np.asarray(im, dtype=np.uint8)
++
++def omni_bounds(starts, tokens):
++    b = [0] + [min(tokens, round(t / OMNI_SECONDS_PER_TOKEN)) for t in starts[1:]] + [tokens]
++    return [max(b[:i + 1]) for i in range(len(b))]
++
++def vl_media(items, max_tokens, max_rows, proc=VL_PROC, max_frames=768, omni=False):
++    out, rows, clips = [], 0, 0
++    if len(items) > 16:
++        raise _bad("a request takes at most 16 pictures and videos")
++    for kind, it in items:
++        if kind == "audio":
++            clips += 1
++            if clips > AUD_MAX_CLIPS:
++                raise _bad(f"a request takes at most {AUD_MAX_CLIPS} audio clips")
++            raw = audio_part(it, "audio")
++            fr, rate, _ch = wav_info(raw)
++            n = audio_tokens(fr, rate)
++            out.append(("audio", n, None, {"wav": raw}))
++            rows += n
++        elif kind == "video":
++            info = {}
++            snd = (it.get("audio") if it.get("audio") is not None else it.get("soundtrack")) if isinstance(it, dict) else None
++            if snd is not None and not omni:
++                raise _bad("a video's soundtrack: this model has no audio encoder")
++            sd = None
++            if snd is not None:
++                sp = ({"type": "input_audio", "input_audio": snd} if isinstance(snd, dict) and "data" in snd
++                      else {"type": "audio_url", "audio_url": snd})
++                raw = audio_part(sp, "video audio")
++                fr, rate, _ch = wav_info(raw)
++                sd = {"wav": raw, "tokens": audio_tokens(fr, rate)}
++            h, w, fr, times = d1_video(it, max_tokens, max(32, max_rows - rows - (sd["tokens"] if sd else 0)), max_frames, info)
++            n = (h // 32) * (w // 32)
++            x = dict(h=h, w=w, frames=fr)
++            if sd:
++                sd["bounds"] = omni_bounds(info["starts"][:len(times)], sd["tokens"])
++                x["sound"] = sd
++            out.append(("video", n, times, x))
++            rows += n * len(times) + (sd["tokens"] if sd else 0)
++        else:
++            url = _media_url(it.get("image_url") if isinstance(it.get("image_url"), (str, dict)) else it) if isinstance(it, dict) else None
++            if isinstance(url, dict):
++                url = url.get("url")
++            if not url:
++                raise _bad("a picture is {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/...;base64,...\"}}")
++            h, w, a = vl_picture(url, max_tokens, proc)
++            n = (h // 32) * (w // 32)
++            out.append(("image", n, None, dict(h=h, w=w, frames=[a])))
++            rows += n
++        if rows > max_rows:
++            raise NpuError(400, f"this request's pictures and video take {rows} tokens; the model takes at most {max_rows}", "context_length_exceeded")
++    return out
++
++def vl_ids(tok, text, media, img_id, vid_id, vs_id, ve_id, aud_id=None):
++    pieces = text.split(VL_MEDIA)
++    if len(pieces) != len(media) + 1:
++        raise NpuError(500, "the request's media and its placeholders disagree", "server_error")
++    enc = lambda t: tok.encode(t, add_special_tokens=False).ids
++    ids, starts = enc(pieces[0]), []
++    for (kind, n, times, x), nxt in zip(media, pieces[1:]):
++        st = []
++        if kind == "image":
++            st.append(len(ids))
++            ids += [img_id] * n
++        elif kind == "audio":
++            st.append(len(ids))
++            ids += [aud_id] * n
++        else:
++            sd = x.get("sound")
++            asp = []
++            for g, t in enumerate(times):
++                ids += enc("<%.1f seconds>" % t) + [vs_id]
++                st.append(len(ids))
++                ids += [vid_id] * n + [ve_id]
++                if sd:
++                    k = sd["bounds"][g + 1] - sd["bounds"][g]
++                    asp.append((len(ids), k))
++                    ids += [aud_id] * k
++            if sd:
++                x["aspans"] = asp
++        starts.append(st)
++        ids += enc(nxt)
++    return ids, starts
++
++AUD_MEDIA = "\ue001"
++AUD_ID = 125031
++AUD_STOP = [124900, 125014]
++SPEECH_STOP = [124900, 125014, -125031, -125032]
++SPEECH_AUDIO = (1.0, 128, 1.1, 4096)
++SPEECH_FRAME_S = 0.08
++SPEECH_SLOTS_PER_CHAR = 2
++def speech_sampling(src, base=SPEECH_AUDIO):
++    src = src or {}
++    t, k, pen, win = (src.get(n, d) for n, d in zip(("audio_temperature", "audio_top_k", "audio_repetition_penalty", "audio_repetition_window"), base))
++    if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 <= t <= 5:
++        raise _bad("audio_temperature: a number from 0 (the most likely code) to 5")
++    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= 2017:
++        raise _bad("audio_top_k: an integer from 0 (no top-k) to 2017")
++    if isinstance(pen, bool) or not isinstance(pen, (int, float)) or not 0 < pen <= 10:
++        raise _bad("audio_repetition_penalty: a number above 0, at most 10")
++    if isinstance(win, bool) or not isinstance(win, int) or not 0 <= win <= 65536:
++        raise _bad("audio_repetition_window: an integer from 0 to 65536 (frames)")
++    return (float(t), int(k), float(pen), int(win))
++
++SPEECH_SLOTS_MAX = 4096
++SPEECH_LFM3_MAX_CHARS = SPEECH_SLOTS_MAX // SPEECH_SLOTS_PER_CHAR - 48
++SPEECH_FALLBACK_VOICE = "female"
++SPEECH_VOICE_ALIASES = {**{v: "female" for v in ("alloy", "coral", "nova", "sage", "shimmer")},
++                        **{v: "male" for v in ("ash", "ballad", "echo", "fable", "onyx", "verse")}}
++SPEECH_LOCALES = {n.lower(): n for n in (
++    "Arabic", "Danish", "German", "Greek", "British English", "American English", "Finnish", "French", "Hebrew", "Italian",
++    "Japanese", "Korean", "Dutch", "Polish", "Portuguese", "Spanish", "Swedish", "Turkish", "Chinese")}
++SPEECH_LOCALES.update({"en": "American English", "en-us": "American English", "en-gb": "British English", "ar": "Arabic",
++                       "da": "Danish", "de": "German", "el": "Greek", "fi": "Finnish", "fr": "French", "he": "Hebrew",
++                       "it": "Italian", "ja": "Japanese", "ko": "Korean", "nl": "Dutch", "pl": "Polish", "pt": "Portuguese",
++                       "es": "Spanish", "sv": "Swedish", "tr": "Turkish", "zh": "Chinese"})
++AUD_BANS = [-125031, -125032, -125012, -125015]
++AUD_MAX_CLIPS = 16
++OMNI_IDS = {"<|image|>": 125030, "<|video|>": 125029, "<|audio|>": AUD_ID, "<|audio_out|>": 125032, "<|audio_start|>": 125012, "<|mixed_start|>": 125015}
++OMNI_BANS = [-125031, -125032, -125030, -125029, -125012, -125015]
++OMNI_SPEECH_STOP = [124900, 125014, -125031, -125032, -125030, -125029]
++OMNI_AUDIO = (0.4, 0, 1.2, 64)
++OMNI_PROC = (65536, 2097152)
++OMNI_MAX_FRAMES = 384
++OMNI_SECONDS_PER_TOKEN = 0.08
++
++class OmniMedia(list):
++    allow = ("image", "video", "audio")
++    wrap_audio = True
++
++class AudioMedia(list):
++    allow = ("audio",)
++
++def wav_info(raw):
++    def no(why):
++        return _bad(f"audio: only WAV audio is taken ({why}); PCM 8/16/24/32-bit or float 32/64-bit RIFF/WAVE")
++    if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
++        raise no("this is not a RIFF/WAVE file")
++    fmt, o = None, 12
++    while o + 8 <= len(raw):
++        cid, cs = raw[o:o + 4], struct.unpack_from("<I", raw, o + 4)[0]
++        if cid == b"fmt " and o + 8 + 16 <= len(raw):
++            tag, ch, rate, _, _, bits = struct.unpack_from("<HHIIHH", raw, o + 8)
++            if tag == 0xFFFE and cs >= 26 and o + 8 + 26 <= len(raw):
++                tag = struct.unpack_from("<H", raw, o + 8 + 24)[0]
++            fmt = (tag, ch, rate, bits)
++        elif cid == b"data":
++            if fmt is None:
++                raise no("no fmt chunk before the data")
++            tag, ch, rate, bits = fmt
++            if not ((tag == 1 and bits in (8, 16, 24, 32)) or (tag == 3 and bits in (32, 64))):
++                raise no(f"format tag {tag}, {bits} bits")
++            if ch < 1 or rate < 1:
++                raise no("a zero channel count or sample rate")
++            n = len(raw) - (o + 8) if cs in (0, 0xFFFFFFFF) or cs > len(raw) - (o + 8) else cs
++            frames = n // (ch * (bits // 8))
++            if frames < 1:
++                raise _bad("audio: the WAV holds no samples")
++            return frames, rate, ch
++        o += 8 + cs + (cs & 1)
++    raise no("no data chunk")
++
++def audio_tokens(frames, rate):
++    n16 = frames if rate == 16000 else frames * 16000 // rate
++    P = 400 if n16 < 400 else n16 + (-(n16 - 400) % 160)
++    F = 1 + (P - 400) // 160
++    return -(-F // 8)
++
++def audio_part(p, where):
++    t = p.get("type") if isinstance(p, dict) else None
++    fmt, data = None, None
++    if t == "input_audio" or (t is None and "input_audio" in p):
++        a = p.get("input_audio")
++        if not isinstance(a, dict):
++            raise _bad(f"{where}: an input_audio part is {{\"type\": \"input_audio\", \"input_audio\": {{\"data\": \"<base64 WAV>\", \"format\": \"wav\"}}}}")
++        data, fmt = a.get("data"), a.get("format")
++    elif t == "audio_url":
++        u = p.get("audio_url")
++        data = u.get("url") if isinstance(u, dict) else u
++    else:
++        a = p.get("audio")
++        data, fmt = (a.get("data"), a.get("format")) if isinstance(a, dict) else (a, None)
++    if fmt is not None and str(fmt).lower() not in ("wav", "wave", "x-wav"):
++        raise _bad(f"{where}: audio format {fmt!r}: only WAV audio is taken")
++    raw = _b64_payload(data, "audio", "audio/")
++    wav_info(raw)
++    return raw
++
++def aud_media(items, max_prompt):
++    if len(items) > AUD_MAX_CLIPS:
++        raise _bad(f"a request takes at most {AUD_MAX_CLIPS} audio clips")
++    out, rows = [], 0
++    for _, part in items:
++        raw = audio_part(part, "audio")
++        fr, rate, _ch = wav_info(raw)
++        n = audio_tokens(fr, rate)
++        out.append(("audio", n, None, {"wav": raw}))
++        rows += n
++        if rows > max_prompt:
++            raise NpuError(400, f"this request's audio takes {rows} tokens; the model takes prompts of at most {max_prompt}", "context_length_exceeded")
++    return out
++
++def aud_ids(tok, text, media, aud_id=AUD_ID):
++    pieces = text.split(AUD_MEDIA)
++    if len(pieces) != len(media) + 1:
++        raise NpuError(500, "the request's audio and its placeholders disagree", "server_error")
++    enc = lambda t: tok.encode(t, add_special_tokens=False).ids
++    ids, starts = enc(pieces[0]), []
++    for (_, n, _, _), nxt in zip(media, pieces[1:]):
++        starts.append([len(ids)])
++        ids += [aud_id] * n
++        ids += enc(nxt)
++    return ids, starts
++
++def d1_media(req, max_tokens, max_S):
++    items = list(getattr(req, "media", None) or []) + list(getattr(req, "images", None) or [])
++    if len(items) > 16:
++        raise _bad("a request takes at most 16 pictures and videos")
++    out, rows = [], 0
++    for it in items:
++        if isinstance(it, dict) and it.get("type") == "video":
++            h, w, fr, times = d1_video(it, max_tokens, max(32, max_S - 256 - rows))
++            n = (h // 32) * (w // 32)
++            out.append(({"kind": "video", "rows": n, "times": times}, dict(h=h, w=w, frames=fr)))
++            rows += n * len(times)
++        else:
++            url = _media_url(it)
++            if not url:
++                raise _bad("a picture is a data: URL, base64, {\"url\": ..} or {\"image_url\": {\"url\": ..}}")
++            h, w, a = d1_picture(url, max_tokens)
++            n = (h // 32) * (w // 32)
++            out.append(({"kind": "image", "rows": n}, dict(h=h, w=w, frames=[a])))
++            rows += n
++    return out
++
+ def _text(content, where, who="a decision model"):
+     if content is None:
+         return ""
+@@ -407,6 +744,47 @@
+         return "".join(out)
+     raise _bad(f"{where}: content must be a string or a list of text parts")
+ 
++VL_MEDIA = "\ue000"
++
++def _lfm3_content(content, where, media):
++    if media is None:
++        return _gtext(content, where)
++    if content is None:
++        return ""
++    if isinstance(content, str):
++        if VL_MEDIA in content:
++            raise _bad(f"{where}: the text holds U+E000, which this server reserves")
++        return content
++    parts = content if isinstance(content, list) else [content] if isinstance(content, dict) else None
++    if parts is None:
++        raise _bad(f"{where}: content must be a string or a list of parts")
++    out = []
++    for p in parts:
++        if isinstance(p, str):
++            out.append(_lfm3_content(p, where, media))
++            continue
++        t = p.get("type") if isinstance(p, dict) else None
++        if t in ("text", "input_text", "output_text"):
++            out.append(_lfm3_content(str(p.get("text") or ""), where, media))
++        elif t in ("image_url", "image", "input_image", "video") and "image" not in getattr(media, "allow", ("image", "video")):
++            raise _bad(f"{where}: a '{t}' part is not taken (this model reads text and audio)")
++        elif t in ("image_url", "image", "input_image"):
++            media.append(("image", p))
++            out.append("<|vision_start|>" + VL_MEDIA + "<|vision_end|>")
++        elif t in ("input_audio", "audio", "audio_url"):
++            if "audio" not in getattr(media, "allow", ("image", "video")):
++                raise _bad(f"{where}: a '{t}' part is not taken ({getattr(media, 'takes', 'text, image_url and video')} are)")
++            media.append(("audio", p))
++            out.append("<|vision_start|>" + VL_MEDIA + "<|vision_end|>" if getattr(media, "wrap_audio", False) else AUD_MEDIA)
++        elif t == "video":
++            if "video" not in getattr(media, "allow", ("image", "video")):
++                raise _bad(f"{where}: a 'video' part is not taken ({getattr(media, 'takes', 'text and image_url')} are)")
++            media.append(("video", p))
++            out.append("<|vision_start|>" + VL_MEDIA + "<|vision_end|>")
++        else:
++            raise _bad(f"{where}: a '{t}' part is not taken ({getattr(media, 'takes', 'text, image_url and video')} are)")
++    return "".join(out)
++
+ def render_qwen35(messages):
+     ms = []
+     for i, m in enumerate(messages or []):
+@@ -453,6 +831,34 @@
+     out.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+     return "".join(out)
+ 
++OVIS_PROC = (448 * 448, 2880 * 2880)
++OVIS_IMAGE_PIXELS = 178956970
++OVIS_MAX_IMAGES = 2
++OVIS_MAX_TOKENS = 16384
++
++def ovis_default_max(m):
++    v = (os.environ.get("HALOGEN_MAX_TOKENS_DEFAULT") or "").strip()
++    return int(v) if v else m.get("default_max", OVIS_MAX_TOKENS)
++
++class OvisMedia(list):
++    allow = ("image",)
++    takes = "text and image_url"
++
++def render_ovis(messages, enable_thinking, media):
++    ms = []
++    for i, m in enumerate(messages or []):
++        if not isinstance(m, dict):
++            raise _bad(f"messages[{i}] must be an object")
++        if m.get("role") in ("system", "developer") and not isinstance(m.get("content"), str):
++            for p in m.get("content") or []:
++                if isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image"):
++                    raise _bad(f"messages[{i}]: a system message cannot contain images")
++        ms.append({**m, "content": _lfm3_content(m.get("content"), f"messages[{i}]", media)})
++    text = render_qwen35(ms)
++    if enable_thinking:
++        text = text[:-len("\n</think>\n\n")]
++    return text
++
+ def _lfm3_json(v):
+     return json.dumps(v, ensure_ascii=False)
+ 
+@@ -470,7 +876,99 @@
+ def _lfm3_tool_json(fn):
+     return "{" + ", ".join(_lfm3_json(k) + ": " + _lfm3_json(v) for k, v in fn.items() if k != "defer_loading") + "}"
+ 
+-def render_lfm3(messages, tools=None, enable_thinking=True, preserve_thinking=False):
++def lfm3_tool_choice(tc, tools):
++    if tc is None or tc == "auto":
++        return "auto", None
++    if isinstance(tc, str):
++        if tc == "none":
++            return "none", None
++        if tc == "required":
++            if not tools:
++                raise _bad("tool_choice 'required' needs tools")
++            return "required", None
++        raise _bad(f"tool_choice '{tc}' unknown; use auto | none | required | {{'type': 'function', ...}}")
++    if isinstance(tc, dict) and tc.get("type") == "function":
++        name = (tc.get("function") or {}).get("name")
++        known = {(t.get("function") or t).get("name") for t in tools or [] if isinstance(t, dict)}
++        if not isinstance(name, str):
++            raise _bad("tool_choice.function.name is required")
++        if name not in known:
++            raise _bad(f"tool_choice names '{name}', which is not in tools")
++        return "function", name
++    raise _bad("tool_choice must be a string or a {'type': 'function', ...} object")
++
++LFM3_FORCE_OPEN = "<tool_call>\n<function="
++
++def lfm3_force_prefill(mode, name, tools):
++    if mode == "function":
++        return LFM3_FORCE_OPEN + name + ">\n"
++    if mode == "required":
++        names = [(t.get("function") or t).get("name") for t in tools or [] if isinstance(t, dict)]
++        if len(names) == 1 and isinstance(names[0], str):
++            return LFM3_FORCE_OPEN + names[0] + ">\n"
++        return LFM3_FORCE_OPEN
++    return ""
++
++class _AsrReq:
++    model_fields_set = frozenset()
++    max_completion_tokens = None
++    stop = None
++    seed = None
++
++    def __init__(self, model, max_tokens):
++        self.model, self.max_tokens = model, max_tokens
++
++def wants_audio_out(req):
++    mods = getattr(req, "modalities", None)
++    return isinstance(mods, list) and "audio" in mods
++
++def speech_voice(v, allow_default=True):
++    v = str(v or "").strip().lower()
++    if not v and allow_default:
++        return SPEECH_FALLBACK_VOICE
++    if v in ("female", "male"):
++        return v
++    if v in SPEECH_VOICE_ALIASES:
++        return SPEECH_VOICE_ALIASES[v]
++    raise _bad("voice: female or male, or one of OpenAI's names (" + ", ".join(sorted(SPEECH_VOICE_ALIASES)) + ")")
++
++def wav_header(n, rate):
++    return b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, 2 * rate, 2, 16) + \
++        b"data" + struct.pack("<I", n)
++
++class _SpeechReq:
++    model_fields_set = frozenset()
++    max_completion_tokens = None
++    stop = None
++    seed = None
++
++    def __init__(self, model, max_tokens, seed=None):
++        self.model, self.max_tokens, self.seed = model, max_tokens, seed
++        if seed is not None:
++            self.model_fields_set = frozenset(["seed"])
++
++def lfm3_think(req, m=None):
++    kw = getattr(req, "chat_template_kwargs", None) or {}
++    if m is not None and (m.get("omni") or m.get("ovis")):
++        on = req.enable_thinking if req.enable_thinking is not None else kw.get("enable_thinking")
++        return on is True and req.reasoning_effort != "none"
++    return not (req.enable_thinking is False or kw.get("enable_thinking") is False or req.reasoning_effort == "none")
++
++def audio_style(m):
++    return bool(m.get("aud")) and not m.get("omni")
++
++def lfm3_keep(req):
++    kw = getattr(req, "chat_template_kwargs", None) or {}
++    return bool(req.preserve_thinking or kw.get("preserve_thinking"))
++
++def lfm3_cached(w):
++    try:
++        d = w[11].split(",")
++        return int(d[4]) if len(d) > 4 else 0
++    except (IndexError, ValueError):
++        return 0
++
++def render_lfm3(messages, tools=None, enable_thinking=True, preserve_thinking=False, media=None, audio=False):
+     ms = []
+     for i, m in enumerate(messages or []):
+         if not isinstance(m, dict):
+@@ -483,7 +981,7 @@
+         raise _bad("No messages provided.")
+     sysp = ""
+     if ms[0]["role"] == "system":
+-        sysp = _gtext(ms[0].get("content"), "messages[0]") if ms[0].get("content") else ""
++        sysp = _lfm3_content(ms[0].get("content"), "messages[0]", media) if ms[0].get("content") else ""
+         ms = ms[1:]
+     lines = []
+     for t in tools or []:
+@@ -505,15 +1003,16 @@
+         if role == "assistant":
+             thinking = next((m[k] for k in ("thinking", "reasoning", "reasoning_content") if m.get(k) is not None), None)
+             keep = preserve_thinking or i > last_user
+-            content = _gtext(m.get("content"), where) if m.get("content") else ""
++            content = _lfm3_content(m.get("content"), where, media) if m.get("content") else ""
+             if thinking is not None and keep:
+                 out.append("<think>" + str(thinking) + "</think>")
+-            elif keep and "</think>" not in content:
++            elif keep and "</think>" not in content and not audio:
+                 out.append("<think></think>")
+             if not keep:
+                 if "</think>" in content:
+                     content = content.split("</think>")[-1].strip()
+-                content = "<think></think>" + content
++                if not audio:
++                    content = "<think></think>" + content
+             out.append(content)
+             for j, tc in enumerate(m.get("tool_calls") or []):
+                 fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+@@ -529,11 +1028,19 @@
+             out.append("<|im_end|>\n")
+         elif role == "tool":
+             c = m.get("content")
+-            c = "" if c is None else _gtext(c, where)
+-            out.append((c if "<tool_response>" in c else "<tool_response>\n" + c + "\n</tool_response>") + "<|im_end|>\n")
++            if isinstance(c, str) and "<tool_response>" in c:
++                out.append(c + "<|im_end|>\n")
++            else:
++                if c is None:
++                    c = ""
++                elif isinstance(c, list):
++                    c = "\n".join(_lfm3_content([x], where, media) for x in c)
++                else:
++                    c = _lfm3_content(c, where, media) if isinstance(c, (str, dict)) else _gtext(c, where)
++                out.append("<tool_response>\n" + c + "\n</tool_response><|im_end|>\n")
+         else:
+-            out.append((_gtext(m.get("content"), where) if m.get("content") else "") + "<|im_end|>\n")
+-    out.append("<|im_start|>assistant\n" + ("<think>" if enable_thinking else "<think></think>"))
++            out.append((_lfm3_content(m.get("content"), where, media) if m.get("content") else "") + "<|im_end|>\n")
++    out.append("<|im_start|>assistant\n" + ("" if enable_thinking is None else "<think>" if enable_thinking else "<think></think>"))
+     return "".join(out)
+ 
+ def render(tok, tpl, labels, state, question, texts):
+@@ -551,8 +1058,59 @@
+     head = tok.encode(tpl["pre"] + state, add_special_tokens=False).ids
+     return head + tok.encode(_block(tpl, labels, question, texts), add_special_tokens=False).ids, len(head)
+ 
++TOK_SPLIT = int(os.environ.get("HALOGEN_NPU_TOK_SPLIT", "800") or 0)
++_FE_TRACE = os.environ.get("_hg_dev_fe_trace") == "1"
++_TOK_CUT = re.compile(r"(?<=\S) (?=[^\W\d_])")
++
++def tok_ids(tok, text):
++    if TOK_SPLIT <= 0 or len(text) < TOK_SPLIT:
++        return tok.encode(text, add_special_tokens=False).ids
++    n = max(2, min(8, len(text) // 400))
++    cuts, step, at = [0], len(text) / n, 0
++    for k in range(1, n):
++        m = _TOK_CUT.search(text, max(int(k * step), at + 1))
++        if m is None:
++            break
++        if m.start() > cuts[-1]:
++            cuts.append(m.start())
++        at = m.start()
++    cuts.append(len(text))
++    if len(cuts) < 3:
++        return tok.encode(text, add_special_tokens=False).ids
++    out = []
++    for e in tok.encode_batch([text[a:b] for a, b in zip(cuts, cuts[1:])], add_special_tokens=False):
++        out += e.ids
++    return out
++
++TOK_CACHE = int(os.environ.get("HALOGEN_NPU_TOK_CACHE", "1") or 0)
++_TOK_CHECK = os.environ.get("_hg_dev_tok_check") == "1"
++_TOKC = {}
++_TOKCHECK_N = [0, 0]
++
++def _tok_piece(tok, text):
++    k = (id(tok), text)
++    v = _TOKC.get(k)
++    if v is None:
++        if len(_TOKC) >= 256:
++            _TOKC.clear()
++        v = _TOKC[k] = tuple(tok.encode(text, add_special_tokens=False).ids)
++    return v
++
+ def render_whole(tok, tpl, labels, state, question, texts):
+-    return tok.encode(tpl["pre"] + state + _block(tpl, labels, question, texts), add_special_tokens=False).ids, 0
++    pre, blk = tpl["pre"], _block(tpl, labels, question, texts)
++    if TOK_CACHE and state and not state[0].isspace() and state[-1].isalnum() and pre.endswith("\n") and blk.startswith("\n"):
++        ids = list(_tok_piece(tok, pre)) + tok_ids(tok, state) + list(_tok_piece(tok, blk))
++        if _TOK_CHECK:
++            whole = tok_ids(tok, pre + state + blk)
++            _TOKCHECK_N[0] += 1
++            if whole != ids:
++                _TOKCHECK_N[1] += 1
++                print("TOKCHECK MISMATCH %d of %d: state %r .. %r" % (_TOKCHECK_N[1], _TOKCHECK_N[0], state[:40], state[-40:]),
++                      file=sys.stderr, flush=True)
++            elif _TOKCHECK_N[0] % 100 == 0:
++                print("TOKCHECK %d same" % _TOKCHECK_N[0], file=sys.stderr, flush=True)
++        return ids, 0
++    return tok_ids(tok, pre + state + blk), 0
+ 
+ def render_whole_image(tok, tpl, labels, state, question, texts, n):
+     text = tpl["pre"] + state + _block(tpl, labels, question, texts)
+@@ -633,6 +1191,40 @@
+ D3_IMAGE_PIXELS = (65536, 1638400)
+ D3_ALIASES = {"vllm-sr/d3-lite": "d3-lite", "vllm-sr/d3-nano": "d3-nano"}
+ 
++MODEL_NAME_CHECK = os.environ.get("HALOGEN_MODEL_NAME_CHECK", "1") != "0"
++_RECORD_IDS = None
++
++def record_ids():
++    global _RECORD_IDS
++    if _RECORD_IDS is None:
++        ids = set()
++        try:
++            with open(os.environ.get("_hg_npu_pins") or "/opt/halogen/npu/models.txt", encoding="utf-8") as f:
++                for line in f:
++                    p = line.split()
++                    if len(p) >= 2 and p[0] == "model":
++                        ids.add(p[1].lower())
++        except OSError:
++            pass
++        ids.update(a.lower() for a in D3_ALIASES)
++        _RECORD_IDS = ids
++    return _RECORD_IDS
++
++def unloaded_refusal(name, loaded):
++    if not MODEL_NAME_CHECK or not isinstance(name, str) or not name or name in loaded:
++        return None
++    low = name.lower()
++    names = ", ".join(sorted(loaded)) or "none"
++    for k in loaded:
++        if k.lower() == low:
++            return f"The model `{name}` is not loaded here; model names are case-sensitive: did you mean `{k}`? (loaded: {names})"
++    if low in record_ids():
++        return (f"The model `{name}` is one of halogen's NPU models but is not loaded here (loaded: {names}); "
++                f"add it to HALOGEN_NPU_MODELS to serve it")
++    return None
++D3_QUESTION_KEYS = ("type", "instructions", "criteria")
++D3_REQUEST_EXTRA = ("images",)
++
+ def d3_text(v):
+     return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+ 
+@@ -653,6 +1245,17 @@
+     return {"type": "choice", "choice": keys[top], "probabilities": {k: p for k, p in zip(keys, probs)},
+             "confidence": d3_confidence(probs)}
+ 
++TAIL_HOLD = os.environ.get("HALOGEN_NPU_TAIL_HOLD", "1") != "0"
++
++def _tail_hold(text, marks):
++    best = 0
++    for m in marks:
++        for k in range(min(len(m) - 1, len(text)), best, -1):
++            if text.endswith(m[:k]):
++                best = k
++                break
++    return best
++
+ class _Conn:
+ 
+     def __init__(self, host, port):
+@@ -678,7 +1281,7 @@
+                 w = s.split(" ", 2)
+                 q = self.streams.get(w[1] if len(w) > 1 else "0")
+                 if q is not None:
+-                    if w[0] not in ("TOK", "AUD"):
++                    if w[0] not in ("TOK", "AUD", "FRM"):
+                         self.streams.pop(w[1], None)
+                     q.put_nowait(s)
+                     continue
+@@ -907,13 +1510,15 @@
+         if head.get("attn") != "set":
+             raise RuntimeError(f"{name}: this front end serves a states head under the set attention only")
+         files = info["model"].get("files", {})
++        img = info.get("image")
+         self.models[name] = dict(task="sets", tok=tok, cal=cal, NS=NS, set_size=int(head.get("set_size", NS.SET_SIZE)),
+                                  max_S=int(info["limits"]["max_S"]), source=info["model"].get("source", ""),
++                                 image_tok=None if img is None else dict(max_tokens=int(img["max_tokens"]), multiple=int(img.get("multiple", 32))),
+                                  fp="npu-" + (files.get("model.safetensors") or files.get("model.safetensors.index.json") or "")[:12])
+-        print(f"npu_api: {name} on the NPU engine at {self.host}:{self.port} (set decisions; buckets "
+-              f"{', '.join(b['name'] for b in info['buckets'])}; prompts up to {info['limits']['max_S']} tokens)", flush=True)
++        print(f"npu_api: {name} on the NPU engine at {self.host}:{self.port} (set decisions{'; pictures and video' if img else ''}; "
++              f"buckets {', '.join(b['name'] for b in info['buckets'])}; prompts up to {info['limits']['max_S']} tokens)", flush=True)
+ 
+-    async def _sets_pass(self, name, m, f):
++    async def _sets_pass(self, name, m, f, media=None):
+         import numpy as np
+         reads = any(sl.rows is None for sl in f.slots)
+         slots = []
+@@ -924,9 +1529,20 @@
+         if len(f.ids) > m["max_S"]:
+             raise NpuError(400, f"this decision's prompt is {len(f.ids)} tokens; {name} takes at most {m['max_S']}",
+                            "context_length_exceeded")
+-        verb = "QSETH" if reads else "QSET"
+-        body = " ".join([str(len(f.ids)), str(len(slots))] + [x for pos, rows in slots for x in [str(pos), str(len(rows))] + [str(r) for r in rows]]
+-                        + [str(g) for g in f.question] + [str(t) for t in f.ids])
++        verb = ("QSETMH" if reads else "QSETM") if media else "QSETH" if reads else "QSET"
++        parts = ([str(len(f.ids)), str(len(slots))] + [x for pos, rows in slots for x in [str(pos), str(len(rows))] + [str(r) for r in rows]]
++                 + [str(g) for g in f.question] + [str(t) for t in f.ids])
++        if media:
++            runs = list(f.media)
++            parts.append(str(len(media)))
++            for md in media:
++                ns = 1 if len(md["frames"]) == 1 else len(md["frames"]) // 2
++                starts, runs = runs[:ns], runs[ns:]
++                parts += [str(md["h"]), str(md["w"]), str(len(md["frames"])), str(ns)] + [str(a) for a, _ in starts]
++                parts += [fr.tobytes().hex() for fr in md["frames"]]
++            if runs:
++                raise NpuError(500, "the request's media and its placeholders disagree", "server_error")
++        body = " ".join(parts)
+         r = await self._pass(self._verb(verb, name, "sets"), body)
+         w = r.split()
+         if w[0] == "ERR":
+@@ -945,17 +1561,18 @@
+             raise NpuError(500, "the NPU engine's answer held a non-finite value", "server_error")
+         return (lambda j, sl, toks: [lgs[j][t] for t in toks]), sts
+ 
+-    async def _sets_answers(self, name, m, req):
++    async def _sets_answers(self, name, m, req, media=None):
+         import numpy as np
+         NS = m["NS"]
+         try:
+-            fs = NS.render(m["tok"], req.state, req.questions, m["set_size"])
++            fs = NS.render(m["tok"], req.state, req.questions, m["set_size"], [mk for mk, _ in media or ()])
+         except (ValueError, KeyError, TypeError, NotImplementedError) as e:
+             raise NpuError(422, f"the request does not fit this model's contract: {e}", "invalid_request_error")
+-        st_text = req.state if isinstance(req.state, str) else json.dumps(req.state, ensure_ascii=False, indent=2)
++        st_text = None if req.state is None else req.state if isinstance(req.state, str) else json.dumps(req.state, ensure_ascii=False, indent=2)
++        md = [x for _, x in media or ()]
+ 
+         async def one(f):
+-            score, sts = await self._sets_pass(name, m, f)
++            score, sts = await self._sets_pass(name, m, f, md)
+ 
+             def ptr(pos, cap):
+                 keys = np.stack([sts[p] for p in range(f.width)])
+@@ -1100,6 +1717,8 @@
+         files = info["model"].get("files", {})
+         tok = self._tokenizer(name, files.get("tokenizer.json"))
+         tpl, head, lim = info["template"], info["head"], info.get("generate", {})
++        if tpl.get("kind") == "chat" and tpl.get("style") == "qwen3.5-media" and head.get("stop"):
++            return self._load_ovis(info, tok, head, lim)
+         if tpl.get("kind") != "chat" or tpl.get("style") != "qwen3.5" or not head.get("stop"):
+             raise RuntimeError(f"{name}: a generation head needs its chat template and stop ids")
+         enc = lambda t: tok.encode(t, add_special_tokens=False).ids
+@@ -1115,6 +1734,31 @@
+               f"(prompts up to {self.models[name]['max_prompt']} tokens, prompt + answer up to "
+               f"{self.models[name]['max_S']})", flush=True)
+ 
++    def _load_ovis(self, info, tok, head, lim):
++        name = info["model"]["name"]
++        files = info["model"].get("files", {})
++        img = info.get("image")
++        enc = lambda t: tok.encode(t, add_special_tokens=False).ids
++        vl = {}
++        for t, k in (("<|image_pad|>", "img"), ("<|video_pad|>", "vid"), ("<|vision_start|>", "vs"), ("<|vision_end|>", "ve")):
++            v = enc(t)
++            if len(v) != 1:
++                raise RuntimeError(f"{name}: the tokenizer does not hold {t} as one token")
++            vl[k] = v[0]
++        for t in ("<|im_start|>", "<|im_end|>"):
++            if len(enc(t)) != 1:
++                raise RuntimeError(f"{name}: the tokenizer does not hold {t} as one token")
++        self.models[name] = dict(
++            ovis=True, aud=False, speech_out=None, omni=False, proc=OVIS_PROC, max_frames=0, default_max=OVIS_MAX_TOKENS,
++            image_tok=None if img is None else dict(max_tokens=int(img["max_tokens"]), multiple=int(img.get("multiple", 32))), vl=vl if img else None,
++            task="generate", style="lfm3", tok=tok, stop=[int(v) for v in head["stop"]], bos=None,
++            max_S=int(lim.get("max_positions", 0)), max_prompt=int(lim.get("max_prompt", 0)),
++            gen=dict(temperature=0.0, top_k=0, top_p=1.0, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0),
++            source=info["model"].get("source", ""),
++            fp="npu-" + (files.get("model.safetensors") or files.get("model.safetensors.index.json") or "")[:12])
++        print(f"npu_api: {name} (generation{'; pictures' if img else ''}) on the NPU engine at {self.host}:{self.port} "
++              f"(prompts up to {self.models[name]['max_prompt']} tokens, prompt + answer up to {self.models[name]['max_S']})", flush=True)
++
+     def _load_lfm3gen(self, info):
+         name = info["model"]["name"]
+         files = info["model"].get("files", {})
+@@ -1125,14 +1769,49 @@
+                 raise RuntimeError(f"{name}: the tokenizer does not hold {t} as one token")
+         lim, g = info.get("generate", {}), info.get("gen") or {}
+         num = lambda k, d: float(g[k]) if k in g else d
++        img = info.get("image")
++        vl = None
++        if img:
++            vl = {}
++            for t, k in (("<|image|>", "img"), ("<|video|>", "vid"), ("<|vision_start|>", "vs"), ("<|vision_end|>", "ve")):
++                v = enc(t)
++                if len(v) != 1:
++                    raise RuntimeError(f"{name}: the tokenizer does not hold {t} as one token")
++                vl[k] = v[0]
++        aud = info.get("audio")
++        omni = bool(aud and vl)
++        if omni:
++            for t, i in OMNI_IDS.items():
++                if enc(t) != [i]:
++                    raise RuntimeError(f"{name}: the tokenizer does not hold {t} as token {i}")
++        if aud:
++            if enc("<|audio|>") != [AUD_ID]:
++                raise RuntimeError(f"{name}: the tokenizer does not hold <|audio|> as token {AUD_ID}")
++        so = info.get("speech_out")
++        if so is not None:
++            if not isinstance(so, dict) or so.get("verb") != "LGENS" or int(so.get("rate", 0)) != 24000:
++                raise RuntimeError(f"{name}: speech_out must be {{rate 24000, verb LGENS}}, got {so!r}")
++            for t, i in (("<|audio_start|>", 125012), ("<|mixed_start|>", 125015)):
++                if enc(t) != [i]:
++                    raise RuntimeError(f"{name}: the tokenizer does not hold {t} as token {i}")
++            so = dict(rate=24000, voices=[str(v) for v in so.get("voices", ["female", "male"])], modes=list(so.get("modes", [])))
++        base = OMNI_AUDIO if omni else SPEECH_AUDIO
++        audio_sampling = (float(g["audio_temperature"]) if g.get("audio_temperature") is not None else base[0],
++                          int(g["audio_top_k"] or 0) if "audio_top_k" in g else base[1],
++                          float(g["audio_repetition_penalty"]) if g.get("audio_repetition_penalty") is not None else base[2],
++                          int(g["audio_repetition_window"]) if g.get("audio_repetition_window") is not None else (64 if "audio_temperature" in g else base[3]))
+         self.models[name] = dict(
+-            task="generate", style="lfm3", tok=tok, stop=enc("<|im_end|>"), bos=enc("<|startoftext|>")[0],
++            aud=bool(aud), speech_out=so, omni=omni,
++            audio_sampling=audio_sampling, speech_stop=OMNI_SPEECH_STOP if omni else SPEECH_STOP,
++            proc=OMNI_PROC if omni else VL_PROC, max_frames=OMNI_MAX_FRAMES if omni else 768,
++            image_tok=None if img is None else dict(max_tokens=int(img["max_tokens"]), multiple=int(img.get("multiple", 32))), vl=vl,
++            task="generate", style="lfm3", tok=tok, stop=(AUD_STOP + (OMNI_BANS if omni else AUD_BANS)) if aud else enc("<|im_end|>"), bos=enc("<|startoftext|>")[0],
+             max_S=int(lim.get("max_positions", 0)), max_prompt=int(lim.get("max_prompt", 0)),
+             gen=dict(temperature=num("temperature", 1.0) if str(g.get("do_sample", "1")) != "0" else 0.0, top_k=int(num("top_k", 0)),
+                      top_p=num("top_p", 1.0), min_p=0.0, presence_penalty=0.0, repetition_penalty=num("repetition_penalty", 1.0)),
+             source=info["model"].get("source", ""),
+             fp="npu-" + (files.get("model.safetensors") or files.get("model.safetensors.index.json") or "")[:12])
+-        print(f"npu_api: {name} (LFM3 generation) on the NPU engine at {self.host}:{self.port} "
++        print(f"npu_api: {name} (LFM3 generation{'; pictures and video' if img else ''}{'; audio in' if aud else ''}{'; speech out' if so else ''}) on the NPU engine at {self.host}:{self.port} "
+               f"(prompts up to {self.models[name]['max_prompt']} tokens, prompt + answer up to {self.models[name]['max_S']}; "
+               f"sampling {self.models[name]['gen']})", flush=True)
+ 
+@@ -1194,16 +1873,18 @@
+                 raise _bad("the body is not JSON")
+             if not isinstance(body, dict):
+                 raise _bad("the body is not a JSON object")
+-            names = [k for k, m in self.models.items() if m["task"] == "speech"]
++            names = [k for k, m in self.models.items() if m["task"] == "speech" or m.get("speech_out")]
+             name = body.get("model")
+             if name in self.models:
+-                if self.models[name]["task"] != "speech":
++                if self.models[name]["task"] != "speech" and not self.models[name].get("speech_out"):
+                     raise _bad(self.wrong_route(name, "/v1/audio/speech"))
+-            elif len(names) == 1:
++            elif self.refuse_unloaded(name) or len(names) == 1:
+                 name = names[0]
+             else:
+                 raise NpuError(404, f"no text-to-speech model named {name!r} on the NPU engine", "model_not_found")
+             m = self.models[name]
++            if m.get("speech_out"):
++                return await self._speech_lfm3(http_request, m, name, body)
+             text = body.get("input")
+             if not isinstance(text, str) or not text.strip():
+                 raise _bad("input: the text to speak")
+@@ -1530,12 +2211,17 @@
+         return self.model_id(model) in self.models
+ 
+     def model_entries(self):
+-        return [{"id": k, "object": "model", "type": "model",
++        out = []
++        for k, m in self.models.items():
++            e = {"id": k, "object": "model", "type": "model",
+                  "display_name": k, "created_at": "1970-01-01T00:00:00Z",
+                  "owned_by": "halogen", "created": 0,
+                  "max_model_len": m["max_S"], "context_length": m["max_S"],
+                  "backend": "npu", "task": m["task"], "source": m["source"]}
+-                for k, m in self.models.items()]
++            if m.get("style") == "lfm3":
++                e["architecture"] = {"input_modalities": ["text", "image"] if m.get("ovis") else ["text", "image", "video", "audio"] if m.get("omni") else ["text", "image", "video"] if m.get("vl") else ["text", "audio"] if m.get("aud") else ["text"], "output_modalities": ["text", "audio"] if m.get("speech_out") else ["text"]}
++            out.append(e)
++        return out
+ 
+     async def health(self):
+         try:
+@@ -1561,6 +2247,13 @@
+             return {"status": "engine_unresponsive", "models": sorted(self.models),
+                     "error": getattr(e, "message", str(e))}
+ 
++    def refuse_unloaded(self, name, ours=()):
++        if isinstance(name, str) and self.model_id(name) in self.models:
++            return
++        msg = unloaded_refusal(name, list(self.models) + list(ours))
++        if msg:
++            raise NpuError(404, msg, "model_not_found")
++
+     def wrong_route(self, model, route):
+         if self.models.get(model, {}).get("task") == "embedding":
+             return (f"'{model}' is an embedding model: it answers on "
+@@ -1598,6 +2291,8 @@
+         if verb == "EMB":
+             tasks = ("embedding", "transcribe")
+         n = sum(m["task"] in tasks for m in self.models.values())
++        if task == "sets":
++            n += sum(m.get("style") == "lfm3" for m in self.models.values())
+         return verb if n < 2 else f"{verb}@{name}"
+ 
+     def _note_ignored(self, req):
+@@ -1720,11 +2415,13 @@
+         self.rec.submit_npu(d)
+ 
+     async def _dec_pass(self, name, m, state, q, texts, share=False, img=None):
++        _t0 = time.perf_counter()
+         if img is not None:
+             ids, at = render_whole_image(m["tok"], m["tpl"], m["labels"], state, q, texts, (img[0] // 32) * (img[1] // 32))
+             nst = 0
+         else:
+             ids, nst = (render_whole if m.get("whole") else render_split)(m["tok"], m["tpl"], m["labels"], state, q, texts)
++        _t1 = time.perf_counter()
+         if len(ids) > m["max_S"]:
+             raise NpuError(400, f"this decision's prompt is {len(ids)} tokens; "
+                                 f"{name} takes at most {m['max_S']}",
+@@ -1768,8 +2465,13 @@
+                     raise NpuError(500, f"the NPU engine answered: {r[:200]}",
+                                    "server_error")
+                 return w
++            _t2 = time.perf_counter()
+             w = await self._finite(full, lambda w: [int(v) for v in w[5:5 + len(rows)]], f"{name}'s decision")
++            _t3 = time.perf_counter()
+             bits = [int(v) for v in w[5:5 + len(rows)]]
++            if _FE_TRACE:
++                print("FETRACE n %d render %.3f body %.3f pass %.3f reply %s" % (len(ids), (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3,
++                      (_t3 - _t2) * 1e3, " ".join(w[-2:])), file=sys.stderr, flush=True)
+         cur = _CUR.get()
+         if cur is not None:
+             try:
+@@ -1852,6 +2554,7 @@
+         decs = sorted(k for k, m in self.models.items() if m["task"] in ("decision", "sets"))
+         if isinstance(name, str) and self.models.get(self.model_id(name), {}).get("task") in ("decision", "sets"):
+             return self.model_id(name)
++        self.refuse_unloaded(name)
+         if len(decs) == 1:
+             return decs[0]
+         raise NpuError(422, f"`model` {name!r} is not a decision model here "
+@@ -1903,6 +2606,11 @@
+         where = f"questions.{qid}"
+         if not isinstance(q, dict) or q.get("type") not in ("noul", "choice", "score"):
+             raise NpuError(422, f"{where}.type must be noul, choice or score", "invalid_request_error")
++        extra = sorted(str(k) for k in q if k not in D3_QUESTION_KEYS)
++        if extra:
++            raise NpuError(422, f"{where} has {', '.join(extra)}, which this model does not read: a question takes "
++                                "type, instructions (the question) and criteria, and the text it is about goes in the "
++                                "request's state", "invalid_request_error")
+         t, crit, ins = q["type"], q.get("criteria"), q.get("instructions")
+         ins = d3_text(ins) if ins not in (None, "") else D3_INSTRUCTIONS
+         if t == "choice":
+@@ -1934,15 +2642,24 @@
+             name = self._s1_model(req.model)
+             m = self.models[name]
+             if m["task"] == "sets":
+-                if req.state is None:
+-                    raise NpuError(422, "`state` is required", "invalid_request_error")
+-                answers, n_in, n_fw = await self._sets_answers(name, m, req)
++                media = None
++                if getattr(req, "media", None) or getattr(req, "images", None):
++                    if not m.get("image_tok"):
++                        raise NpuError(400, f"{name} takes no pictures or video here", "invalid_request_error")
++                    media = d1_media(req, m["image_tok"]["max_tokens"], m["max_S"])
++                if req.state is None and not media:
++                    raise NpuError(422, "`state` is required (or a picture or a video in `media`)", "invalid_request_error")
++                answers, n_in, n_fw = await self._sets_answers(name, m, req, media)
+                 return JSONResponse({"model": req.model if isinstance(req.model, str) else name, "answers": answers,
+                                      "usage": {"input_tokens": n_in, "output_tokens": len(answers)}})
+             d3 = m.get("prompt") == "d3"
+             if req.state is None and not d3:
+                 raise NpuError(422, "`state` is required", "invalid_request_error")
+             if d3:
++                extra = sorted(k for k in (getattr(req, "model_extra", None) or {}) if k not in D3_REQUEST_EXTRA)
++                if extra:
++                    raise NpuError(422, f"this request has {', '.join(extra)}, which this model does not read: it takes "
++                                        "model, state (the text to judge), questions and images", "invalid_request_error")
+                 state = D3_EMPTY_STATE if req.state is None or req.state == "" else d3_text(req.state)
+                 qs = {qid: self._s1_question_d3(qid, q) for qid, q in req.questions.items()}
+             else:
+@@ -1964,7 +2681,10 @@
+                 ids, bits, _, _ = await self._dec_pass(name, m, state, ins, texts, share=len(qs) > 1, img=img)
+                 lps = option_logprobs(bits, m["temp"])
+                 return qid, len(ids), (s1_answer_d3 if d3 else s1_answer)(t, keys, [math.exp(v) for v in lps], legend)
++            _ta = time.perf_counter()
+             done = await self._all([one(i) for i in qs.items()])
++            if _FE_TRACE:
++                print("FETRACE s1 all %.3f" % ((time.perf_counter() - _ta) * 1e3), file=sys.stderr, flush=True)
+         except NpuError as e:
+             return self._error(e)
+         return JSONResponse({"model": req.model if isinstance(req.model, str) else name,
+@@ -2056,7 +2776,7 @@
+                             conn.cancel(rid)
+                         continue
+                     if w[0] != "OK":
+-                        raise NpuError(500, f"the NPU engine refused the generation: {' '.join(w[2:])}", "server_error")
++                        raise _gen_refused(w)
+                     text = tok.decode(out, skip_special_tokens=True)
+                     hit = min((text.find(s) for s in stops if s in text), default=-1)
+                     if hit >= 0:
+@@ -2114,43 +2834,207 @@
+         import tool_parse as TP
+         m = self.models[req.model]
+         tok = m["tok"]
+-        f = req.model_fields_set
+         try:
+             if req.n not in (None, 1):
+                 raise _bad("the NPU's generation model answers one choice (n = 1)")
+-            tc = req.tool_choice
+-            if tc not in (None, "none", "auto"):
+-                raise _bad("tool_choice: the NPU's LFM3 generation takes auto or none (a forced call is not built here)")
+-            tools = None if tc == "none" else (req.tools or None)
+-            kw = req.chat_template_kwargs or {}
+-            think = not (req.enable_thinking is False or kw.get("enable_thinking") is False or req.reasoning_effort == "none")
+-            keep = bool(req.preserve_thinking or kw.get("preserve_thinking"))
+-            ids = tok.encode(render_lfm3(req.messages, tools, enable_thinking=think, preserve_thinking=keep), add_special_tokens=False).ids
++            if wants_audio_out(req) or getattr(req, "audio", None) is not None:
++                return await self._chat_audio_out(req, http_request)
++            rf = getattr(req, "response_format", None)
++            if m.get("ovis") and isinstance(rf, dict) and rf.get("type") not in (None, "text"):
++                raise _bad(f"'{req.model}' runs on the NPU, which does not constrain the output to a schema (response_format)")
++            mode, forced = lfm3_tool_choice(req.tool_choice, req.tools)
++            tools = None if mode == "none" else (req.tools or None)
++            pre = lfm3_force_prefill(mode, forced, tools)
++            think = lfm3_think(req, m) and not pre and not audio_style(m)
++            keep = lfm3_keep(req)
++            h = await self.lfm3_open(req, req.messages, tools, think, keep, pre)
++        except NpuError as e:
++            return self._error(e)
++        conn, rid, q, slot, ids, stops = h["conn"], h["rid"], h["q"], h["slot"], h["ids"], h["stops"]
++        cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
++        head = {"id": cid, "created": created, "model": req.model, "system_fingerprint": m["fp"]}
++        return await self._lfm3_chat_reply(req, http_request, m, tok, h, conn, rid, q, slot, ids, stops, tools, think, pre, head,
++                                           JSONResponse, StreamingResponse, TP)
++
++    def lfm3_prompt(self, model, messages, tools, think, keep, pre=""):
++        m = self.models[model]
++        tok = m["tok"]
++        if m.get("ovis"):
++            if tools:
++                raise _bad("this model does not call tools")
++            items = OvisMedia() if m.get("vl") else None
++            text = render_ovis(messages, bool(think), items)
++            med, starts = [], []
++            if items:
++                if len(items) > OVIS_MAX_IMAGES:
++                    raise _bad(f"a request takes at most {OVIS_MAX_IMAGES} images")
++                vl = m["vl"]
++                med = vl_media(items, m["image_tok"]["max_tokens"], m["max_prompt"] - 64, m["proc"])
++                ids, starts = vl_ids(tok, text, med, vl["img"], vl["vid"], vl["vs"], vl["ve"])
++            else:
++                ids = tok.encode(text, add_special_tokens=False).ids
++            return ids + (tok.encode(pre, add_special_tokens=False).ids if pre else []), med, starts
++        items = OmniMedia() if m.get("omni") else [] if m.get("vl") else AudioMedia() if m.get("aud") else None
++        if audio_style(m):
++            think = None
++        elif m.get("omni") and think is None:
++            think = False
++        text = render_lfm3(messages, tools, enable_thinking=think, preserve_thinking=keep, media=items, audio=audio_style(m))
++        med, starts = [], []
++        if items and m.get("omni"):
++            vl = m["vl"]
++            med = vl_media(items, m["image_tok"]["max_tokens"], m["max_prompt"] - 64, m["proc"], m["max_frames"], True)
++            ids, starts = vl_ids(tok, text, med, vl["img"], vl["vid"], vl["vs"], vl["ve"], AUD_ID)
++            med2, st2 = [], []
++            for md, st in zip(med, starts):
++                med2.append(md)
++                st2.append(st)
++                if md[3].get("sound"):
++                    med2.append(("soundtrack", md[3]["sound"]["tokens"], None, {"wav": md[3]["sound"]["wav"], "spans": md[3]["aspans"]}))
++                    st2.append([])
++            med, starts = med2, st2
++        elif items and m.get("aud"):
++            med = aud_media(items, m["max_prompt"] - 64)
++            ids, starts = aud_ids(tok, text, med)
++        elif items:
++            vl = m["vl"]
++            med = vl_media(items, m["image_tok"]["max_tokens"], m["max_prompt"] - 64)
++            ids, starts = vl_ids(tok, text, med, vl["img"], vl["vid"], vl["vs"], vl["ve"])
++        else:
++            ids = tok.encode(text, add_special_tokens=False).ids
++        if pre:
++            ids = ids + tok.encode(pre, add_special_tokens=False).ids
++        return ids, med, starts
++
++    async def lfm3_open(self, req, messages, tools, think, keep, pre="", speech=None):
++        m = self.models[req.model]
++        f = req.model_fields_set
++        if True:
++            ids, med, starts = self.lfm3_prompt(req.model, messages, tools, think, keep, pre)
+             if len(ids) > m["max_prompt"]:
+                 raise NpuError(400, f"this prompt is {len(ids)} tokens; {req.model} takes at most {m['max_prompt']}", "context_length_exceeded")
+             room = m["max_S"] - len(ids)
+             if room < 1:
+                 raise NpuError(400, f"this prompt leaves no room for an answer ({m['max_S']} positions)", "context_length_exceeded")
+             want = req.max_completion_tokens if req.max_completion_tokens else req.max_tokens
+-            mx = max(1, min(int(want or GEN_MAX_TOKENS), room))
++            if m.get("ovis") and "max_tokens" not in f and "max_completion_tokens" not in f:
++                want = ovis_default_max(m)
++            mx = max(1, min(int(want or m.get("default_max", GEN_MAX_TOKENS)), room))
++            if speech:
++                mx = max(1, min(int(speech["slots"]), room))
+             g = m["gen"]
+             sp = {k: (getattr(req, k) if k in f and getattr(req, k, None) is not None else g[k])
+                   for k in ("temperature", "top_k", "top_p", "min_p", "presence_penalty", "repetition_penalty")}
+             if not sp["repetition_penalty"] or sp["repetition_penalty"] <= 0:
+                 raise _bad("repetition_penalty must be > 0")
++            if m.get("ovis") and float(sp["repetition_penalty"]) != 1.0:
++                raise _bad(f"{req.model} takes no repetition_penalty (presence_penalty is taken)")
+             seed = req.seed if "seed" in f and req.seed is not None else int.from_bytes(os.urandom(6), "little")
+             stops = [req.stop] if isinstance(req.stop, str) else [x for x in (req.stop or []) if x]
+-            body = " ".join([str(mx), repr(float(sp["temperature"])), str(int(sp["top_k"] or 0)), repr(float(sp["top_p"])),
+-                             repr(float(sp["min_p"] or 0)), repr(float(sp["presence_penalty"] or 0)), repr(float(sp["repetition_penalty"])),
+-                             str(seed), str(len(m["stop"]))] + [str(v) for v in m["stop"]] + [str(len(ids))] + [str(v) for v in ids])
+-            conn, rid, q, slot = await self._gen(f"LGEN@{req.model}", body)
+-        except NpuError as e:
+-            return self._error(e)
+-        cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+-        head = {"id": cid, "created": created, "model": req.model, "system_fingerprint": m["fp"]}
++            if speech:
++                au = speech.get("audio", m.get("audio_sampling", SPEECH_AUDIO))
++                body = " ".join(["auto"] + [repr(float(au[0])), str(int(au[1])), repr(float(au[2])), str(int(au[3]))] +
++                                [str(mx), repr(float(sp["temperature"])), str(int(sp["top_k"] or 0)), repr(float(sp["top_p"])),
++                                 repr(float(sp["min_p"] or 0)), repr(float(sp["presence_penalty"] or 0)), str(seed),
++                                 repr(float(sp["repetition_penalty"])), str(len(m.get("speech_stop", SPEECH_STOP)))] + [str(v) for v in m.get("speech_stop", SPEECH_STOP)] +
++                                [str(len(ids))] + [str(v) for v in ids])
++            else:
++                body = " ".join([str(mx), repr(float(sp["temperature"])), str(int(sp["top_k"] or 0)), repr(float(sp["top_p"])),
++                                 repr(float(sp["min_p"] or 0)), repr(float(sp["presence_penalty"] or 0))] + ([] if m.get("ovis") else [repr(float(sp["repetition_penalty"]))]) +
++                                [str(seed), str(len(m["stop"]))] + [str(v) for v in m["stop"]] + [str(len(ids))] + [str(v) for v in ids])
++            if med:
++                parts = [str(len(med))]
++                for (kind, n, times, x), st in zip(med, starts):
++                    if kind == "audio":
++                        parts += ["a", str(n), str(st[0]), base64.b64encode(x["wav"]).decode()]
++                        continue
++                    if kind == "soundtrack":
++                        parts += ["as", str(n), str(len(x["spans"]))] + [str(v) for sp in x["spans"] for v in sp] + [base64.b64encode(x["wav"]).decode()]
++                        continue
++                    fr = x["frames"] + ([x["frames"][-1]] if kind == "video" and len(x["frames"]) % 2 else [])
++                    parts += [str(x["h"]), str(x["w"]), str(len(fr)), str(len(st))] + [str(a) for a in st]
++                    parts += [a.tobytes().hex() for a in fr]
++                body += " " + " ".join(parts)
++            verb = ("GENM" if med else "GEN") if m.get("ovis") else "LGENS" if speech else "LGENM" if med else "LGEN"
++            conn, rid, q, slot = await self._gen(f"{verb}@{req.model}", body)
++        return {"conn": conn, "rid": rid, "q": q, "slot": slot, "ids": ids, "stops": stops, "n_prompt": len(ids)}
++
++    async def lfm3_events(self, req, h, think, http_request=None):
++        m = self.models[req.model]
++        tok = m["tok"]
++        conn, rid, q, slot, ids, stops = h["conn"], h["rid"], h["q"], h["slot"], h["ids"], h["stops"]
++        hold = max([len(x) - 1 for x in stops] + [0 if think else len("<think></think>") - 1])
++        out, sent, done, cancelled, hit_stop, think_end = [], 0, False, False, None, 0
++
++        def visible(text, final):
++            nonlocal hit_stop
++            if not think:
++                if text.startswith("<think></think>"):
++                    text = text[len("<think></think>"):]
++                elif not final and "<think></think>".startswith(text):
++                    return ""
++            k = text.find("</think>") if think else -1
++            a = k + len("</think>") if k >= 0 else (0 if not think else len(text))
++            j = min(((text.find(x, a), x) for x in stops if text.find(x, a) >= 0), default=None)
++            if j is not None:
++                hit_stop = j[1]
++                return text[:j[0]]
++            return text if final else text[:max(0, len(text) - (_tail_hold(text, stops) if TAIL_HOLD else hold))]
++
++        try:
++            while True:
++                line = await q.get()
++                w = line.split()
++                if w[0] == "TOK":
++                    out += [int(v) for v in w[2:]]
++                    text = tok.decode(out, skip_special_tokens=False)
++                    if think and not think_end and "</think>" in text:
++                        think_end = len(out)
++                    if text.endswith("\ufffd"):
++                        continue
++                    vis = visible(text, False)
++                    if len(vis) > sent:
++                        yield vis[sent:], None
++                        sent = len(vis)
++                    if hit_stop is not None and not cancelled:
++                        cancelled = True
++                        conn.cancel(rid)
++                    if http_request is not None and not cancelled and await http_request.is_disconnected():
++                        cancelled = True
++                        conn.cancel(rid)
++                    continue
++                if w[0] != "OK":
++                    done = True
++                    e = _gen_refused(w)
++                    yield None, {"reason": "error", "status": e.status, "message": e.message, "code": e.code}
++                    return
++                vis = visible(tok.decode(out, skip_special_tokens=False), True)
++                if len(vis) > sent:
++                    yield vis[sent:], None
++                done = True
++                d = {"reason": "stop" if hit_stop is not None or w[4] != "length" else "length", "n_prompt": len(ids),
++                     "n_gen": int(w[3]), "n_cached": lfm3_cached(w), "stop_seq": hit_stop,
++                     "prefill_ms": int(w[5]) / 1000.0, "decode_ms": int(w[6]) / 1000.0}
++                if think_end:
++                    d["think_end"] = think_end
++                yield None, d
++                return
++        finally:
++            if not done and not cancelled:
++                conn.cancel(rid)
++            slot.release()
++
++    async def _lfm3_chat_reply(self, req, http_request, m, tok, h, conn, rid, q, slot, ids, stops, tools, think, pre, head,
++                               JSONResponse, StreamingResponse, TP):
+ 
+         def split(text, final):
+-            if think:
++            opened = False
++            if not think and audio_style(m):
++                if text.startswith("<think>"):
++                    text, opened = text[len("<think>"):], True
++                elif "<think>".startswith(text) and not final:
++                    return "", "", ""
++            if think or opened:
+                 k = text.find("</think>")
+                 if k < 0:
+                     r = text if final else text[:max(0, len(text) - len("</think>") + 1)]
+@@ -2167,7 +3051,7 @@
+             j = rest.find(TP.TC_OPEN)
+             if j >= 0:
+                 return r, rest[:j], rest[j:]
+-            hold = 0 if final else max([len(TP.TC_OPEN) - 1] + [len(x) - 1 for x in stops])
++            hold = 0 if final else (_tail_hold(rest, [TP.TC_OPEN] + list(stops)) if TAIL_HOLD else max([len(TP.TC_OPEN) - 1] + [len(x) - 1 for x in stops]))
+             return r, rest[:max(0, len(rest) - hold)], ""
+ 
+         async def run():
+@@ -2179,7 +3063,7 @@
+                     w = line.split()
+                     if w[0] == "TOK":
+                         out += [int(v) for v in w[2:]]
+-                        text = tok.decode(out, skip_special_tokens=False)
++                        text = pre + tok.decode(out, skip_special_tokens=False)
+                         if text.endswith("\ufffd"):
+                             continue
+                         r, c, _ = split(text, False)
+@@ -2197,15 +3081,24 @@
+                             conn.cancel(rid)
+                         continue
+                     if w[0] != "OK":
+-                        raise NpuError(500, f"the NPU engine refused the generation: {' '.join(w[2:])}", "server_error")
+-                    text = tok.decode(out, skip_special_tokens=False)
++                        raise _gen_refused(w)
++                    text = pre + tok.decode(out, skip_special_tokens=False)
+                     r, c, tail = split(text, True)
+                     if len(r) > sent_r:
+                         yield ("reasoning", r[sent_r:])
+                     if len(c) > sent_c:
+                         yield ("content", c[sent_c:])
+                     calls = []
+-                    if tail and tools:
++                    if pre and tail:
++                        rest_c, calls, _ = TP.split_tool_calls(tail, tools)
++                        if not calls and w[4] == "length":
++                            rest_c, calls, _ = TP.partial_tool_calls(tail, tools)
++                        if not calls:
++                            raise NpuError(502, "tool_choice required a call and the model did not name a function: retry, or name "
++                                                "the function in tool_choice", "server_error")
++                        if rest_c:
++                            yield ("content", rest_c)
++                    elif tail and tools:
+                         rest_c, calls, _ = TP.split_tool_calls(tail, tools)
+                         if rest_c and not calls:
+                             yield ("content", tail)
+@@ -2215,9 +3108,11 @@
+                         yield ("content", tail)
+                     done = True
+                     hit_stop = bool(stops) and any(x in text.split("</think>")[-1] for x in stops)
+-                    finish = "tool_calls" if calls else ("stop" if hit_stop or w[4] != "length" else "length")
+-                    yield ("end", {"finish": finish, "tool_calls": calls,
+-                                   "usage": {"prompt_tokens": len(ids), "completion_tokens": int(w[3]), "total_tokens": len(ids) + int(w[3])}})
++                    finish = ("length" if pre and w[4] == "length" else "tool_calls") if calls else ("stop" if hit_stop or w[4] != "length" else "length")
++                    usage = {"prompt_tokens": len(ids), "completion_tokens": int(w[3]), "total_tokens": len(ids) + int(w[3])}
++                    if lfm3_cached(w):
++                        usage["prompt_tokens_details"] = {"cached_tokens": lfm3_cached(w)}
++                    yield ("end", {"finish": finish, "tool_calls": calls, "usage": usage})
+                     return
+             finally:
+                 if not done and not cancelled:
+@@ -2273,7 +3168,7 @@
+         from fastapi.responses import JSONResponse, StreamingResponse
+         name = self.model_id(req.model)
+         m = self.models.get(name)
+-        if not m or m.get("style") != "lfm3":
++        if not m or m.get("style") != "lfm3" or m.get("ovis"):
+             return self.oai_error(400, self.wrong_route(req.model, "/v1/completions"))
+         tok, f = m["tok"], req.model_fields_set
+         try:
+@@ -2311,7 +3206,7 @@
+                     w = (await q.get()).split()
+                     final = w[0] != "TOK"
+                     if final and w[0] != "OK":
+-                        raise NpuError(500, f"the NPU engine refused the generation: {' '.join(w[2:])}", "server_error")
++                        raise _gen_refused(w)
+                     if not final:
+                         out += [int(v) for v in w[2:]]
+                     text = tok.decode(out, skip_special_tokens=False)
+@@ -2381,6 +3276,7 @@
+         if name in ours:
+             raise _bad(f"'{name}' has no embedding head; the embedding models "
+                        f"here: {', '.join(emb) or 'none'}")
++        self.refuse_unloaded(name, ours)
+         if len(emb) == 1:
+             return emb[0]
+         raise _bad(f"The model `{name}` is not an embedding model loaded here "
+@@ -2608,6 +3504,7 @@
+                 if name in self.models or name in ours:
+                     raise _bad(f"'{name}' has no rerank head; the rerank models "
+                                f"here: {', '.join(rr) or 'none'}")
++                self.refuse_unloaded(name, ours)
+                 if len(rr) != 1:
+                     raise _bad(f"The model `{name}` is not a rerank model loaded "
+                                f"here (loaded: {', '.join(rr) or 'none'})",
+@@ -2688,6 +3585,7 @@
+         if name in ours:
+             raise _bad(f"'{name}' has no moderation head; the moderation "
+                        f"models here: {', '.join(mods) or 'none'}")
++        self.refuse_unloaded(name, ours)
+         if len(mods) == 1:
+             return mods[0]
+         raise _bad(f"The model `{name}` is not a moderation model loaded here "
+@@ -2926,6 +3824,7 @@
+             if self.models[name]["task"] != "image":
+                 raise _bad(self.wrong_route(name, "/v1/images/generations"))
+             return name, self.models[name]
++        self.refuse_unloaded(name)
+         if len(imgs) == 1:
+             return imgs[0], self.models[imgs[0]]
+         raise NpuError(404, f"no text-to-image model is loaded here (loaded: {', '.join(sorted(self.models))})"
+@@ -3055,7 +3954,6 @@
+     async def image_edits(self, http_request, variation=False):
+         from fastapi.responses import JSONResponse
+         import base64
+-        route = "/v1/images/variations" if variation else "/v1/images/edits"
+         try:
+             n_bytes, chunks = 0, []
+             async for c in http_request.stream():
+@@ -3242,12 +4140,12 @@
+             def val(k):
+                 v = f.get(k)
+                 return v[1].decode("utf-8", "replace").strip() if v and v[0] is None else None
+-            names = [k for k, m in self.models.items() if m["task"] == "transcribe"]
++            names = [k for k, m in self.models.items() if m["task"] == "transcribe" or m.get("aud")]
+             name = val("model")
+             if name in self.models:
+-                if self.models[name]["task"] != "transcribe":
++                if self.models[name]["task"] != "transcribe" and not self.models[name].get("aud"):
+                     raise _bad(self.wrong_route(name, "/v1/audio/transcriptions"))
+-            elif len(names) == 1:
++            elif self.refuse_unloaded(name) or len(names) == 1:
+                 name = names[0]
+             else:
+                 raise NpuError(404, f"no speech-to-text model is named {name!r} (loaded: "
+@@ -3262,6 +4160,8 @@
+                 raise _bad(f"response_format: {fmt!r} (json or text; verbose_json, srt and vtt are not available)")
+             if val("stream") not in (None, "", "false", "0"):
+                 raise _bad("stream: not available for transcriptions")
++            if m.get("aud"):
++                return await self._transcribe_lfm3(m, name, wav, fmt, val)
+             sec = self.wav_seconds(wav)
+             if sec is None:
+                 raise _bad("file: only WAV audio (PCM or float, RIFF/WAVE) is accepted by this server")
+@@ -3294,6 +4194,281 @@
+             return PlainTextResponse(text + "\n")
+         return JSONResponse({"text": text, "usage": {"type": "duration", "seconds": int(math.ceil(sec))}})
+ 
++    async def _transcribe_lfm3(self, m, name, wav, fmt, val):
++        from fastapi.responses import JSONResponse, PlainTextResponse
++        try:
++            if val("prompt"):
++                raise _bad(f"prompt: not available for {name} (the language is the one setting; language=<code>)")
++            lang = "English"
++            if val("language"):
++                lang = ASR_ISO.get(val("language").lower()) or ASR_LANGS.get(val("language").lower())
++                if not lang:
++                    raise _bad(f"language: {val('language')!r} is not one of the model's languages")
++            fr, rate, _ch = wav_info(wav)
++            sec = fr / rate
++            msgs = [{"role": "system", "content": f"Perform ASR in {lang}."},
++                    {"role": "user", "content": [{"type": "input_audio",
++                                                  "input_audio": {"data": base64.b64encode(wav).decode(), "format": "wav"}}]}]
++            req = _AsrReq(name, max(64, min(4096, int(sec * 12) + 64)))
++            h = await self.lfm3_open(req, msgs, None, None, False)
++            text = ""
++            async for t, done in self.lfm3_events(req, h, False):
++                if t:
++                    text += t
++                if done is not None and done.get("reason") == "error":
++                    raise NpuError(done.get("status", 500), done.get("message", "the NPU engine failed"), done.get("code", "server_error"))
++        except NpuError as e:
++            return self._error(e)
++        text = re.sub(r"<\|[a-z_]+\|>", "", text).strip()
++        if fmt == "text":
++            return PlainTextResponse(text + "\n")
++        return JSONResponse({"text": text, "usage": {"type": "duration", "seconds": int(math.ceil(sec))}})
++
++    async def speech_events(self, h, http_request=None):
++        conn, rid, q, slot = h["conn"], h["rid"], h["q"], h["slot"]
++        done = cancelled = False
++        try:
++            while True:
++                line = await q.get()
++                if line.startswith("TOK "):
++                    yield "tok", [int(v) for v in line.split()[2:]]
++                elif line.startswith("AUD "):
++                    w = line.split(" ", 3)
++                    yield "aud", (base64.b64decode(w[3]) if len(w) > 3 else b"")
++                elif line.startswith("OK "):
++                    w = line.split()
++                    done = True
++                    yield "end", {"n_gen": int(w[3]), "reason": w[4], "kv": dict(x.split("=", 1) for x in w[5:] if "=" in x)}
++                    return
++                elif line.startswith("ERR "):
++                    done = True
++                    why = line.split(" ", 2)
++                    raise NpuError(503, "the NPU engine: " + (why[2].strip() if len(why) > 2 else line), "engine_error")
++                else:
++                    continue
++                if http_request is not None and not cancelled and await http_request.is_disconnected():
++                    cancelled = True
++                    conn.cancel(rid)
++                    return
++        finally:
++            if not done and not cancelled:
++                conn.cancel(rid)
++            slot.release()
++
++    async def _speech_lfm3(self, http_request, m, name, body):
++        from fastapi.responses import Response, StreamingResponse
++        try:
++            text = body.get("input")
++            if not isinstance(text, str) or not text.strip():
++                raise _bad("input: the text to speak")
++            if len(text) > SPEECH_LFM3_MAX_CHARS:
++                raise _bad(f"input: at most {SPEECH_LFM3_MAX_CHARS} characters a request for {name}")
++            voice = speech_voice(body.get("voice"))
++            loc = str(body.get("language") or "").strip().lower()
++            if loc in ("", "auto"):
++                locale = "American English"
++            elif loc in SPEECH_LOCALES:
++                locale = SPEECH_LOCALES[loc]
++            else:
++                raise _bad("language: one of " + ", ".join(sorted(set(SPEECH_LOCALES.values()))))
++            fmt = str(body.get("response_format") or "wav").lower()
++            if fmt not in ("wav", "pcm"):
++                raise _bad("response_format: wav or pcm (24 kHz, 16-bit mono); other formats are not made here")
++            stream = bool(body.get("stream")) or body.get("stream_format") == "audio"
++            if stream and fmt != "pcm":
++                raise _bad("stream: response_format pcm")
++            if body.get("instructions") not in (None, ""):
++                raise _bad(f"instructions: {name} takes none (the voice is female or male; language picks the locale)")
++            if body.get("speed") not in (None, 1, 1.0):
++                raise _bad("speed: only 1.0")
++            seed = body.get("seed")
++            seed = int(seed) if isinstance(seed, int) and seed >= 0 else None
++            msgs = [{"role": "system", "content": f"Perform TTS in {locale} using a {voice} voice."}, {"role": "user", "content": text}]
++            slots = max(64, min(SPEECH_SLOTS_MAX, SPEECH_SLOTS_PER_CHAR * len(text) + 32))
++            au = speech_sampling(body, m.get("audio_sampling", SPEECH_AUDIO))
++            h = await self.lfm3_open(_SpeechReq(name, slots, seed), msgs, None, None, False, "<|audio_start|>", speech={"slots": slots, "audio": au})
++        except NpuError as e:
++            return self._error(e)
++        rate = m["speech_out"]["rate"]
++        fin = {}
++
++        async def pieces():
++            async with contextlib.aclosing(self.speech_events(h, http_request)) as ev:
++                async for kind, x in ev:
++                    if kind == "aud":
++                        yield x
++                    elif kind == "end":
++                        fin.update(x)
++        if stream:
++            src = pieces()
++            try:
++                head = await src.__anext__()
++            except StopAsyncIteration:
++                return self._error(NpuError(502, "the model made no speech for this input", "server_error"))
++            except NpuError as e:
++                await src.aclose()
++                return self._error(e)
++
++            async def rest():
++                try:
++                    yield head
++                    async for p in src:
++                        yield p
++                except NpuError:
++                    return
++                finally:
++                    await src.aclose()
++            return StreamingResponse(rest(), media_type="audio/pcm", headers={"X-Sample-Rate": str(rate)})
++        try:
++            pcm = b"".join([p async for p in pieces()])
++            if not pcm:
++                raise NpuError(502, "the model made no speech for this input", "server_error")
++        except NpuError as e:
++            return self._error(e)
++        hdr = {"X-Sample-Rate": str(rate), "X-Halogen-Finish": "length" if fin.get("reason") == "length" else "stop"}
++        if fmt == "pcm":
++            return Response(pcm, media_type="audio/pcm", headers=hdr)
++        return Response(wav_header(len(pcm), rate) + pcm, media_type="audio/wav", headers=hdr)
++
++    def _audio_out_args(self, req, m):
++        mods = getattr(req, "modalities", None)
++        if not m.get("speech_out"):
++            raise _bad(f"'{req.model}' has no audio output: modalities / audio are for a speech model (lfm3-audio-2b)")
++        if mods is not None and (not isinstance(mods, list) or any(x not in ("text", "audio") for x in mods)):
++            raise _bad("modalities: a list of text and audio")
++        a = getattr(req, "audio", None)
++        if not wants_audio_out(req):
++            raise _bad("audio: needs modalities naming audio")
++        if not isinstance(a, dict):
++            raise _bad("audio: {voice, format} is required with modalities audio")
++        voice = speech_voice(a.get("voice"), allow_default=False if a.get("voice") is not None else True)
++        fmt = str(a.get("format") or "wav").lower()
++        if fmt not in ("wav", "pcm16", "pcm"):
++            raise _bad("audio.format: wav or pcm16 (24 kHz, 16-bit mono); other formats are not made here")
++        if req.stream and fmt == "wav":
++            raise _bad("audio.format: a streamed reply is pcm16")
++        if req.tools:
++            raise _bad("tools: not with audio output (the model decides between a call and speech by itself)")
++        return voice, ("wav" if fmt == "wav" else "pcm16")
++
++    async def _chat_audio_out(self, req, http_request):
++        from fastapi.responses import JSONResponse, StreamingResponse
++        m = self.models[req.model]
++        tok = m["tok"]
++        try:
++            voice, fmt = self._audio_out_args(req, m)
++            instr = "Respond with interleaved text and audio."
++            msgs = []
++            for x in req.messages:
++                if isinstance(x, dict) and x.get("role") == "assistant" and isinstance(x.get("audio"), dict):
++                    tr = str(x["audio"].get("transcript") or "")
++                    x = {k: v for k, v in x.items() if k != "audio"}
++                    if not x.get("content"):
++                        x["content"] = tr
++                msgs.append(x)
++            if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") in ("system", "developer"):
++                c = msgs[0].get("content")
++                if isinstance(c, str) and c.strip().startswith(instr):
++                    pass
++                elif isinstance(c, str):
++                    c = instr + ("\n\n" + c if c else "")
++                elif isinstance(c, list):
++                    c = [{"type": "text", "text": instr + "\n\n"}] + c
++                else:
++                    c = instr
++                msgs[0] = dict(msgs[0], role="system", content=c)
++            else:
++                msgs.insert(0, {"role": "system", "content": instr})
++            want = req.max_completion_tokens if req.max_completion_tokens else req.max_tokens
++            slots = max(1, min(int(want or GEN_MAX_TOKENS), SPEECH_SLOTS_MAX))
++            au = speech_sampling(getattr(req, "model_extra", None) or {}, m.get("audio_sampling", SPEECH_AUDIO))
++            h = await self.lfm3_open(req, msgs, None, None, keep=lfm3_keep(req), pre="<|mixed_start|>", speech={"slots": slots, "audio": au})
++        except NpuError as e:
++            return self._error(e)
++        rate = m["speech_out"]["rate"]
++        aid, created = "audio_" + uuid.uuid4().hex[:24], int(time.time())
++        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
++        head = {"id": cid, "created": created, "model": req.model, "system_fingerprint": m["fp"]}
++        expires = created + 3600
++
++        def usage_of(fin, frames):
++            u = {"prompt_tokens": h["n_prompt"], "completion_tokens": fin["n_gen"], "total_tokens": h["n_prompt"] + fin["n_gen"]}
++            if frames:
++                u["completion_tokens_details"] = {"audio_tokens": frames}
++            return u
++
++        def frames_of(fin, nbytes):
++            try:
++                return int(fin["kv"]["frames"])
++            except (KeyError, ValueError):
++                return nbytes // (2 * 1920)
++
++        if not req.stream:
++            out, pcm, fin = [], [], None
++            try:
++                async for kind, x in self.speech_events(h, http_request):
++                    if kind == "tok":
++                        out += x
++                    elif kind == "aud":
++                        pcm.append(x)
++                    else:
++                        fin = x
++            except NpuError as e:
++                return self._error(e)
++            if fin is None:
++                from fastapi.responses import Response
++                return Response(status_code=499)
++            raw = b"".join(pcm)
++            data = wav_header(len(raw), rate) + raw if fmt == "wav" else raw
++            text = tok.decode(out, skip_special_tokens=True).strip()
++            msg = {"role": "assistant", "content": None,
++                   "audio": {"id": aid, "data": base64.b64encode(data).decode(), "expires_at": expires, "transcript": text}}
++            return JSONResponse({**head, "object": "chat.completion",
++                                 "choices": [{"index": 0, "message": msg, "logprobs": None,
++                                              "finish_reason": "length" if fin["reason"] == "length" else "stop"}],
++                                 "usage": usage_of(fin, frames_of(fin, len(raw)))})
++        so = req.stream_options
++        with_usage = isinstance(so, dict) and bool(so.get("include_usage"))
++
++        def chunk(choices, **kw_):
++            return "data: " + json.dumps({**head, "object": "chat.completion.chunk", "choices": choices, **kw_}, ensure_ascii=False) + "\n\n"
++
++        async def sse():
++            yield chunk([{"index": 0, "delta": {"role": "assistant", "content": None}, "logprobs": None, "finish_reason": None}])
++            out, sent, first, nb = [], 0, True, 0
++            try:
++                async with contextlib.aclosing(self.speech_events(h, http_request)) as ev:
++                    async for kind, x in ev:
++                        if kind == "tok":
++                            out += x
++                            text = tok.decode(out, skip_special_tokens=True)
++                            if text.endswith("\ufffd"):
++                                continue
++                            if len(text) > sent:
++                                a = {"id": aid, "transcript": text[sent:]}
++                                sent = len(text)
++                            else:
++                                continue
++                        elif kind == "aud":
++                            nb += len(x)
++                            a = {"id": aid, "data": base64.b64encode(x).decode()}
++                        else:
++                            text = tok.decode(out, skip_special_tokens=True)
++                            if len(text) > sent:
++                                yield chunk([{"index": 0, "delta": {"audio": {"id": aid, "transcript": text[sent:]}}, "logprobs": None,
++                                              "finish_reason": None}])
++                            yield chunk([{"index": 0, "delta": {}, "logprobs": None, "finish_reason": "length" if x["reason"] == "length" else "stop"}])
++                            if with_usage:
++                                yield chunk([], usage=usage_of(x, frames_of(x, nb)))
++                            continue
++                        if first:
++                            a["expires_at"], first = expires, False
++                        yield chunk([{"index": 0, "delta": {"audio": a}, "logprobs": None, "finish_reason": None}])
++            except NpuError as e:
++                yield "data: " + json.dumps({"error": {"message": e.message, "type": e.code}}) + "\n\n"
++            yield "data: [DONE]\n\n"
++        return StreamingResponse(sse(), media_type="text/event-stream")
++
+     def add_routes(self, app, ours=()):
+         from typing import Any, Optional
+ 
+@@ -3396,8 +4571,11 @@
+             return await self.speech(http_request)
+         app.add_api_route("/v1/audio/speech", speech, methods=["POST"])
+ 
++def raw_text_models(models):
++    return sorted(k for k, m in models.items() if m.get("style") == "lfm3" and not m.get("ovis"))
++
+ def serve_only(args, ChatReq, oai_error, keepalive_s, install_auth=None,
+-               uvicorn_kw=None, CompletionReq=None):
++               uvicorn_kw=None, CompletionReq=None, wire_routes=None):
+     import uvicorn
+     from fastapi import FastAPI, Request
+     from fastapi.exceptions import RequestValidationError
+@@ -3408,7 +4586,13 @@
+     tdirs = [tdirs] if isinstance(tdirs, str) else list(tdirs)
+     front = Front(args.npu or "127.0.0.1:8740", [args.tokenizer] + tdirs,
+                   oai_error, args.queue_timeout)
+-    app = FastAPI(title="halogen")
++
++    @contextlib.asynccontextmanager
++    async def _lifespan(_app):
++        await _start()
++        yield
++
++    app = FastAPI(title="halogen", lifespan=_lifespan)
+     if install_auth is not None:
+         install_auth(app)
+     front.add_routes(app)
+@@ -3437,14 +4621,15 @@
+         return oai_error(500, f"internal error: {type(exc).__name__}: "
+                               f"{str(exc)[:300]}", "server_error")
+ 
+-    @app.on_event("startup")
+     async def _start():
+         try:
+             await front.start()
+         except Exception as e:
+             print(f"serve_api: {e}", flush=True)
+             os._exit(1)
+-        if CompletionReq is not None and any(m.get("style") == "lfm3" for m in front.models.values()):
++        if wire_routes is not None and any(m.get("style") == "lfm3" for m in front.models.values()):
++            wire_routes(app, front)
++        if CompletionReq is not None and raw_text_models(front.models):
+             async def completions(req: CompletionReq, http_request: Request):
+                 if not front.owns(req.model):
+                     return oai_error(404, f"The model `{req.model}` does not exist or "
+@@ -3453,7 +4638,7 @@
+                                      "model_not_found")
+                 return await front.complete(req, http_request)
+             app.add_api_route("/v1/completions", completions, methods=["POST"])
+-        print(f"serve_api: NPU-only, listening on {args.host}:{args.port}",
++        print(f"serve_api: NPU-only, listening on {args.listen_name}:{args.port}",
+               flush=True)
+ 
+     @app.get("/health")

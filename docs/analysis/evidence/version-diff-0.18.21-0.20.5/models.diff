@@ -1,0 +1,227 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/npu/models.txt	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/models.txt	1970-01-01 10:00:01.000000000 +1000
+@@ -3,7 +3,7 @@
+ # every file's size and sha256 must match. Filled by the release that publishes
+ # the files; one line a model, then one line a file:
+ #
+-#   model <id> repo=<org>/<repo> revision=<commit> task=decision|embedding|score|classify|generate|image|transcribe|guard|speak [devices=<id>] source=<org>/<repo>@<commit> license=<spdx>
++#   model <id> repo=<org>/<repo> revision=<commit> task=decision|embedding|score|classify|generate|image|transcribe|guard|speak [devices=<id>] [vis=<id>] source=<org>/<repo>@<commit> license=<spdx>
+ #
+ # The task is what the front end serves the model for: decision (the deciders'
+ # decisions), embedding (/v1/embeddings; EmbeddingGemma 2's devices/ also holds
+@@ -38,7 +38,12 @@
+ # vis/devices.hnpm ...), after devices/ and before <id>.hnpw, and the
+ # entrypoint passes the directory to the NPU engine as a second set beside the
+ # model's own. This holds for a model on another's devices= too: wemm-embedding-4b
+-# runs its text on decider-4b's devices/ and its images on its own vis/.
++# runs its text on decider-4b's devices/ and its images on its own vis/. A model whose line names vis=<other id>
++# holds no files of its own: it runs on its devices= model's devices/ with that model's vis/ (lfm3-vl-2b-fast).
++#
++# A model line may name aud=<id>: the record whose aud/ folder (an audio encoder's set: devices.hnpm, its .elf files, NOTICE.md) the
++# model reads beside its devices= trunk set, as vis= names a tower's (lfm3-audio-2b: aud=lfm3-audio-2b; its :fast form names the
++# same). Its file lines (aud/...) are the published set's.
+ #
+ # An empty repo= (and revision=) is a model whose files are recorded but have no
+ # download source yet: the files are still checked, and HALOGEN_DOWNLOAD names
+@@ -134,6 +139,9 @@
+ file qwen3guard-stream-0.6b qwen3guard-stream-0.6b.hnpw 813585376 3304508136b6435632c00042606fb0d0204869374abf8daacb734f7ce7c776d9
+ file qwen3guard-stream-0.6b tokenizer/tokenizer.json 11422654 aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+ file qwen3guard-stream-0.6b heads.npz 4247478 ad426b23dcd257fc1350b0b5b9311f3f1348ede6928ea69417067ac5ece58c41
++model halogen-spotter-0.6b repo=peonist-ai/halogen-spotter-0.6b revision= task=classify devices=qwen3-embedding-0.6b source=peonist-ai/halogen-spotter-0.6b@cd88149807fe98be836c35ca8fab796e44677fc5 license=apache-2.0
++file halogen-spotter-0.6b halogen-spotter-0.6b.hnpw 813581112 ddf3fe003b710a80d1df80a5e6b0f66c3ffdcbbed304f8a4e88bb39c04f8676c
++file halogen-spotter-0.6b tokenizer/tokenizer.json 11422654 aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+ model qwen3-embedding-4b repo=peonist-ai/halogen-npu-qwen3-embedding-4b revision=0ab7221987083c7f2ba4fcde2a2219dc95ab0523 task=embedding source=Qwen/Qwen3-Embedding-4B@5cf2132abc99cad020ac570b19d031efec650f2b license=apache-2.0
+ file qwen3-embedding-4b devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+ file qwen3-embedding-4b devices/consts.hnpb 5218200 123713df2e2339e2906754b6f3556da83874939ba8b751cc62d7b3703f6f4a2b
+@@ -237,22 +245,22 @@
+ file wemm-embedding-4b vis/consts.hnpb 285080 7037614f882c438903c918e8ab4aec44c77d799135cf7eaf460fecf8e679bcf4
+ file wemm-embedding-4b wemm-embedding-4b.hnpw 5691690616 38bc8fb6f5666a3d8e8288af1be282a7a51b97aa579067ba8d87c163bfce06bb
+ file wemm-embedding-4b tokenizer/tokenizer.json 19990378 40e444c744512f423da4c8443c47c21e22ff76056ba4e9796a81c04c13a9daf0
+-model d3-lite repo=peonist-ai/halogen-npu-d3-lite revision=2def562ec3af8bfe75b6e1d5c6366b65ae46adfb task=decision source=vllm-sr/d3-lite@03560c26f5199c3c04129a2ccb38960c913635e0 license=apache-2.0
+-file d3-lite devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+-file d3-lite devices/consts.hnpb 12672920 6f223c1c4f72c74597be446f69fe135cc65ac2dd162da3eece44389b865fd591
+-file d3-lite devices/devices.hnpm 49463 ab8d378e3cc5ded9a6a28b47f31ba393663a1cfae203f506da7893fbdf3cbdc8
+-file d3-lite devices/u0.elf 15825768 bde9cc60e37ad4c2bdd2b847056bb527bd87e5bac6a942a391f20432255852b7
+-file d3-lite devices/u1.elf 8564456 1a01c8f9472cab39812e05320f03cf4e0f5e5416deac68d5044ba3a7410402b2
+-file d3-lite devices/u10.elf 10754456 27d4764021322d3ebcd90f88596061c8d281de5dfec86a6bfaca2dba5144a561
+-file d3-lite devices/u2.elf 8665720 eb18ec874c4f3da951017deb3859be5e82a99ffd822d9415ce06e18be9e021ca
+-file d3-lite devices/u3.elf 9194552 fde1a18d3d747941a759e9b2518d1736c80c1fb6ee36da0a2da0baefc467f4da
+-file d3-lite devices/u4.elf 9740728 4ef143f8a7af6c1c0eba18eb0c9ad699ef789b2c80ab03ed1e7ae6b670daabf4
+-file d3-lite devices/u5.elf 10277128 c57290c3ed2e2209f5c448e1ef4bfc854ca1f8d29f3b396abc498556728e15b1
+-file d3-lite devices/u6.elf 11363704 ecd51dc2f2c20cf1d2f55dd47246ebd60078d279c06524b1b7b39de9f12e6de0
+-file d3-lite devices/u7.elf 12450472 e4c16551db87359e039bc4a75988460eb7f55ebfe1403ec538009b53ff8148d1
+-file d3-lite devices/u8.elf 14624328 47a1b0189bd137e969a966493b6e4c95a686299d6b5a8c5a6658a22e4d4d710e
+-file d3-lite devices/u9.elf 16809048 7f3a9aa2c040612f47248c891988d60e550d7748947b45bd9547552033c6bf11
+-file d3-lite devices/u11.elf 8570648 6633ba5f4402de94480858f0bc8650ae432afe8036d4da6a9f82f4740065e092
++model d3-lite repo=peonist-ai/halogen-npu-d3-lite revision=8919811a106cd7071defc9f284261a589b021266 task=decision source=vllm-sr/d3-lite@03560c26f5199c3c04129a2ccb38960c913635e0 license=apache-2.0
++file d3-lite devices/NOTICE.md 6711 06ef85455827947345ff5e38752e454015bf44e9c8ad97d4df3e2f2b34c44580
++file d3-lite devices/consts.hnpb 13825624 b5f4a42c5b3c4dfdc970dbefd8194c560264a8944e6821c0d7f3ebca87c5c829
++file d3-lite devices/devices.hnpm 56252 996c77ee191161db6cb4ae038e7882e41f694f1c01388f889afc077e1912a0b4
++file d3-lite devices/u0.elf 16238440 fd3d8e99bc01348efbbe16386be2285f522db48a00772164de664eae1cf9941e
++file d3-lite devices/u1.elf 10223176 7aafa6ec3c8dc26e0c78a2ac2955b866a4aecc4a6ee163fd5b333821b5c3ce26
++file d3-lite devices/u10.elf 11192536 59cafb120c84c05f21eb414f2e0815667a8b4c3d8f3c0649f60018f2ced05c1e
++file d3-lite devices/u2.elf 9004152 06dc8a785dff5f608a641afa3a64242821fb27c6950456ada6f498c44b422290
++file d3-lite devices/u3.elf 9547384 e6a6c0c1784c84f4720bb19ea4e5f55fe93fca3f962df8b30ada7e77aa752e76
++file d3-lite devices/u4.elf 10109304 d52d082400454fd35f54b3b6860bdc64f2966f7ff262a5c8e5b600fe560b9170
++file d3-lite devices/u5.elf 10661448 eee9c451a7d9854f19b820f1400c044c433a42356bc301a3aa0b3e7ebd8a3b3e
++file d3-lite devices/u6.elf 11780856 395cd12375334a6a3587eac54f014547b93228bb7a446c6a5f03ce1b0dd9e122
++file d3-lite devices/u7.elf 12900456 2a4b38f7972865276915609ba3df3f938fb90e3779c447f0395adf7fbdd06a82
++file d3-lite devices/u8.elf 15139976 f9736d95a5186f476d80df319620275f307f4208ce8a056e8aa4312236a2b816
++file d3-lite devices/u9.elf 17390456 d6d566971f3d63cc5a84c3d11df391e1406e3524d262353a8aff67912daf6e52
++file d3-lite devices/u11.elf 10217432 46a9c3744330e525c66be743a56e5ba593b545696c179d11ebb5d3673f724e28
+ file d3-lite vis/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+ file d3-lite vis/devices.hnpm 6118 f539dbfa4d6b3b907f6ef17f07585bac8f6f534f801d855137897019eb9bd23e
+ file d3-lite vis/u0.elf 3144680 16dcce2b4bf62c526b41ce4d782fe7963b88daa7b693d24622dfae295957712a
+@@ -261,21 +269,21 @@
+ file d3-lite vis/consts.hnpb 512208 6f4633018c90f8512fc728b3adde95a2b88a2044dddaf6b5871add9ea21ecd60
+ file d3-lite d3-lite.hnpw 2271419312 6512d1bdc220a79bb5d8fc265cdec7d93d329381ddfc4c2fd55dec38ae96275d
+ file d3-lite tokenizer/tokenizer.json 12807982 5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42
+-model d3-nano repo=peonist-ai/halogen-npu-d3-nano revision=2f7bc2e484074318a016914323075fa62d2424d0 task=decision source=vllm-sr/d3-nano@462efc366229ea268cf4eed3738b3fc4415e4817 license=apache-2.0
+-file d3-nano devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+-file d3-nano devices/consts.hnpb 11897736 d6c7e7e48d2d7d4252be94b88bfe99e3f1e73068046d33de9f018c745fabe4c7
+-file d3-nano devices/devices.hnpm 42274 18edd1aaf0d36b742fa974f2d719ca5464f9a3893d7d4eebda5a242a201bb574
+-file d3-nano devices/u0.elf 8576104 51d3fbb1fcf63d9311392d31ebe4b2e02dc356ec397cfca9e4b13e8f60851f5b
+-file d3-nano devices/u1.elf 8569912 5dfa4557e87438cc7fec35bf8e5a9c39510c29b4749d57405bab47185a935f89
+-file d3-nano devices/u10.elf 10745368 1e531cf3dc833819ea367e7cb54c9d818d4aa8e0f6261f362d03126d3ee1ebbc
+-file d3-nano devices/u2.elf 8662520 9779cc776e2f60e4aecd2836f0a076925ee9f0e28e17adc2685d069b11702a8d
+-file d3-nano devices/u3.elf 9189240 ee014b55a1e5021d90b5ddfd17c6931d56f5ba5efa010786f126373ce08f6595
+-file d3-nano devices/u4.elf 9733528 443c36e0e16d74cc56593858251a3e78a796336081a23fcb085901738bc5ddd1
+-file d3-nano devices/u5.elf 10268040 746d16eabc36f87519edb5036c7bd1766a8b2f1b6c6be2a82eacb4c952474670
+-file d3-nano devices/u6.elf 11351288 70bb650dc922ff5f67aa10a5da8742cc7c6a35c8a1b438a5d58d252b93ed60d2
+-file d3-nano devices/u7.elf 12434728 dbc26d9eaef8d8852f9dd577e0c8b63e13ba3ce0aaebf274e79378589a74b193
+-file d3-nano devices/u8.elf 14601928 b8eacafcf575fc4dd14a19819bd5fd97c90ebd78379b906dd07191c80702c71d
+-file d3-nano devices/u9.elf 16779992 c9a9b80a72520df0872fcd737e326da519dc84fe56633d388d501bcecdcd9d97
++model d3-nano repo=peonist-ai/halogen-npu-d3-nano revision=318043118f3791cf4cde55f9401114ce517d04ca task=decision source=vllm-sr/d3-nano@462efc366229ea268cf4eed3738b3fc4415e4817 license=apache-2.0
++file d3-nano devices/NOTICE.md 6711 06ef85455827947345ff5e38752e454015bf44e9c8ad97d4df3e2f2b34c44580
++file d3-nano devices/consts.hnpb 12006024 89cb5f28ddaabc219020fd48626fc04fbc3be7c4814de89685fcf211745b0498
++file d3-nano devices/devices.hnpm 44419 59d2f67a448f2c3b3168d8d138a4c75ab5e276f4d5fd51ca2c599597c4c2f54e
++file d3-nano devices/u0.elf 8842344 17e24b5c70249e3bcd60203c1920be141df3b665a8cdcf4f03b7a0b4dc7325d3
++file d3-nano devices/u1.elf 8836152 d02e42b3c93ea99d3bedd1988f94ab931cb86c0a9146f2807ad826b5ca3fa7ea
++file d3-nano devices/u10.elf 11011608 94ed3a0bf95ca6e54e8ed7c42eb9b8a1c4b2e1ab3bea7677dfbf117dc7131869
++file d3-nano devices/u2.elf 8875000 7919d107f36fa347572fb891a2a203f08e7516ea5d60db5ef343bc4d1ca0db1c
++file d3-nano devices/u3.elf 9401720 c9a9cca80a8a46c2ee460838125d43b7791a6ebb582f82b93269babd78a70deb
++file d3-nano devices/u4.elf 9946008 c0a99d4c631025b8a51f4bacc59093a27cfe34015b64d9943980dc7873630e94
++file d3-nano devices/u5.elf 10480520 ecd5bed59bd6e8d2ea2fda5b1f76e21bd85b8d3272b0d0d81f66c4f2413b4c87
++file d3-nano devices/u6.elf 11563768 594ce839c87b8541fbde8aba18a42de1d095e72566e331f53eb2645ce3c0ed6a
++file d3-nano devices/u7.elf 12647208 f73a5bc1fd38d7d12dab3fc004841c6215c148495ff1333c3d8b943a8e2ccddb
++file d3-nano devices/u8.elf 14814408 ac91bb139da96d394f896ae3053c3515891ca1cdeb7eeb4f4d78a04d7f2dde1e
++file d3-nano devices/u9.elf 16992552 ea965e6fe3909d4c2d9ef362b4b0d81881a3716d85a1f15ebb55bcab63abd9f5
+ file d3-nano vis/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+ file d3-nano vis/devices.hnpm 7518 a8719a240e4252461ecf90389fc0f50a9e7ac772f619ee4cb48bd2a7377d7a09
+ file d3-nano vis/u0.elf 5401296 25552cf5fce73e7636f58f262743acc4cb407539c3bb344c33714dc02e6ee948
+@@ -343,25 +351,93 @@
+ # Programs for the user's own checkpoint only (devices/ alone: no weight file, no tokenizer; their licence keeps the weights with
+ # the user). Named by a path in HALOGEN_NPU_MODELS, never by these ids: /models/<dir> runs LFM3-1.7B (or a fine-tune of it) on
+ # lfm3-1.7b, /models/<dir>:fast on lfm3-1.7b-fast (int5 weights: faster decode, a small quality cost), and a d1-2B checkpoint on
+-# d1-2b. The release that publishes the sets records their files (tools/npu_pins.py --user).
+-model lfm3-1.7b repo=peonist-ai/halogen-npu-lfm3-1.7b revision=8586fb6b23895d1c0c98a3a6500ee4df3ab97524 task=generate source=LiquidAI/LFM3-1.7B@40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd license=lfm1.0
+-file lfm3-1.7b devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+-file lfm3-1.7b devices/consts.hnpb 319634592 f7e5ab4f49201e3fa6df23c7b8520afa2602f161b27273e41eadb784479855da
+-file lfm3-1.7b devices/devices.hnpm 34362 8141ea10679ee4c08b2bd0792c1702bb4bd4482e880558c4bff25192e43ca29f
+-file lfm3-1.7b devices/u0.elf 2999232 e42eef7a9feca2df475d83de0925382364420e8a0ef3314e2d6366f66427f7be
+-file lfm3-1.7b devices/u1.elf 5221656 a49b1f736e7e40a887ccfd3e1c8a7f7d8a91e7f03f824f082192979f6aaee192
+-file lfm3-1.7b devices/u2.elf 5587784 f7eba56d869ef2a968d520e3c02fafaacfa21573c7416ba94b4c45e0b7deb940
+-file lfm3-1.7b devices/u3.elf 6338408 666f5fba581939a3b394002788667ad19186150d1187c5c9bee04130bb83f210
+-file lfm3-1.7b devices/u4.elf 81324264 2cf1999715a2b08923db61e4341e0b1148abf399de43a40ff45ea9dfec2f170e
+-file lfm3-1.7b devices/u5.elf 13285632 a6b9bd230e7699346aff9a05547def4ebbbac805508f858ed0a80a452a9f6499
+-model lfm3-1.7b-fast repo=peonist-ai/halogen-npu-lfm3-1.7b-fast revision=b04fc8f1d37f700f3973719e43db340f86a1ec49 task=generate source=LiquidAI/LFM3-1.7B@40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd license=lfm1.0
+-file lfm3-1.7b-fast devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
+-file lfm3-1.7b-fast devices/consts.hnpb 319675552 e4a75b321e4f3c2108bce4534e1be66fc006e36ddf80bdbcaba1465d2e807f8c
+-file lfm3-1.7b-fast devices/devices.hnpm 34348 9271fc4ba7ac2b49faf64d9b19c39c2ecfc54c25e968f269ec14ad808a4ca31d
+-file lfm3-1.7b-fast devices/u0.elf 2999232 df1727d0faa6a85ad565143ec17506a503f1ea03db55207c9335d78776ae1c59
+-file lfm3-1.7b-fast devices/u1.elf 5221656 16a74a4b8bf8ccaf05a826b5e2eef0ef3c0ebc4d16055211851abfc30e163e64
+-file lfm3-1.7b-fast devices/u2.elf 5587784 07a56c358e70c5c6e7bc2a28377f63ed542cd91cc9dae57411c4dcaa997822ef
+-file lfm3-1.7b-fast devices/u3.elf 6338408 9cd3c291490862c4cb0531a34cfb0e065c6e1c57f4db46d933c78d2990a21bc6
+-file lfm3-1.7b-fast devices/u4.elf 81324264 0e92e18dce7716ae6733a99ab3e098da034c7790aabdfa042ce8e23730462f5e
+-file lfm3-1.7b-fast devices/u5.elf 13339904 9971f7bbedae69f1383a6f9c04c37278debb117c164963b441b658f235f8e6c9
+-model d1-2b repo= revision= task=decision source=LiquidAI/d1-2B@97c57047d5852d77e02dfac211f8768aff77a8b2 license=lfm1.0
++# d1-2b, and an OvisOCR3 checkpoint on ovisocr3. The release that publishes the sets records their files (tools/npu_pins.py --user).
++model lfm3-1.7b repo=peonist-ai/halogen-npu-lfm3-1.7b revision=b9b15f09c8a8ecb2550791e5fb806674a310c8da task=generate source=LiquidAI/LFM3-1.7B@40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd license=lfm1.0
++file lfm3-1.7b devices/NOTICE.md 6708 8908fbd49a53ee9b9f1ed5624bb0f2c360917034f3a7bc7a0b66c82fafa720f7
++file lfm3-1.7b devices/consts.hnpb 321723824 9c590c1229c058855b51fce9803b79e7f6ddcd751b693cfc668fb3bf72d4a6f7
++file lfm3-1.7b devices/devices.hnpm 41484 70c7e9e63c2cf61a4625229a67bf2aebd5534be51f655c6f6fec12ef0f23f351
++file lfm3-1.7b devices/u0.elf 3428128 0edbd7a01afc0d14d1b8945022cb968cb8846e2b81417d1335eb006291a15589
++file lfm3-1.7b devices/u1.elf 3487136 783a17c28b3c5eacc70fa59c879de9ed6969851180a46353f8b4746b92c1b940
++file lfm3-1.7b devices/u2.elf 3582656 d8fdce76d9249ef69b33ea8b509cff8afbfb0acc3b82ec0c075ed26fbf4507c4
++file lfm3-1.7b devices/u3.elf 5743896 da4c9e44dddfd76719d5ef5c92f780d91ed2a495e6f4bcad081c6508d28d8507
++file lfm3-1.7b devices/u4.elf 7545096 300cd55a2d2ad49e7d9a8cb983afef395cc5ecf0ffe3e2837cdf35a966e69b6b
++file lfm3-1.7b devices/u5.elf 6860648 18cb080cef8c74a239a2b198a472e5cb1fbe7c110356ceaa369b98550c70315e
++file lfm3-1.7b devices/u6.elf 73180184 e22a37afebcd79b5b3afa02601b5d79f3208005bd049502da5fd4c57eba32281
++file lfm3-1.7b devices/u7.elf 14404480 4ba3fa552ebd1a1849784701fb26686631c25bacb09ddac05c373db935ac01ce
++model lfm3-1.7b-fast repo=peonist-ai/halogen-npu-lfm3-1.7b-fast revision=aa6207e4d84fc10c669629da29c133248a473429 task=generate source=LiquidAI/LFM3-1.7B@40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd license=lfm1.0
++file lfm3-1.7b-fast devices/NOTICE.md 6708 8908fbd49a53ee9b9f1ed5624bb0f2c360917034f3a7bc7a0b66c82fafa720f7
++file lfm3-1.7b-fast devices/consts.hnpb 321748400 4f779f9c0de091fbf2ddeed079d7a04a9e2d97b5b9162f530b8dff8406258f90
++file lfm3-1.7b-fast devices/devices.hnpm 41464 b8b5b8eb66417c96bc536d506fec146ce45632c00c14bd2aad066b86681e7049
++file lfm3-1.7b-fast devices/u0.elf 3428128 0edbd7a01afc0d14d1b8945022cb968cb8846e2b81417d1335eb006291a15589
++file lfm3-1.7b-fast devices/u1.elf 3487136 783a17c28b3c5eacc70fa59c879de9ed6969851180a46353f8b4746b92c1b940
++file lfm3-1.7b-fast devices/u2.elf 3582656 d8fdce76d9249ef69b33ea8b509cff8afbfb0acc3b82ec0c075ed26fbf4507c4
++file lfm3-1.7b-fast devices/u3.elf 5743896 da4c9e44dddfd76719d5ef5c92f780d91ed2a495e6f4bcad081c6508d28d8507
++file lfm3-1.7b-fast devices/u4.elf 7545096 300cd55a2d2ad49e7d9a8cb983afef395cc5ecf0ffe3e2837cdf35a966e69b6b
++file lfm3-1.7b-fast devices/u5.elf 6860648 18cb080cef8c74a239a2b198a472e5cb1fbe7c110356ceaa369b98550c70315e
++file lfm3-1.7b-fast devices/u6.elf 73180184 e22a37afebcd79b5b3afa02601b5d79f3208005bd049502da5fd4c57eba32281
++file lfm3-1.7b-fast devices/u7.elf 14434144 4340abb8bf48dde8904b847c9d47a5f75ae05d4c41f1f6c160b8b68b120e08b0
++model d1-2b repo=peonist-ai/halogen-npu-d1-2b revision=76c2a527c6b5b2ba0bb90012eb3e9e4db29df95e task=decision source=LiquidAI/d1-2B@97c57047d5852d77e02dfac211f8768aff77a8b2 license=lfm1.0
++file d1-2b devices/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
++file d1-2b devices/consts.hnpb 22527992 c5d4d836e49b58e6d59416cc14985daecbb4729f8fb2ddc132de7fde9c89d950
++file d1-2b devices/devices.hnpm 23918 95d4ee8ee1af5c2dbeec5b96976f6aa884b96251efb7233f3e5acf8d9c64ca81
++file d1-2b devices/u0.elf 5321736 30e987028f1da1b369385db80590acefd0faacf648ec95c486d44d1f02eac8b9
++file d1-2b devices/u1.elf 6000280 b06f958505b0e41bee735ee4596d3b56a9e69e622c09605d70ccb80fd3eb7eb2
++file d1-2b devices/u2.elf 6679576 0eb2b06b59e48956be5c3678f189f2dee197d1928601914712ed26a252eb8765
++file d1-2b devices/u3.elf 8145880 6bb04cd20130c6beba43c0cc1a419d4f94f51bf2871de2cde3ff744bb45ba84a
++file d1-2b vis/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
++file d1-2b vis/consts.hnpb 1020448 a8c49d9d5125a366dd2eb0984c321a20893adf700ecd9c33de8c5495c1da404e
++file d1-2b vis/devices.hnpm 15212 66a88d43797088aa8009462a7d207025c74dd19aa8f8f78960d0bbfcf8bda130
++file d1-2b vis/u0.elf 3497336 4115baff03135f3bd3ca1bb9477c16419d7ac287925051e24da9c34d9499da65
++file d1-2b vis/u1.elf 5430664 e0dd41bf2e1c03d1e509cbcfd90060988b2c4ac5897b68a62a50c9147692191c
++file d1-2b vis/u2.elf 5123704 9f80ef6f97467e32f71a547d55e200b7d284bf9dedb7903ae2e4e188d25c750a
++file d1-2b vis/u3.elf 10228104 cf26cc5ca937a4de467a86eda5e716e3cb9a1aeee9a3db4b1b44b156c89d0eec
++model ovisocr3 repo=peonist-ai/halogen-npu-ovisocr3 revision= task=generate source=ATH-MaaS/OvisOCR3@17f255e2c8ae6d18d5d5edb0a474bd4ed39aef90 license=apache-2.0
++file ovisocr3 devices/NOTICE.md 6711 06ef85455827947345ff5e38752e454015bf44e9c8ad97d4df3e2f2b34c44580
++file ovisocr3 devices/consts.hnpb 17243088 a4c8744a509a0ddf842fcee87dcbeecd1961c81a5ffc4606decb91455c2eb028
++file ovisocr3 devices/devices.hnpm 22414 be381cc42e296dc3594520cb85d5b437e9cd7308fbbe2c6705b4c5076e91d973
++file ovisocr3 devices/u0.elf 16739976 4d76ff54234ff8625f127f8c115a7b0c185b45fdab7a9f822e3030bf9953545c
++file ovisocr3 devices/u1.elf 17813736 c13424083743d3dac33b62b691211cd569770c17f3dc9f5ae65c0e603a13ae77
++file ovisocr3 devices/u2.elf 20521624 677705ce37837206ac8680d3124c36639f5f908a54d0a0735300060a8152f74d
++file ovisocr3 devices/u3.elf 24857496 9b4587e23b8ffa6692e4cb3cef7698e7b43570b05236393acbbba6fa6e1b18a2
++file ovisocr3 devices/u4.elf 34062440 09f45b9cd4797d5260b9f7ecbc3e6d570079d19ec4a7cae039658bfbfcaf1d11
++file ovisocr3 devices/u5.elf 50304360 71e8bb683f33d0fb9a87e6fa3595fdd7ca5ce8cd9ebc88ccabf46fd32178b218
++file ovisocr3 devices/u6.elf 4734688 ce2f19f1b06c6ee284abc11ffc4ad2df3395e990e1f929742848bedced48fdb2
++file ovisocr3 vis/NOTICE.md 6711 06ef85455827947345ff5e38752e454015bf44e9c8ad97d4df3e2f2b34c44580
++file ovisocr3 vis/devices.hnpm 21623 76201eda64b299ce93d74ff815e49c8c7fa50c225eae0fb937896ba2a9ce70c4
++file ovisocr3 vis/u0.elf 8083528 2d7104cb88adb46d3336ea2f58f447c95261db82cce16fb5b88b052136bfb1cd
++file ovisocr3 vis/u1.elf 8953512 b8db29d0504913a4b55a7009399b889472c314feab06cca15950ec73dbff66af
++file ovisocr3 vis/u2.elf 9329992 47be30ae9fa42f74b40efa809a769a85c0b423886dbe0152b23f6da6b385ae11
++file ovisocr3 vis/u3.elf 12583592 6c8e9ecf01c65f044390523378ed714fea094496da798654ce98682625b846af
++file ovisocr3 vis/u4.elf 11844424 da8d242c5d994c59428bf1fc39d2ad0f4064ac3a9546a124b0e9b4c3017f4a53
++file ovisocr3 vis/u5.elf 14358856 8b49d46eae54fcd992edea4df30f77622b3265d60bea71e4580af8b4ee873aa2
++file ovisocr3 vis/u6.elf 18130504 30811659ee9249ddf04a28c55efade80da1e2c26bc10052861857d6d8078c002
++file ovisocr3 vis/u7.elf 21064008 83a459c456e5b452f153c2ff4dcedb172527455495f1524551a995a2619f6465
++# LFM3-VL-2B: /models/<dir> runs an LFM3-VL-2B checkpoint (or a fine-tune of it) on lfm3-1.7b's devices/ with
++# its own vision tower in lfm3-vl-2b's vis/ (the converted weight file carries the tower's weights), /models/<dir>:fast on
++# lfm3-1.7b-fast's with the same tower (vis= names the record whose vis/ it reads).
++model lfm3-vl-2b repo=peonist-ai/halogen-npu-lfm3-vl-2b revision=70be2bcd9751d23df15da04b412d00d20c7bf9b6 task=generate devices=lfm3-1.7b source=LiquidAI/LFM3-VL-2B@ba44bd51db20a2753f28c273a1571ccaa210d954 license=lfm1.0
++file lfm3-vl-2b vis/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
++file lfm3-vl-2b vis/devices.hnpm 21234 f839b1c76f567cba04e90db408b5114b7556d42acdd95735e3f213ed3cfb65d4
++file lfm3-vl-2b vis/u0.elf 9938632 3f28c614ef9d778d8bb8828ea5e9f8b5048ba285c07782cbb7a04471c0e88717
++file lfm3-vl-2b vis/u1.elf 11130600 01f8a6dc22e47c6cfcce02f6f2a1e9cd4bf7e0d6b381d5a60d7dab2316976c5f
++file lfm3-vl-2b vis/u2.elf 11565000 54f50e6da1af97de702e029b2465c3b428ea776f50a8d93a4fda4375a4d7f89a
++file lfm3-vl-2b vis/u3.elf 15928040 5cd8eeb7b219620f235d512f6fb5a97b65e7548150e7be136f637171c7f94a71
++file lfm3-vl-2b vis/u4.elf 14853576 41140c994de7071f1cf235c46d464673a8c5df245f9530dc7ddfe591870cb801
++file lfm3-vl-2b vis/u5.elf 18142152 4a4d469478ff58eef02d619e2f96fcf2d87d57ef1eb10b07a9bc54747d3ac20a
++model lfm3-vl-2b-fast repo= revision= task=generate devices=lfm3-1.7b-fast vis=lfm3-vl-2b source=LiquidAI/LFM3-VL-2B@ba44bd51db20a2753f28c273a1571ccaa210d954 license=lfm1.0
++# LFM3-Audio-2B: speech in on the NPU, for the user's own checkpoint. Its trunk runs on LFM3-1.7B's devices/ (lfm3-1.7b,
++# or lfm3-1.7b-fast for /models/<dir>:fast); its audio encoder is the aud/ set of this record (the converted weight file carries the
++# encoder's weights).
++# lfm3-audio-2b speech out needs no program set of its own: the trunk sets and aud/ above; no new file lines.
++model lfm3-audio-2b repo=peonist-ai/halogen-npu-lfm3-audio-2b revision=f9d6f60252b612989384e17ad4f15fd6e8120a58 task=generate devices=lfm3-1.7b aud=lfm3-audio-2b source=LiquidAI/LFM3-Audio-2B@0295e4130594c06800fd25451d97139ac2da1aff license=lfm1.0
++file lfm3-audio-2b aud/NOTICE.md 3248 0f267b3d2523ddf14997ee58660a492a9eaf10ccf6b08bf19dfdc85b9a478b91
++file lfm3-audio-2b aud/devices.hnpm 7676 dd23c8823d70285843dd10c714b359890c08427afbe94e39277f3ea59ee7bb3d
++file lfm3-audio-2b aud/u0.elf 9087232 a874abc4e44184ff2571633f7301ebf15120ea2d1b5323255a76874bd58f2be3
++file lfm3-audio-2b aud/u1.elf 9563648 714b7a496f4ee873557b460ed60528b7199e593f4c1128b7d2441479507ef793
++model lfm3-audio-2b-fast repo= revision= task=generate devices=lfm3-1.7b-fast aud=lfm3-audio-2b source=LiquidAI/LFM3-Audio-2B@0295e4130594c06800fd25451d97139ac2da1aff license=lfm1.0
++# LFM3-Omni-2B: pictures, video (with its soundtrack), speech in and speech out on one trunk, for the user's own
++# checkpoint. Its trunk runs on LFM3-1.7B's devices/ (lfm3-1.7b, or lfm3-1.7b-fast for /models/<dir>:fast); its vision tower is
++# lfm3-vl-2b's vis/ and its speech encoder lfm3-audio-2b's aud/ (vis= and aud= name the records whose sets it reads; the converted weight
++# file carries the tower's, the encoder's and the speech-out weights). It holds no program set of its own, so no file lines.
++model lfm3-omni-2b repo= revision= task=generate devices=lfm3-1.7b vis=lfm3-vl-2b aud=lfm3-audio-2b source=LiquidAI/LFM3-Omni-2B@5797d07c125503bd4f4c0e7f915ae2d3d703e8de license=lfm1.0
++model lfm3-omni-2b-fast repo= revision= task=generate devices=lfm3-1.7b-fast vis=lfm3-vl-2b aud=lfm3-audio-2b source=LiquidAI/LFM3-Omni-2B@5797d07c125503bd4f4c0e7f915ae2d3d703e8de license=lfm1.0

@@ -1,0 +1,3452 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py	1970-01-01 10:00:01.000000000 +1000
+@@ -2,11 +2,13 @@
+ # halogen-flash-server: source shipped as-is, comments stripped. The README is the documentation.
+ import argparse
+ import array
++import array
+ import asyncio
+ import base64
+ import binascii
+ import bisect
+ import collections
++import contextlib
+ import hashlib
+ import hmac
+ import io
+@@ -16,7 +18,10 @@
+ import json
+ import os
+ import random
++import socket
+ import sys
++import contextvars
++import threading
+ import time
+ import uuid
+ import zlib
+@@ -104,7 +109,7 @@
+     return IMAGE_TOKEN_ID
+ 
+ def textify_pad_mentions(ids, snap=0, snap2=0, n_images=0):
+-    if not PAD_TEXT_IDS or not any(v in PAD_TEXT_IDS for v in ids):
++    if not PAD_TEXT_IDS or PAD_TEXT_IDS.keys().isdisjoint(ids):
+         return ids, snap, snap2, 0
+     out, grown, n = [], 0, 0
+     snap0, snap20, last = snap, snap2, len(ids) - 1
+@@ -203,8 +208,82 @@
+ def shield_kwargs(kw):
+     return _marked(kw, _MARK_ALL) if _MARK_ALL is not None else kw
+ 
++TOKENIZE_SPLIT = int(os.environ.get("HALOGEN_TOKENIZE_SPLIT", "16384") or 0)
++_SPLIT_CUT = None
++_SPLIT_TOK = None
++
++def split_encode(text, pieces=None):
++    bk = _SPLIT_TOK
++    if bk is None or bk.truncation is not None or bk.padding is not None:
++        return None
++    n = pieces or min(8, len(text) // max(1, TOKENIZE_SPLIT // 2))
++    if n < 2:
++        return None
++    cuts, step = [0], len(text) / n
++    for k in range(1, n):
++        m = _SPLIT_CUT.search(text, max(int(k * step), cuts[-1] + 1))
++        if m is None:
++            break
++        cuts.append(m.start())
++    if len(cuts) < 2:
++        return None
++    cuts.append(len(text))
++    ids, offs = [], []
++    for c, e in zip(cuts, bk.encode_batch([text[a:b] for a, b in zip(cuts, cuts[1:])],
++                                          add_special_tokens=False)):
++        ids.extend(e.ids)
++        offs.extend(e.offsets if c == 0 else [(s + c, t + c) for s, t in e.offsets])
++    return ids, offs
++
++def split_setup(tok):
++    global _SPLIT_CUT, _SPLIT_TOK
++    _SPLIT_CUT = _SPLIT_TOK = None
++    bk = getattr(tok, "backend_tokenizer", None)
++    if TOKENIZE_SPLIT <= 0 or bk is None:
++        return False
++    import re
++    try:
++        for a in bk.get_added_tokens_decoder().values():
++            if a.lstrip or a.rstrip or " " in a.content:
++                raise ValueError(f"the added token {a.content!r} holds or strips a space")
++        _SPLIT_CUT = re.compile(r"(?<=\S) (?=[^\W\d_])")
++        _SPLIT_TOK = bk
++
++        def whole(t):
++            enc = tok(t, add_special_tokens=False, return_offsets_mapping=True)
++            return list(enc["input_ids"]), [tuple(x) for x in enc["offset_mapping"]]
++        sample = ("Résumé café é ä é 今日は いい天気 \U0001F600\U0001F680 ❤️ नमस्ते ²nd Ⅷ ½ x² it's we'll I'm "
++                  "def f(x):\n    return x  # é\nclass A:\r\n\tpass\n\n  spaced   out \u00a0nbsp a\u3000b "
++                  "<|im_start|>user Hello world<|im_end|> <tool_call> call <think> t </think> e\u0301 "
++                  "z\u0301 ÀÉÎ ΑΒΓ Здравствуйте мир العربية עברית 1234 a1b2 _under __dunder "
++                  "'quoted' \"dq\" (paren) [brk] {brace} a.b.c e.g. U.S.A. --flag -x ~tilde "
++                  "The quick brown fox jumps over the lazy dog near the old river bank, then rests. ")
++        ids, offs = whole(sample)
++        n = 0
++        for m in _SPLIT_CUT.finditer(sample):
++            c = m.start()
++            a_ids, a_offs = whole(sample[:c])
++            b_ids, b_offs = whole(sample[c:])
++            if a_ids + b_ids != ids or a_offs + [(s + c, t + c) for s, t in b_offs] != offs:
++                raise ValueError(f"a cut at {c} changes the tokens")
++            n += 1
++        if n < 40:
++            raise ValueError(f"only {n} cuts in the sample")
++        long = "".join(sample[i:] + sample[:i] for i in range(0, len(sample), 17))
++        for k in (2, 3, 8):
++            if split_encode(long, k) != whole(long):
++                raise ValueError(f"{k} pieces differ from one encode")
++    except Exception as e:
++        print(f"serve_api: long prompts encode in pieces: off ({type(e).__name__}: {e})", flush=True)
++        _SPLIT_CUT = _SPLIT_TOK = None
++        return False
++    return True
++
+ def tokenize_offsets(tok, text):
+     if _UNMARK_RE is None or not _UNMARK_RE.search(text):
++        got = split_encode(text) if len(text) >= TOKENIZE_SPLIT > 0 else None
++        if got is not None:
++            return got
+         enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+         return list(enc["input_ids"]), [tuple(x) for x in enc["offset_mapping"]]
+     ids, offs = [], []
+@@ -345,6 +424,21 @@
+ BILLING_PREFIX = "x-anthropic-billing-header:"
+ TOOL_DEFER = os.environ.get("HALOGEN_TOOL_DEFER", "1").strip() != "0"
+ 
++_MODEL_NAMES_SAID = set()
++
++def flash_model_refusal(name, npu):
++    if not isinstance(name, str) or not name or name.lower() == MODEL_ID.lower():
++        return None
++    import npu_api
++    msg = npu_api.unloaded_refusal(name, [MODEL_ID] + (list(npu.models) if npu is not None else []))
++    if msg:
++        print(f"serve_api: model `{name}` refused (404): {msg}", flush=True)
++        return msg
++    if npu_api.MODEL_NAME_CHECK and name not in _MODEL_NAMES_SAID and len(_MODEL_NAMES_SAID) < 64:
++        _MODEL_NAMES_SAID.add(name)
++        print(f"serve_api: model `{name}` is not a model here: {MODEL_ID} answers it (said once a name)", flush=True)
++    return None
++
+ def anth_error_obj(status, message):
+     return {"type": ANTH_ERROR_TYPES.get(status, "api_error"),
+             "message": message}
+@@ -440,6 +534,10 @@
+ OPENER = "<|im_start|>"
+ REUSE_ON = os.environ.get("HALOGEN_TOKENIZE_REUSE", "1").strip().lower() not in ("0", "off", "false", "no")
+ REUSE_MIN_CHARS = 4096
++REUSE_LINE_STEP = 2048
++
++def line_cut_char(c):
++    return "!" <= c <= "~"
+ 
+ def common_prefix_len(a, b):
+     n = min(len(a), len(b))
+@@ -458,34 +556,219 @@
+         return lo
+     return n
+ 
++class IdsList(list):
++    __slots__ = ("gen_text",)
++
++    def __init__(self, it=(), gen_text=None):
++        super().__init__(it)
++        self.gen_text = gen_text
++
++    def __setitem__(self, i, v):
++        self.gen_text = None
++        super().__setitem__(i, v)
++
++    def __delitem__(self, i):
++        self.gen_text = None
++        super().__delitem__(i)
++
++    def __iadd__(self, other):
++        self.gen_text = None
++        return super().__iadd__(other)
++
++    def __imul__(self, n):
++        self.gen_text = None
++        return super().__imul__(n)
++
++    def append(self, v):
++        self.gen_text = None
++        super().append(v)
++
++    def extend(self, it):
++        self.gen_text = None
++        super().extend(it)
++
++    def insert(self, i, v):
++        self.gen_text = None
++        super().insert(i, v)
++
++    def pop(self, *a):
++        self.gen_text = None
++        return super().pop(*a)
++
++    def remove(self, v):
++        self.gen_text = None
++        super().remove(v)
++
++    def clear(self):
++        self.gen_text = None
++        super().clear()
++
++    def sort(self, *a, **kw):
++        self.gen_text = None
++        super().sort(*a, **kw)
++
++    def reverse(self):
++        self.gen_text = None
++        super().reverse()
++
++def plain_ids(ids):
++    return ids if type(ids) is list else list(ids)
++
++def ids_gen_text(ids):
++    t = getattr(ids, "gen_text", None)
++    return t if t is not None else ids_text(ids)
++
+ class _Rendered:
+-    __slots__ = ("text", "ids", "top", "opens", "before")
++    __slots__ = ("text", "ids", "top", "opens", "before", "chunk_ends", "chunk_txt")
+ 
+-    def __init__(self, text, ids, top):
++    def __init__(self, text, ids, top, lines=False):
+         self.text = text
+-        self.ids = array.array("i", ids)
+-        self.top = array.array("i", top)
++        self.ids = ids if isinstance(ids, array.array) else array.array("i", ids)
++        self.top = top if isinstance(top, array.array) else array.array("i", top)
++        self.chunk_ends, self.chunk_txt = [], []
+         self.opens, self.before = [], []
+         c = text.find(OPENER, 1)
+         while c > 0:
+-            i = bisect.bisect_left(self.top, c)
+-            if i < len(self.top) and self.top[i] == c:
++            i = bisect.bisect_right(self.top, c) - 1
++            if i >= 0 and self.top[i] == c:
+                 self.opens.append(c)
+                 self.before.append(i + 1)
+             c = text.find(OPENER, c + 1)
++        if lines:
++            cuts = list(zip(self.opens, self.before))
++            at = REUSE_MIN_CHARS
++            while True:
++                c = text.find("\n", at - 1) + 1
++                if c <= 0 or c >= len(text):
++                    break
++                if not line_cut_char(text[c]):
++                    at = c + 1
++                    continue
++                i = bisect.bisect_right(self.top, c) - 1
++                if i >= 0 and self.top[i] == c:
++                    cuts.append((c, i + 1))
++                at = c + REUSE_LINE_STEP
++            cuts.sort()
++            self.opens = [c for c, _ in cuts]
++            self.before = [b for _, b in cuts]
++
++    def text_upto(self, k):
++        n = bisect.bisect_right(self.chunk_ends, k)
++        ends, txt = self.chunk_ends[:n], self.chunk_txt[:n]
++        last = ends[-1] if ends else 0
++        if last < k:
++            ends.append(k)
++            txt.append(ids_text(self.ids[last:k]))
++        return ends, txt
++
++    def text_from(self, ends, txt):
++        ends, txt = list(ends), list(txt)
++        a = ends[-1] if ends else 0
++        for b in [b for b in self.before if b > a] + [len(self.ids)]:
++            if b > a:
++                ends.append(b)
++                txt.append(ids_text(self.ids[a:b]))
++                a = b
++        self.chunk_ends, self.chunk_txt = ends, txt
++        return " ".join(txt)
++
++FE_TRACE = (os.environ.get("HALOGEN_SERVE_TRACE") or "")[:1] in tuple("123456789")
++_FE_T = contextvars.ContextVar("fe_trace", default=None)
++
++def ids_text(seq):
++    n = len(seq)
++    return ("%d " * n % tuple(seq))[:-1] if n else ""
++
++def fe_mark(stage, value=None):
++    t = _FE_T.get()
++    if t is not None:
++        t.setdefault(stage, time.monotonic() if value is None else value)
++
++class FeTrace:
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope.get("type") != "http" or scope.get("method") != "POST":
++            return await self.app(scope, receive, send)
++        t = {"recv": time.monotonic()}
++        name = next((v.decode("latin-1") for k, v in scope.get("headers", ()) if k == b"x-halogen-trace"), "-")
++        tok = _FE_T.set(t)
++
++        async def rcv():
++            m = await receive()
++            if m.get("type") == "http.request" and not m.get("more_body"):
++                t.setdefault("body", time.monotonic())
++            return m
++
++        async def snd(m):
++            if m.get("type") == "http.response.body":
++                if m.get("body") and "tok" in t:
++                    t.setdefault("first_bytes", time.monotonic())
++                if not m.get("more_body") and "printed" not in t:
++                    t["printed"] = 1
++                    t0 = t["recv"]
++                    print("trace-fe id=%s req=%s path=%s recv=%.3f %s" % (
++                        name, t.get("req", "-"), scope.get("path"), t0 * 1e3,
++                        " ".join("%s=%.3f" % (k, (t[k] - t0) * 1e3) for k in
++                                 ("body", "handler", "rendered", "tokenized", "serve", "gen", "wrote",
++                                  "tok", "first_bytes") if k in t)), flush=True)
++            await send(m)
++        try:
++            await self.app(scope, rcv, snd)
++        finally:
++            _FE_T.reset(tok)
+ 
+ class PromptTokens:
+ 
+-    def __init__(self, tok, keep=8, max_chars=1 << 26):
+-        self.tok, self.keep, self.max_chars = tok, keep, max_chars
++    def __init__(self, tok, keep=8, max_chars=1 << 26, raw=False):
++        self.tok, self.keep, self.max_chars, self.raw = tok, keep, max_chars, raw
+         self.recent = []
+         self.reused = self.whole = 0
+-        self.on = REUSE_ON and self._split_holds()
++        self.lock = threading.Lock()
++        self.on = REUSE_ON and self._split_holds() and (not raw or self._lines_hold())
+ 
+     def _tokenize(self, text):
++        if self.raw:
++            got = split_encode(text) if len(text) >= TOKENIZE_SPLIT > 0 else None
++            if got is not None:
++                return got[0], [b for _, b in got[1]]
++            enc = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
++            return list(enc["input_ids"]), [b for _, b in enc["offset_mapping"]]
+         ids, offs = tokenize_offsets(self.tok, text)
+         return ids, [b for _, b in offs]
+ 
++    def _lines_hold(self):
++        text = ("def f(x):\n    return x  # \u00e9\nclass A:\r\n\tpass\n\n\n)\n]\n1234\n"
++                "'s\n\"q\"\n \n  \nx\ne\n\u0301y\nz\u0301\n\u4eca\u65e5\u306f\n#\U0001F600\n"
++                "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\u00a0\na\u3000b\n~\n!\n")
++        try:
++            ids, ends = self._tokenize(text)
++            n, c = 0, text.find("\n") + 1
++            while 0 < c < len(text):
++                if line_cut_char(text[c]):
++                    a_ids, a_ends = self._tokenize(text[:c])
++                    b_ids, b_ends = self._tokenize(text[c:])
++                    if a_ids + b_ids != ids or a_ends + [e + c for e in b_ends] != ends:
++                        return False
++                    n += 1
++                c = text.find("\n", c) + 1
++            return n >= 8
++        except Exception:
++            return False
++
++    def _cut_ok(self, text, c):
++        if text.startswith(OPENER, c):
++            return True
++        return self.raw and c < len(text) and text[c - 1] == "\n" and line_cut_char(text[c])
++
++    def encode_ids(self, text):
++        if not self.on or len(text) < REUSE_MIN_CHARS:
++            return list(self.tok(text, add_special_tokens=False)["input_ids"])
++        with self.lock:
++            return self.encode(text)[0]
++
+     def _split_holds(self):
+         text = ("<|im_start|>system\nYou are a careful assistant.\n<|im_end|>\n"
+                 "<|im_start|>user\nRésumé café é 今日は "
+@@ -514,24 +797,32 @@
+             for j, r in enumerate(self.recent):
+                 shared = common_prefix_len(text, r.text)
+                 i = bisect.bisect_right(r.opens, shared) - 1
+-                while i >= 0 and not text.startswith(OPENER, r.opens[i]):
++                while i >= 0 and not self._cut_ok(text, r.opens[i]):
+                     i -= 1
+                 if i >= 0 and r.opens[i] >= REUSE_MIN_CHARS and (best is None or r.opens[i] > best[1]):
+                     best = (j, r.opens[i], r.before[i])
+         if best is None:
+             ids, ends = self._tokenize(text)
+-            top = list(itertools.accumulate(ends, max))
++            top = array.array("i", itertools.accumulate(ends, max))
++            kept = ids
+             self.whole += 1
+         else:
+             j, cut, k = best
+             r = self.recent[j]
+             s_ids, s_ends = self._tokenize(text[cut:])
+-            ids = r.ids[:k].tolist() + s_ids
+-            top = list(itertools.accumulate(itertools.chain(r.top[:k], (e + cut for e in s_ends)), max))
++            kept = r.ids[:k]
++            kept.extend(s_ids)
++            ids = kept.tolist()
++            top = r.top[:k]
++            top.extend(itertools.islice(itertools.accumulate(
++                (e + cut for e in s_ends), max, initial=top[-1]), 1, None))
+             del self.recent[j]
+             self.reused += 1
+         if self.on and len(text) >= REUSE_MIN_CHARS:
+-            self.recent.append(_Rendered(text, ids, top))
++            rd = _Rendered(text, kept, top, self.raw)
++            ends, txt = r.text_upto(k) if best is not None else ((), ())
++            ids = IdsList(ids, rd.text_from(ends, txt))
++            self.recent.append(rd)
+             while len(self.recent) > self.keep or (
+                     len(self.recent) > 1 and sum(len(r.text) for r in self.recent) > self.max_chars):
+                 del self.recent[0]
+@@ -571,10 +862,67 @@
+     raise ValueError("%s: an image block needs `source` of type base64 or "
+                      "url" % where)
+ 
+-def _anth_system_text(content, where):
++_TOOL_EVENT_SAID = set()
++
++def _tool_event_name(b):
++    t = b.get("tool")
++    cands = [b.get("tool_name"), b.get("name"), t if isinstance(t, str) else None]
++    if isinstance(t, dict):
++        d = t.get("definition")
++        cands += [t.get("tool_name"), t.get("name"),
++                  d.get("name") if isinstance(d, dict) else None]
++    for c in cands:
++        if isinstance(c, str) and c:
++            return c
++    return None
++
++def tool_definitions(messages):
++    defs, seen = [], set()
++    for m in messages or []:
++        if not isinstance(m, dict) or m.get("role") != "system":
++            continue
++        c = m.get("content")
++        if not isinstance(c, list):
++            continue
++        for b in c:
++            if not isinstance(b, dict) or b.get("type") != "tool_addition":
++                continue
++            t = b.get("tool")
++            d = t.get("definition") if isinstance(t, dict) else None
++            if isinstance(d, dict) and isinstance(d.get("name"), str) \
++                    and d["name"] and d["name"] not in seen:
++                seen.add(d["name"])
++                defs.append(d)
++    return defs
++
++def with_added_tools(chat_tools, deferred, messages):
++    defs = tool_definitions(messages)
++    if not defs:
++        return chat_tools, deferred
++    have = {(t.get("function") or {}).get("name") for t in chat_tools or []}
++    new, _, _ = messages_tools([d for d in defs if d["name"] not in have])
++    if not new:
++        return chat_tools, deferred
++    return ((chat_tools or []) + new,
++            set(deferred or ()) | {t["function"]["name"] for t in new})
++
++def _anth_system_text(content, where, defer=None, events=True):
+     parts = []
+     for b in _anth_blocks(content):
+-        if b.get("type") != "text":
++        ty = b.get("type")
++        if events and ty in ("tool_addition", "tool_removal"):
++            name = _tool_event_name(b)
++            if ty not in _TOOL_EVENT_SAID:
++                _TOOL_EVENT_SAID.add(ty)
++                print(f"serve_api: /v1/messages system block {ty}: keys "
++                      f"{sorted(b)}, tool {name!r} (said once)", flush=True)
++            word = "added" if ty == "tool_addition" else "removed"
++            t = ("Tool %s: %s" % (word, name)) if name else "A tool was " + word + "."
++            if ty == "tool_addition" and defer and name in defer:
++                t += "\n<tools>\n" + defer.pop(name) + "\n</tools>"
++            parts.append(t)
++            continue
++        if ty != "text":
+             raise ValueError("%s: a system message may carry text only"
+                              % where)
+         t = b.get("text") or ""
+@@ -625,14 +973,14 @@
+     out, head = [], []
+     defer = dict(defer) if defer else None
+     if system:
+-        head.append(_anth_system_text(system, "system"))
++        head.append(_anth_system_text(system, "system", events=False))
+     seen_turn = False
+     for i, m in enumerate(messages or []):
+         if not isinstance(m, dict):
+             raise ValueError("message %d is not an object" % i)
+         role, where = m.get("role"), "message %d" % i
+         if role == "system":
+-            text = _anth_system_text(m.get("content"), where)
++            text = _anth_system_text(m.get("content"), where, defer)
+             if not seen_turn:
+                 head.append(text)
+             elif text:
+@@ -796,6 +1144,19 @@
+         out.append(t)
+     return out
+ 
++def check_tool_schemas(tools, field="parameters"):
++    for i, t in enumerate(tools or ()):
++        if not isinstance(t, dict):
++            continue
++        fn = t.get("function") if isinstance(t.get("function"), dict) else t
++        schema = fn.get("parameters")
++        if schema and not isinstance(schema, dict):
++            name = fn.get("name")
++            who = f"tool '{name}'" if isinstance(name, str) and name else f"tools[{i}]"
++            raise HTTPException(
++                400, f"{who}: {field} must be a JSON Schema object, "
++                     f"not {type(schema).__name__}.")
++
+ def strict_payload(tools, strict):
+     out = []
+     for t in tools or []:
+@@ -879,6 +1240,28 @@
+     return max(300.0, cap + 2 * (15.0 + ENGINE_PING_S))
+ 
+ NEXT_TOKEN_S = _next_token_s()
++
++START_WARM = os.environ.get("HALOGEN_START_WARM", "1").strip()
++
++async def warm_start(engine, tok):
++    if START_WARM == "0":
++        return
++    t0 = time.monotonic()
++    try:
++        text = tok.apply_chat_template([{"role": "user", "content": "Say hi."}], tokenize=False,
++                                       add_generation_prompt=True, enable_thinking=False)
++        ids = list(tok(text, add_special_tokens=False)["input_ids"])
++        made = 0
++        async for tid, _, _ in engine.generate(ids, 16, EOS_IDS):
++            if tid is not None:
++                made += 1
++        print(f"serve_api: warm start: one {len(ids)}-token request, {made} tokens, "
++              f"{time.monotonic() - t0:.2f} s, before listening (the first pass after "
++              f"a start does one-time work a client's first request would wait for)",
++              flush=True)
++    except Exception as e:
++        print(f"serve_api: warm start skipped after {time.monotonic() - t0:.2f} s: {e!r}",
++              flush=True)
+ PREFIX_NOTE_MIN = 1024
+ ABORT_DRAIN_S = 10.0
+ 
+@@ -926,6 +1309,26 @@
+     def filter(self, record):
+         return not record.getMessage().startswith(self.DROP)
+ 
++def listen_host(host):
++    if host != "::":
++        return host, host
++    try:
++        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
++            s.bind(("::", 0))
++    except OSError:
++        return "0.0.0.0", "0.0.0.0"
++    logging.getLogger("uvicorn.error").addFilter(_UvicornListenLine())
++    return None, "[::] and 0.0.0.0"
++
++class _UvicornListenLine(logging.Filter):
++
++    def filter(self, record):
++        m = record.getMessage()
++        if m.startswith("Uvicorn running on http://0.0.0.0:"):
++            record.msg, record.args = m.replace("0.0.0.0", "[::]", 1), ()
++            record.__dict__.pop("color_message", None)
++        return True
++
+ def install_upgrade_note(app):
+     app.add_middleware(UpgradeNote)
+     lg = logging.getLogger("uvicorn.error")
+@@ -1075,6 +1478,16 @@
+ 
+ _TOKEN_BYTES = None
+ 
++def think_prose_end(text, at):
++    fences = 0
++    for line in text[:at].split("\n"):
++        s = line.lstrip(" \t\r\v\f")
++        if s.startswith("```") or s.startswith("~~~"):
++            fences += 1
++    if fences % 2:
++        return False
++    return text.count("`", text.rfind("\n", 0, at) + 1, at) % 2 == 0
++
+ def token_bytes(tok, i):
+     global _TOKEN_BYTES
+     if _TOKEN_BYTES is None:
+@@ -1120,17 +1533,25 @@
+ MAP_AGENT_HEADER = "x-claude-code-agent-id"
+ MAP_PARENT_HEADER = "x-claude-code-parent-agent-id"
+ 
+-def fork_maps(env=None):
++FORK_MAP_RETIRED = ("auto",)
++
++def fork_maps(env=None, say=None):
+     env = os.environ if env is None else env
+     v = (env.get("HALOGEN_FORK_MAP") or "").strip()
+     if v in ("", "0"):
+         return set()
+     got = {x.strip() for x in v.split(",")}
++    gone = got & set(FORK_MAP_RETIRED)
++    if gone and say is not None:
++        say(f"serve_api: HALOGEN_FORK_MAP={v}: `auto` is retired and ignored: the prompt cache "
++            f"now keeps the end of every reply by default, which serves the same follow-up turns")
++    got -= gone
+     for x in sorted(got):
+-        if x not in ("claude-code", "auto"):
++        if x not in ("claude-code",):
+             raise SystemExit(f"serve_api: HALOGEN_FORK_MAP={v!r} is not a map this server "
+-                             f"knows; set it to claude-code, auto or both (claude-code,auto), "
+-                             f"or unset it (or 0) for none")
++                             f"knows; set it to claude-code, or unset it (or 0) for none")
++    if not got:
++        return set()
+     if env.get("HALOGEN_FORK", "0").strip() != "1":
+         raise SystemExit(f"serve_api: HALOGEN_FORK_MAP={v} needs HALOGEN_FORK=1 "
+                          "(the map keeps each state under a name); set it, or "
+@@ -1140,13 +1561,7 @@
+ def fork_map_on(env=None):
+     return "claude-code" in fork_maps(env)
+ 
+-def fork_auto_on(env=None):
+-    return "auto" in fork_maps(env)
+-
+-FORK_MAP = fork_map_on()
+-FORK_AUTO = fork_auto_on()
+-FORK_AUTO_KEEPS = max(1, int(os.environ.get("HALOGEN_FORK_AUTO_KEEPS", "4") or 4))
+-FORK_AUTO_END_ONLY = os.environ.get("HALOGEN_FORK_AUTO_END_ONLY", "1") != "0"
++FORK_MAP = "claude-code" in fork_maps(say=lambda m: print(m, flush=True))
+ 
+ def map_id(v):
+     v = (v or "").strip()
+@@ -1167,11 +1582,13 @@
+     def expired(self, now):
+         return [n for n, h in self.by_name.items() if now - h["used"] > self.ttl]
+ 
+-    def get(self, name, now):
++    def get(self, name):
++        return self.by_name.get(name)
++
++    def touch(self, name, now):
+         h = self.by_name.get(name)
+         if h is not None:
+             h["used"] = now
+-        return h
+ 
+     def room(self, name):
+         return name in self.by_name or len(self.by_name) < self.cap
+@@ -1769,6 +2186,8 @@
+                 "kv_cache": p[29] if len(p) >= 30 else "bf16",
+                 "keep_end": len(p) >= 31 and p[30] == "1",
+                 "masks_images": len(p) >= 32 and p[31] == "1",
++                "nocall": len(p) >= 33 and p[32] == "1",
++                "noseed": len(p) >= 34 and p[33] == "1",
+                 }
+ 
+     async def _ensure(self):
+@@ -1862,9 +2281,12 @@
+         finished = False
+         cancel_at = None
+         try:
++            fe_mark("req", req)
++            fe_mark("gen")
+             async with self.wlock:
+                 self.w.write(line.encode())
+                 await self.w.drain()
++            fe_mark("wrote")
+             first = True
+             first_by = time.monotonic() + FIRST_TOKEN_S
+             heard = False
+@@ -1909,6 +2331,7 @@
+                     gnote = g_line(parts)
+                     continue
+                 if parts[0] == "T":
++                    fe_mark("tok")
+                     first = False
+                     if cancel_at is not None:
+                         continue
+@@ -1939,7 +2362,7 @@
+                        after=None, escape=(), think=None, seg=None,
+                        snap3=0, guard=None, ctl=None, keep=None,
+                        progress=None, agent=False, no_store=False,
+-                       tools=None, keep_end=False):
++                       tools=None, keep_end=False, nocall=None):
+         await self._ensure()
+         self.req += 1
+         req = self.req
+@@ -1949,9 +2372,16 @@
+             self.w.write(("VIMG %d %d %d %d %s\n" %
+                           (req, first_tok, H, W,
+                            base64.b64encode(rgb).decode())).encode())
++        look = []
++        vt = getattr(self, "tokenizer", None)
++        if PLD_VIEW and vt is not None and sample is None and drafter != 0 and self.info.get("pld_n"):
++            if getattr(self, "view_ids", None) is None:
++                self.view_ids = (vt.convert_tokens_to_ids("<tool_response>"),
++                                 vt.convert_tokens_to_ids("</tool_response>"))
++            look = await asyncio.to_thread(lookup_view, vt, ids, *self.view_ids)
+         line = (f"GEN {req} {max_tokens} {len(eos)} "
+                 + (" ".join(str(e) for e in eos) + " " if eos else "")
+-                + f"{len(ids)} " + " ".join(str(i) for i in ids)
++                + f"{len(ids)} " + ids_gen_text(ids)
+                 + (f" {drafter}" if drafter is not None else "")
+                 + (" SAMPLE %.9g %d %.9g %.9g %d" % sample if sample else "")
+                 + (penalty or "")
+@@ -1980,11 +2410,17 @@
+                 + (" AGUARD %d" % self.im_start_id
+                    if guard and ANSWER_GUARD and getattr(self, "im_start_id", None) is not None
+                    and self.info.get("grammar") else "")
++                + (" NOCALL %d" % nocall
++                   if nocall is not None and guard and self.info.get("nocall")
++                   and self.info.get("grammar") else "")
+                 + ((" SEG %d " % len(seg)) + " ".join(str(x) for x in seg)
+                    if seg and self.info.get("composable") else "")
+                 + (" PROGRESS" if progress is not None else "")
++                + ((" LOOK %d " % len(look)) + ids_text(look) if look else "")
+                 + (" AGENT" if agent else "")
+                 + (" NOSTORE" if no_store else "")
++                + (" NOSEED" if sample and not getattr(sample, "seeded", True)
++                   and self.info.get("noseed") else "")
+                 + (f" KEEP {int(keep)}" if keep else "")
+                 + (" KEEPEND" if keep and keep_end and self.info.get("keep_end") else "")
+                 + "\n")
+@@ -1992,8 +2428,11 @@
+             async for item in self._gen_batched(req, line, ctl, progress):
+                 yield item
+             return
++        fe_mark("req", req)
++        fe_mark("gen")
+         self.w.write(line.encode())
+         await self.w.drain()
++        fe_mark("wrote")
+         self.active = req
+         first = True
+         first_by = time.monotonic() + FIRST_TOKEN_S
+@@ -2049,6 +2488,7 @@
+                 gnote = g_line(parts)
+                 continue
+             if parts[0] == "T" and int(parts[1]) == req:
++                fe_mark("tok")
+                 first = False
+                 if cancel_at is not None:
+                     continue
+@@ -2190,7 +2630,7 @@
+                schema, after, escape, think, seg, snap, snap2, snap3, guard,
+                tools=None):
+     h = hashlib.sha256()
+-    h.update(array.array("q", ids).tobytes())
++    h.update(array.array("q", plain_ids(ids)).tobytes())
+     samp = None
+     if sample:
+         samp = tuple(sample) if getattr(sample, "seeded", True) else tuple(sample[:4])
+@@ -2491,6 +2931,80 @@
+ 
+ ANSWER_GUARD = _env_bool("HALOGEN_ANSWER_GUARD") is not False
+ 
++TOOL_NONE_MASK = _env_bool("HALOGEN_TOOL_NONE_MASK") is not False
++FORK_UNMATCHED_RELEASE = _env_bool("HALOGEN_FORK_UNMATCHED_RELEASE") is not False
++
++PLD_VIEW = _env_bool("HALOGEN_PLD_VIEW") is not False
++_VIEW_NUM = None
++_VIEW_CACHE = collections.OrderedDict()
++_VIEW_CACHE_IDS = [0]
++VIEW_CACHE_MAX_IDS = 1 << 22
++VIEW_LOOK_MAX_IDS = 1 << 22
++
++def view_segments(text):
++    global _VIEW_NUM
++    if _VIEW_NUM is None:
++        import re
++        _VIEW_NUM = re.compile(r"^ *([0-9]+)(?:\t|\u2192|\| )")
++    body, decoded = text.strip("\n"), False
++    if body.startswith("{") and body.endswith("}"):
++        try:
++            obj = json.loads(body)
++        except ValueError:
++            obj = None
++        if isinstance(obj, dict) and isinstance(obj.get("output"), str):
++            body, decoded = obj["output"], True
++    segs, run, prev = [], [], None
++    for ln in body.split("\n"):
++        m = _VIEW_NUM.match(ln)
++        n = int(m.group(1)) if m else None
++        if m and prev is not None and n == prev + 1:
++            run.append(ln[m.end():])
++        else:
++            if len(run) >= 3:
++                segs.append("\n".join(run))
++            run = [ln[m.end():]] if m else []
++        prev = n
++    if len(run) >= 3:
++        segs.append("\n".join(run))
++    if not segs and decoded and body.strip():
++        segs.append(body)
++    return segs
++
++def lookup_view(tok, ids, open_id, close_id):
++    out, i, n = [], 0, len(ids)
++    while i < n:
++        try:
++            i = ids.index(open_id, i)
++        except ValueError:
++            break
++        try:
++            j = ids.index(close_id, i + 1)
++        except ValueError:
++            j = n
++        key = hash(tuple(ids[i + 1:j]))
++        got = _VIEW_CACHE.get(key)
++        if got is None:
++            text = tok.decode(ids[i + 1:j], skip_special_tokens=False, clean_up_tokenization_spaces=False)
++            parts = []
++            for seg in view_segments(text):
++                if parts:
++                    parts.append(-1)
++                parts.extend(tok(seg, add_special_tokens=False)["input_ids"])
++            got = array.array("i", parts)
++            _VIEW_CACHE[key] = got
++            _VIEW_CACHE_IDS[0] += len(got) + 1
++            while _VIEW_CACHE_IDS[0] > VIEW_CACHE_MAX_IDS and len(_VIEW_CACHE) > 1:
++                _VIEW_CACHE_IDS[0] -= len(_VIEW_CACHE.popitem(last=False)[1]) + 1
++        else:
++            _VIEW_CACHE.move_to_end(key)
++        if got and len(out) + len(got) < VIEW_LOOK_MAX_IDS:
++            if out:
++                out.append(-1)
++            out.extend(got)
++        i = j + 1
++    return out
++
+ TEMPLATE_UNCHECKED = _env_bool("HALOGEN_TEMPLATE_UNCHECKED") is True
+ THINK_EMPTY_BLOCK = "<think>\n\n</think>"
+ 
+@@ -2513,10 +3027,154 @@
+                          f"is empty")
+     return path, text
+ 
++RENDER_ONCE = os.environ.get("HALOGEN_RENDER_ONCE", "1").strip().lower() not in ("0", "off", "false", "no")
++_GEN_BLOCK = None
++_GEN_SUFFIX = {}
++
++def _gen_block_names(source):
++    import jinja2
++    import jinja2.ext
++    from jinja2 import nodes
++    from jinja2.sandbox import ImmutableSandboxedEnvironment
++    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
++                                        extensions=[jinja2.ext.loopcontrols])
++    tree = env.parse(source)
++    body = list(tree.body)
++    while body and isinstance(body[-1], nodes.Output) and all(
++            isinstance(x, nodes.TemplateData) and not x.data.strip() for x in body[-1].nodes):
++        body.pop()
++    if not body or not isinstance(body[-1], nodes.If):
++        return None
++    last = body[-1]
++    if not (isinstance(last.test, nodes.Name) and last.test.name == "add_generation_prompt"
++            and not last.elif_ and not last.else_):
++        return None
++    uses = [n for n in tree.find_all(nodes.Name) if n.name == "add_generation_prompt"]
++    if len(uses) != 1 or uses[0] is not last.test:
++        return None
++    ok = (nodes.If, nodes.Output, nodes.TemplateData, nodes.Const, nodes.Name, nodes.Test,
++          nodes.And, nodes.Or, nodes.Not, nodes.Compare, nodes.Operand, nodes.CondExpr)
++    names = set()
++    for stmt in last.body:
++        for n in [stmt] + list(stmt.find_all(nodes.Node)):
++            if not isinstance(n, ok):
++                return None
++            if isinstance(n, nodes.Name):
++                names.add(n.name)
++    assigned = {t.name for t in tree.find_all(nodes.Name) if t.ctx in ("store", "param")}
++    if names & (assigned | {"messages", "tools", "documents", "strftime_now", "raise_exception", "loop"}):
++        return None
++    return tuple(sorted(names))
++
++def gen_suffix(tok, kw):
++    if _GEN_BLOCK is None:
++        return None
++    key = tuple((n, repr(kw[n]) if n in kw else None) for n in _GEN_BLOCK)
++    got = _GEN_SUFFIX.get(key)
++    if got is None:
++        probe = [{"role": "user", "content": "x"}]
++        pk = {n: kw[n] for n in _GEN_BLOCK if n in kw}
++        a = tok.apply_chat_template(probe, tokenize=False, add_generation_prompt=False, **pk)
++        b = tok.apply_chat_template(probe, tokenize=False, add_generation_prompt=True, **pk)
++        if not b.startswith(a):
++            return None
++        got = b[len(a):]
++        if len(_GEN_SUFFIX) < 64:
++            _GEN_SUFFIX[key] = got
++    return got
++
++def render_once_setup(tok):
++    global _GEN_BLOCK
++    _GEN_BLOCK = None
++    _GEN_SUFFIX.clear()
++    src = getattr(tok, "chat_template", None)
++    if not RENDER_ONCE or not isinstance(src, str):
++        return False
++    try:
++        names = _gen_block_names(src)
++    except Exception:
++        names = None
++    if names is None:
++        return False
++    _GEN_BLOCK = names
++    tools = [{"type": "function", "function": {"name": "read", "description": "Read a file.",
++              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
++    convs = [[{"role": "user", "content": "Hi é 今日は"}],
++             [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Read it."},
++              {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {
++                  "name": "read", "arguments": {"path": "a.py"}}}]},
++              {"role": "tool", "content": "def f():\n    return 1\n"},
++              {"role": "assistant", "content": "It returns 1.", "reasoning_content": "Look at f."},
++              {"role": "user", "content": "And now?"}]]
++    try:
++        for kw in ({}, {"enable_thinking": False}, {"enable_thinking": True}, {"tools": tools},
++                   {"tools": tools, "enable_thinking": False}):
++            for msgs in convs:
++                full = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, **kw)
++                hist = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False, **kw)
++                g = gen_suffix(tok, kw)
++                if g is None or full != hist + g:
++                    raise ValueError("the prompt is not the history plus the generation prompt")
++    except Exception as e:
++        print(f"serve_api: one template render a request: off ({type(e).__name__}: {e})", flush=True)
++        _GEN_BLOCK = None
++        _GEN_SUFFIX.clear()
++        return False
++    return True
++
++NATIVE_SPLIT = os.environ.get("HALOGEN_TOKENIZER_NATIVE", "1") != "0"
++NATIVE_SPLIT_STATE = "unset"
++
++def native_split(tok, where):
++    if not NATIVE_SPLIT:
++        return "off (HALOGEN_TOKENIZER_NATIVE=0)"
++    f = os.path.join(where, "tokenizer.json") if os.path.isdir(str(where)) else None
++    bk = getattr(tok, "backend_tokenizer", None)
++    if not f or not os.path.isfile(f) or bk is None:
++        return "not applied (no tokenizer.json beside the tokenizer)"
++    try:
++        from tokenizers import Tokenizer
++        with open(f, encoding="utf-8") as fh:
++            want = json.load(fh).get("pre_tokenizer")
++        spec = json.loads(bk.to_str())
++        have = spec.get("pre_tokenizer")
++        if want == have:
++            return "as loaded (the file's pattern)"
++
++        def splits(pt):
++            seq = pt.get("pretokenizers") if isinstance(pt, dict) and pt.get("type") == "Sequence" else None
++            return [x for x in (seq or []) if isinstance(x, dict) and x.get("type") == "Split"]
++        ws, hs = splits(want), splits(have)
++        if len(ws) != 1 or len(hs) != 1 or any(ws[0].get(k) != hs[0].get(k) for k in ("behavior", "invert")):
++            return "not applied (the file's pre-tokenizer is not one Split + the loaded steps)"
++        if ws[0].get("pattern") == hs[0].get("pattern"):
++            return "as loaded (the patterns agree)"
++        plain_probe = "Résumé café 今日は \U0001F600 Привет\n\tdef f(x):\n        return x  # é\n\n\n  ok. "
++        before = tok(plain_probe, add_special_tokens=False, return_offsets_mapping=True)
++        hs[0]["pattern"] = ws[0]["pattern"]
++        loaded = bk.pre_tokenizer
++        bk.pre_tokenizer = Tokenizer.from_str(json.dumps(spec)).pre_tokenizer
++        ref = Tokenizer.from_file(f)
++        marks_probe = "नमस्ते दुनिया, यह एक परीक्षण है। สวัสดีครับ ภาษาไทย مَرْحَبًا"
++        after = tok(plain_probe, add_special_tokens=False, return_offsets_mapping=True)
++        ok = (list(after["input_ids"]) == list(before["input_ids"])
++              and [tuple(x) for x in after["offset_mapping"]] == [tuple(x) for x in before["offset_mapping"]]
++              and list(after["input_ids"]) == ref.encode(plain_probe, add_special_tokens=False).ids
++              and tok(marks_probe, add_special_tokens=False)["input_ids"]
++              == ref.encode(marks_probe, add_special_tokens=False).ids)
++        if not ok:
++            bk.pre_tokenizer = loaded
++            return "not applied (the probe disagreed; the loaded pattern kept)"
++        return "the split pattern from tokenizer.json (the class's own differed)"
++    except Exception as e:
++        return f"not applied ({type(e).__name__}: {e})"
++
+ def load_serving_tokenizer(where):
++    global NATIVE_SPLIT_STATE
+     ov = chat_template_override()
+     from transformers import AutoTokenizer
+     tok = AutoTokenizer.from_pretrained(where)
++    NATIVE_SPLIT_STATE = native_split(tok, where)
+     if ov is not None:
+         tok.chat_template = ov[1]
+     return tok
+@@ -2837,6 +3495,7 @@
+     max_tokens: int = COMPLETION_MAX_TOKENS
+     stream: bool = False
+     stop: list[str] | str | None = None
++    ignore_eos: bool = False
+     return_progress: bool | None = None
+     stream_options: dict | None = None
+     drafter: str | None = None
+@@ -2889,6 +3548,8 @@
+     chat_template_kwargs: dict | None = None
+     continue_final_message: bool | None = None
+     add_generation_prompt: bool | None = None
++    modalities: object = None
++    audio: object = None
+ 
+     @model_validator(mode="after")
+     def _check_continuation(self):
+@@ -3085,6 +3746,12 @@
+ def responses_tools(tools, ns=None):
+     if not tools:
+         return None, []
++    for t in tools:
++        if isinstance(t, dict) and t.get("type") == "namespace":
++            subs = t.get("tools")
++            if subs and not (isinstance(subs, list) and all(isinstance(x, dict) for x in subs)):
++                raise HTTPException(400, f"namespace '{t.get('name')}': tools must be "
++                                         f"an array of objects.")
+     out, dropped = [], []
+     taken = set()
+     for t in tools:
+@@ -3122,7 +3789,7 @@
+         take(t)
+     return (out or None), dropped
+ 
+-def _item_parts(item):
++def _item_parts(item, audio=False):
+     c = item.get("content")
+     if isinstance(c, str):
+         return c
+@@ -3151,6 +3818,12 @@
+                 raise ValueError("input_image carries no image_url")
+             parts.append({"type": "image_url", "image_url": {"url": u}})
+             has_img = True
++        elif kind == "input_audio" and audio:
++            a = p.get("input_audio")
++            if not isinstance(a, dict) or not a.get("data"):
++                raise ValueError("input_audio carries no input_audio.data")
++            parts.append({"type": "input_audio", "input_audio": {"data": a["data"], "format": a.get("format") or "wav"}})
++            has_img = True
+         elif kind in ("input_file", "file"):
+             raise ValueError("file inputs are not supported by this server")
+         elif isinstance(p.get("text"), str):
+@@ -3172,7 +3845,7 @@
+         return _item_parts({"content": out})
+     return json.dumps(out, ensure_ascii=False)
+ 
+-def responses_messages(instructions, items, ns=None):
++def responses_messages(instructions, items, ns=None, audio=False):
+     back = {v: k for k, v in (ns or {}).items()}
+     sys_parts = []
+     if instructions:
+@@ -3212,7 +3885,7 @@
+         if kind in ("reasoning", "web_search_call", "item_reference"):
+             continue
+         role = it.get("role") or "user"
+-        content = _item_parts(it)
++        content = _item_parts(it, audio)
+         if role in ("developer", "system"):
+             if isinstance(content, list):
+                 raise ValueError("images are not supported in a system or "
+@@ -3414,6 +4087,34 @@
+         return (self.full[:i].strip(),
+                 self.full[i + len(self.MARK):].lstrip("\n"))
+ 
++class OpenedThinkSplit(ThinkSplit):
++
++    OPEN = "<think>"
++
++    def __init__(self):
++        super().__init__(thinking=False)
++        self.raw = ""
++        self.mode = None
++
++    def push(self, delta):
++        self.raw += delta
++        if self.mode is None:
++            if self.raw.startswith(self.OPEN):
++                self.mode, self.thinking = True, True
++                return super().push(self.raw[len(self.OPEN):])
++            if self.OPEN.startswith(self.raw):
++                return "", ""
++            self.mode = False
++            return super().push(self.raw)
++        return super().push(delta)
++
++    def parts(self):
++        if self.mode is None:
++            raw = self.raw or self.full
++            self.mode = self.thinking = raw.startswith(self.OPEN)
++            self.full = raw[len(self.OPEN):] if self.mode else raw
++        return super().parts()
++
+ def common_prefix_len(a, b):
+     n = min(len(a), len(b))
+     if a[:n] == b[:n]:
+@@ -3432,17 +4133,21 @@
+     def __init__(self, keep=16):
+         self.items = collections.deque(maxlen=keep)
+ 
+-    def best(self, ids):
+-        a = array.array("i", ids)
+-        best, now = None, time.monotonic()
+-        for t, plen, seq in self.items:
++    def look(self):
++        return tuple(self.items), time.monotonic()
++
++    def best(self, ids, look=None):
++        a = array.array("i", plain_ids(ids))
++        items, now = look if look is not None else (self.items, time.monotonic())
++        best = None
++        for t, plen, seq in items:
+             n = common_prefix_len(a, seq)
+             if best is None or n > best[0]:
+                 best = (n, now - t, plen, len(seq))
+         return best
+ 
+     def add(self, ids, out):
+-        seq = array.array("i", ids)
++        seq = array.array("i", plain_ids(ids))
+         seq.extend(out)
+         self.items.append((time.monotonic(), len(ids), seq))
+ 
+@@ -3483,21 +4188,849 @@
+         raise HTTPException(400, "the body must be a JSON object")
+     return body
+ 
++def reasoning_tokens(d, thinking):
++    if thinking is False:
++        return 0
++    if d.get("think_end"):
++        return min(int(d["think_end"]), int(d.get("n_gen", 0)))
++    return int(d.get("n_gen", 0)) if thinking else 0
++
++def usage(d, n_prompt):
++    u = {"prompt_tokens": n_prompt, "completion_tokens": d["n_gen"],
++         "total_tokens": n_prompt + d["n_gen"]}
++    if d.get("n_cached"):
++        u["prompt_tokens_details"] = {"cached_tokens": d["n_cached"]}
++    if "n_reasoning" in d:
++        det = {"reasoning_tokens": d["n_reasoning"]}
++        if d.get("think_closed_by"):
++            det["reasoning_closed_at"] = int(d.get("think_seen", 0))
++            det["reasoning_closed_by"] = d["think_closed_by"]
++        u["completion_tokens_details"] = det
++    kept = int(d.get("kept_think", 0)) + int(d.get("kept_call", 0))
++    if kept:
++        u.setdefault("completion_tokens_details", {})["end_of_turn_kept"] = kept
++    if d.get("call_in_block"):
++        u.setdefault("completion_tokens_details", {})["tool_call_from_reasoning"] = True
++    if d.get("turn_cut"):
++        u.setdefault("completion_tokens_details", {})["end_of_turn_in_reasoning"] = True
++    return u
++
++def responses_usage(d, n_prompt):
++    u = usage(d, n_prompt)
++    r = {"input_tokens": u.get("prompt_tokens", 0),
++         "output_tokens": u.get("completion_tokens", 0),
++         "total_tokens": u.get("total_tokens", 0)}
++    if "prompt_tokens_details" in u:
++        r["input_tokens_details"] = dict(u["prompt_tokens_details"])
++    if "completion_tokens_details" in u:
++        r["output_tokens_details"] = dict(u["completion_tokens_details"])
++    return r
++
++def timings_of(d, info=None):
++    pn = int(d.get("n_prompt", 0))
++    gn = int(d.get("n_gen", 0))
++    cached = int(d.get("n_cached", 0))
++    processed = max(0, pn - cached)
++    pms = float(d.get("prefill_ms", 0.0))
++    dms = float(d.get("decode_ms", 0.0))
++    t = {"prompt_n": processed, "predicted_n": gn,
++         "prompt_ms": round(pms, 3), "predicted_ms": round(dms, 3),
++         "prompt_per_second": (round(processed / (pms / 1000.0), 3)
++                               if pms > 0 and processed > 0 else 0.0),
++         "predicted_per_second": round(gn / (dms / 1000.0), 3) if dms > 0 else 0.0}
++    if "n_cached" in d:
++        t["cache_n"] = cached
++    if "disk_rows" in d:
++        t["disk_restore_n"] = int(d["disk_rows"])
++        t["disk_restore_ms"] = round(float(d["disk_ms"]), 3)
++    if "prefix_n" in d:
++        t["prefix_n"] = int(d["prefix_n"])
++    if int(d.get("room_from", -1)) >= 0:
++        t["max_tokens_clamped_from"] = int(d["room_from"])
++        t["max_tokens_clamped_to"] = int(d["max_tokens"])
++    if "rounds" in d:
++        pld_r = int(d.get("pld_rounds", 0))
++        pld_a = int(d.get("pld_accepted", 0))
++        gram_r = int(d.get("gram_rounds", 0))
++        gram_d = int(d.get("gram_drafted", 0))
++        gram_a = int(d.get("gram_accepted", 0))
++        head_r = int(d["rounds"]) - pld_r - gram_r
++        head_a = (int(d["commit"]) - int(d["rounds"]) - int(d.get("shared", 0))
++                  - pld_a - gram_a)
++        if pld_r == 0 or "pld_drafted" in d:
++            head_d = int(d["head_drafted"]) if "head_drafted" in d else max(0, head_r)
++            t["draft_n"] = head_d + int(d.get("pld_drafted", 0)) + gram_d
++            t["draft_n_accepted"] = max(0, head_a) + pld_a + gram_a
++            t["speculation"] = {
++                "drafter": {0: "none", 1: ("mtp" if (info or {}).get("mtp")
++                                           else "lookup")}.get(int(d.get("drafter", 0)),
++                                                      str(d.get("drafter"))),
++                "rounds": int(d["rounds"]),
++                "head": {"rounds": head_r, "drafted": head_d,
++                         "accepted": max(0, head_a)},
++                "lookup": {"rounds": pld_r, "drafted": int(d.get("pld_drafted", 0)),
++                           "accepted": pld_a},
++                "grammar": {"rounds": gram_r, "drafted": gram_d,
++                            "accepted": gram_a}}
++    return t
++
++def error_body(d):
++    return {"message": d["message"],
++            "type": ERROR_TYPES.get(d["status"], "server_error"),
++            "param": None, "code": d.get("code")}
++
++def messages_usage(d, n_prompt):
++    cached = int(d.get("n_cached") or 0)
++    return {"input_tokens": max(0, int(n_prompt) - cached),
++            "output_tokens": int(d.get("n_gen") or 0),
++            "cache_read_input_tokens": cached,
++            "cache_creation_input_tokens": 0}
++
++def messages_stop(d, called):
++    if d.get("reason") == "length":
++        return "max_tokens", None
++    if called:
++        return "tool_use", None
++    if d.get("stop_seq"):
++        return "stop_sequence", d["stop_seq"]
++    return "end_turn", None
++
++def tool_input(args):
++    try:
++        v = json.loads(args or "{}")
++    except ValueError:
++        return {}
++    return v if isinstance(v, dict) else {}
++
++async def sse_messages(gen, mid, model, split, tstream=None, pre="",
++                       parallel=True, n_prompt=0, show_thinking=True):
++    def ev(kind, **body):
++        return "event: %s\ndata: %s\n\n" % (kind, json.dumps(
++            dict({"type": kind}, **body)))
++
++    yield ev("message_start", message={
++        "id": mid, "type": "message", "role": "assistant", "model": model,
++        "content": [], "stop_reason": None, "stop_sequence": None,
++        "usage": {"input_tokens": int(n_prompt), "output_tokens": 0,
++                  "cache_read_input_tokens": 0,
++                  "cache_creation_input_tokens": 0}})
++    nxt = itertools.count(0)
++    cur = None
++    rs_text, rs_started, rs_pending = "", False, ""
++    started, buf = False, ""
++    calls = {}
++
++    def close_cur():
++        nonlocal cur
++        if cur is None:
++            return ""
++        kind, i = cur
++        cur = None
++        out = ""
++        if kind == "thinking":
++            out = ev("content_block_delta", index=i, delta={
++                "type": "signature_delta",
++                "signature": think_signature(rs_text)})
++        return out + ev("content_block_stop", index=i)
++
++    def open_block(kind, block):
++        nonlocal cur
++        cur = (kind, next(nxt))
++        return ev("content_block_start", index=cur[1], content_block=block)
++
++    def text_and_calls(td, evs):
++        if td:
++            if cur is None or cur[0] != "text":
++                yield close_cur()
++                yield open_block("text", {"type": "text", "text": ""})
++            yield ev("content_block_delta", index=cur[1], delta={
++                "type": "text_delta", "text": td})
++        for e in evs:
++            i = e["index"]
++            if not parallel and i > 0:
++                continue
++            fn = e.get("function") or {}
++            if i not in calls:
++                yield close_cur()
++                yield open_block("tool", {"type": "tool_use",
++                                          "id": e.get("id") or "",
++                                          "name": fn.get("name") or "",
++                                          "input": {}})
++                calls[i] = cur[1]
++            frag = fn.get("arguments") or ""
++            if frag:
++                yield ev("content_block_delta", index=calls[i],
++                         delta={"type": "input_json_delta",
++                                "partial_json": frag})
++
++    async for delta, d in gen:
++        if d is not None and d.get("reason") == "error":
++            yield ev("error", error=anth_error_obj(d["status"],
++                                                   d["message"]))
++            return
++        if d is not None:
++            if tstream is not None and buf:
++                for s in text_and_calls(*tstream.push(pre + buf, final=True)):
++                    yield s
++            out = close_cur()
++            if out:
++                yield out
++            d["n_reasoning"] = reasoning_tokens(d, split.thinking)
++            sr, ss = messages_stop(d, bool(calls))
++            u = messages_usage(d, d.get("n_prompt") or n_prompt)
++            yield ev("message_delta",
++                     delta={"stop_reason": sr, "stop_sequence": ss},
++                     usage=u)
++            yield ev("message_stop")
++            return
++        rd, cd = split.push(delta)
++        if rd:
++            if not rs_started:
++                rd = rd.lstrip()
++                if rd:
++                    rs_started = True
++            if rs_started and rd:
++                rd = rs_pending + rd
++                kept = rd.rstrip()
++                rs_pending = rd[len(kept):]
++                rd = kept
++            if rd:
++                if cur is None or cur[0] != "thinking":
++                    yield close_cur()
++                    yield open_block("thinking", {"type": "thinking",
++                                                  "thinking": ""})
++                rs_text += rd
++                if show_thinking:
++                    yield ev("content_block_delta", index=cur[1], delta={
++                        "type": "thinking_delta", "thinking": rd})
++        if not cd:
++            continue
++        if cur is not None and cur[0] == "thinking":
++            yield close_cur()
++        if not started:
++            cd = cd.lstrip("\n")
++            if not cd:
++                continue
++            started = True
++        td, evs = cd, []
++        if tstream is not None:
++            buf += cd
++            td, evs = tstream.push(pre + buf)
++        for s in text_and_calls(td, evs):
++            yield s
++
++async def sse_responses(gen, rid, created, model, split,
++                        tstream=None, pre="", parallel=True,
++                        max_out=0, want_summary=False, tool_ns=None, info=None):
++    seq = itertools.count(0)
++
++    def ev(kind, **body):
++        body["type"] = kind
++        body["sequence_number"] = next(seq)
++        return f"event: {kind}\ndata: {json.dumps(body)}\n\n"
++
++    def envelope(status, output, usage_obj=None):
++        return {"id": rid, "object": "response", "created_at": created,
++                "status": status, "model": model, "output": output,
++                "parallel_tool_calls": parallel,
++                "max_output_tokens": max_out or None,
++                "usage": usage_obj}
++
++    base = envelope("in_progress", [])
++    yield ev("response.created", response=base)
++    yield ev("response.in_progress", response=base)
++
++    nxt = itertools.count(0)
++    started = False
++    msg_id = "msg_" + rid.split("_", 1)[-1]
++    msg_open = False
++    msg_index = None
++    text_out = ""
++    buf = ""
++    calls = {}
++    done_items = []
++
++    def open_message():
++        nonlocal msg_open, msg_index
++        msg_index = next(nxt)
++        msg_open = True
++        item = {"id": msg_id, "type": "message", "role": "assistant",
++                "status": "in_progress", "content": []}
++        return (ev("response.output_item.added", output_index=msg_index,
++                   item=item)
++                + ev("response.content_part.added", item_id=msg_id,
++                     output_index=msg_index, content_index=0,
++                     part={"type": "output_text", "text": "",
++                           "annotations": []}))
++
++    def close_message():
++        item = {"id": msg_id, "type": "message", "role": "assistant",
++                "status": "completed",
++                "content": [{"type": "output_text", "text": text_out,
++                             "annotations": []}]}
++        done_items.append((msg_index, item))
++        return (ev("response.output_text.done", item_id=msg_id,
++                   output_index=msg_index, content_index=0, text=text_out)
++                + ev("response.content_part.done", item_id=msg_id,
++                     output_index=msg_index, content_index=0,
++                     part={"type": "output_text", "text": text_out,
++                           "annotations": []})
++                + ev("response.output_item.done", output_index=msg_index,
++                     item=item))
++
++    rs_id = "rs_" + rid.split("_", 1)[-1]
++    rs_open = False
++    rs_index = None
++    rs_text = ""
++    rs_pending = ""
++    rs_started = False
++
++    def open_reasoning():
++        nonlocal rs_open, rs_index
++        rs_index = next(nxt)
++        rs_open = True
++        item = {"id": rs_id, "type": "reasoning", "status": "in_progress",
++                "summary": [], "content": [], "encrypted_content": None}
++        out = ev("response.output_item.added", output_index=rs_index,
++                 item=item)
++        if want_summary:
++            out += ev("response.reasoning_summary_part.added",
++                      item_id=rs_id, output_index=rs_index,
++                      summary_index=0,
++                      part={"type": "summary_text", "text": ""})
++        return out
++
++    def reasoning_delta(rd):
++        nonlocal rs_text
++        rs_text += rd
++        if want_summary:
++            return ev("response.reasoning_summary_text.delta",
++                      item_id=rs_id, output_index=rs_index,
++                      summary_index=0, delta=rd)
++        return ev("response.reasoning_text.delta", item_id=rs_id,
++                  output_index=rs_index, content_index=0, delta=rd)
++
++    def close_reasoning():
++        nonlocal rs_open
++        rs_open = False
++        item = {"id": rs_id, "type": "reasoning", "status": "completed",
++                "summary": ([{"type": "summary_text", "text": rs_text}]
++                            if want_summary else []),
++                "content": [{"type": "reasoning_text", "text": rs_text}],
++                "encrypted_content": None}
++        done_items.append((rs_index, item))
++        if want_summary:
++            out = ev("response.reasoning_summary_text.done",
++                     item_id=rs_id, output_index=rs_index,
++                     summary_index=0, text=rs_text)
++            out += ev("response.reasoning_summary_part.done",
++                      item_id=rs_id, output_index=rs_index,
++                      summary_index=0,
++                      part={"type": "summary_text", "text": rs_text})
++        else:
++            out = ev("response.reasoning_text.done", item_id=rs_id,
++                     output_index=rs_index, content_index=0, text=rs_text)
++        out += ev("response.output_item.done", output_index=rs_index,
++                  item=item)
++        return out
++
++    def text_and_calls(td, evs):
++        nonlocal msg_open, text_out
++        if td:
++            if not msg_open:
++                yield open_message()
++            text_out += td
++            yield ev("response.output_text.delta", item_id=msg_id,
++                     output_index=msg_index, content_index=0, delta=td)
++        for e in evs:
++            i = e["index"]
++            if not parallel and i > 0:
++                continue
++            fn = e.get("function") or {}
++            if i not in calls:
++                if msg_open:
++                    yield close_message()
++                    msg_open = False
++                idx = next(nxt)
++                calls[i] = {"index": idx, "fc_id": f"fc_{uuid.uuid4().hex[:24]}",
++                            "call_id": e.get("id") or "",
++                            "name": fn.get("name") or "", "args": "",
++                            "closed": False}
++                calls[i]["name"], calls[i]["extra"] = ns_call_fields(
++                    tool_ns, calls[i]["name"])
++                st = calls[i]
++                yield ev("response.output_item.added", output_index=idx,
++                         item={"id": st["fc_id"], "type": "function_call",
++                               "status": "in_progress", "name": st["name"],
++                               "arguments": "", "call_id": st["call_id"],
++                               **st["extra"]})
++                if not fn.get("arguments"):
++                    continue
++            st = calls[i]
++            frag = fn.get("arguments") or ""
++            if not frag:
++                continue
++            st["args"] += frag
++            yield ev("response.function_call_arguments.delta",
++                     item_id=st["fc_id"], output_index=st["index"],
++                     delta=frag)
++
++    async for delta, d in gen:
++        if d is not None and d.get("reason") == "error":
++            body = error_body(d)
++            body["code"] = body["code"] or body["type"]
++            yield ev("error", **body)
++            return
++        if d is not None:
++            if rs_open:
++                yield close_reasoning()
++            if tstream is not None and buf:
++                for s in text_and_calls(*tstream.push(pre + buf, final=True)):
++                    yield s
++            if msg_open:
++                yield close_message()
++            for st in calls.values():
++                if st["closed"]:
++                    continue
++                st["closed"] = True
++                item = {"id": st["fc_id"], "type": "function_call",
++                        "status": "incomplete" if d.get("reason") == "length" else "completed",
++                        "name": st["name"],
++                        "arguments": st["args"], "call_id": st["call_id"],
++                        **st["extra"]}
++                done_items.append((st["index"], item))
++                yield ev("response.function_call_arguments.done",
++                         item_id=st["fc_id"], output_index=st["index"],
++                         arguments=st["args"])
++                yield ev("response.output_item.done",
++                         output_index=st["index"], item=item)
++            status = "incomplete" if d.get("reason") == "length" \
++                else "completed"
++            out = [i for _, i in sorted(done_items, key=lambda x: x[0])]
++            d["n_reasoning"] = reasoning_tokens(d, split.thinking)
++            final = envelope(status, out, responses_usage(d, d.get("n_prompt", 0)))
++            if status == "incomplete":
++                final["incomplete_details"] = {"reason": "max_output_tokens"}
++                yield ev("response.incomplete", response=final, timings=timings_of(d, info))
++            else:
++                yield ev("response.completed", response=final, timings=timings_of(d, info))
++            return
++
++        rd, cd = split.push(delta)
++        if rd:
++            if not rs_started:
++                rd = rd.lstrip()
++                if rd:
++                    rs_started = True
++            if rs_started and rd:
++                rd = rs_pending + rd
++                kept = rd.rstrip()
++                rs_pending = rd[len(kept):]
++                rd = kept
++            if rd:
++                if not rs_open:
++                    yield open_reasoning()
++                yield reasoning_delta(rd)
++        if not cd:
++            continue
++        if rs_open:
++            yield close_reasoning()
++        if not started:
++            cd = cd.lstrip("\n")
++            if not cd:
++                continue
++            started = True
++        if tstream is None:
++            if not msg_open:
++                yield open_message()
++            text_out += cd
++            yield ev("response.output_text.delta", item_id=msg_id,
++                     output_index=msg_index, content_index=0, delta=cd)
++            continue
++        buf += cd
++        for s in text_and_calls(*tstream.push(pre + buf)):
++            yield s
++
++def messages_body(split, text, done, fin, tools, pre, json_only, parallel,
++                  forced, cid, model, n_prompt, show_thinking, tim):
++    split.full = text
++    reasoning, content = split.parts()
++    answer = content
++    tool_calls = []
++    if tools:
++        content, tool_calls, _ = split_tool_calls(pre + content, tools, json_only=json_only)
++        if not parallel:
++            tool_calls = tool_calls[:1]
++    if forced and not tool_calls and fin == "length":
++        content, tool_calls, _ = partial_tool_calls(pre + (answer or ""), tools,
++                                                    json_only=json_only)
++        if not parallel:
++            tool_calls = tool_calls[:1]
++    elif forced and not tool_calls:
++        return None, [], ("tool_choice required a call and the "
++                          "model did not name a tool: retry, or "
++                          "name the tool in tool_choice")
++    blocks = []
++    if reasoning:
++        blocks.append({"type": "thinking",
++                       "thinking": reasoning if show_thinking else "",
++                       "signature": think_signature(reasoning)})
++    if content:
++        blocks.append({"type": "text", "text": content})
++    for tc in tool_calls:
++        blocks.append({"type": "tool_use", "id": tc["id"],
++                       "name": tc["function"]["name"],
++                       "input": tool_input(tc["function"]["arguments"])})
++    done["n_reasoning"] = reasoning_tokens(done, split.thinking)
++    sr, ss = messages_stop(done, bool(tool_calls))
++    body = {"id": cid, "type": "message", "role": "assistant",
++            "model": model, "content": blocks, "stop_reason": sr,
++            "stop_sequence": ss,
++            "usage": messages_usage(done, n_prompt)}
++    if tim is not None:
++        body["timings"] = tim
++    return body, tool_calls, None
++
++def responses_body(split, text, done, fin, tools, pre, json_only, parallel,
++                   forced, cid, created, model, n_prompt, max_tokens,
++                   want_summary, tool_ns, tim):
++    split.full = text
++    reasoning, content = split.parts()
++    answer = content
++    tool_calls = []
++    if tools:
++        content, tool_calls, _ = split_tool_calls(pre + content, tools, json_only=json_only)
++        if not parallel:
++            tool_calls = tool_calls[:1]
++    left_open = set()
++    if forced and not tool_calls and fin == "length":
++        content, tool_calls, left_open = partial_tool_calls(pre + (answer or ""), tools,
++                                                            json_only=json_only)
++        if not parallel:
++            tool_calls = tool_calls[:1]
++    out = []
++    if reasoning:
++        out.append({"id": "rs_" + cid.split("_", 1)[-1],
++                    "type": "reasoning", "status": "completed",
++                    "summary": ([{"type": "summary_text",
++                                  "text": reasoning}]
++                                if want_summary else []),
++                    "content": [{"type": "reasoning_text",
++                                 "text": reasoning}],
++                    "encrypted_content": None})
++    if content:
++        out.append({"id": "msg_" + cid.split("_", 1)[-1],
++                    "type": "message", "role": "assistant",
++                    "status": "completed",
++                    "content": [{"type": "output_text",
++                                 "text": content,
++                                 "annotations": []}]})
++    for tc in tool_calls:
++        nm, extra = ns_call_fields(tool_ns, tc["function"]["name"])
++        out.append({"id": f"fc_{uuid.uuid4().hex[:24]}",
++                    "type": "function_call",
++                    "status": "incomplete" if tc["id"] in left_open else "completed",
++                    "name": nm,
++                    "arguments": tc["function"]["arguments"],
++                    "call_id": tc["id"], **extra})
++    done["n_reasoning"] = reasoning_tokens(done, split.thinking)
++    body = {"id": cid, "object": "response", "created_at": created,
++            "status": "incomplete" if fin == "length" else "completed",
++            "model": model, "output": out,
++            "parallel_tool_calls": parallel,
++            "max_output_tokens": max_tokens,
++            "usage": responses_usage(done, n_prompt)}
++    if tim is not None:
++        body["timings"] = tim
++    if fin == "length":
++        body["incomplete_details"] = {"reason": "max_output_tokens"}
++    return body, tool_calls
++
++async def keepalive(frames, every, side=None, side_frame=None):
++    if every <= 0 and side is None:
++        async for f in frames:
++            yield f
++        return
++    it = frames.__aiter__()
++    nxt = None
++    sget = None
++    try:
++        while True:
++            if nxt is None:
++                nxt = asyncio.ensure_future(it.__anext__())
++            if side is not None and sget is None:
++                sget = asyncio.ensure_future(side.get())
++            done, _ = await asyncio.wait(
++                {nxt} if sget is None else {nxt, sget},
++                timeout=every if every > 0 else None,
++                return_when=asyncio.FIRST_COMPLETED)
++            if not done:
++                yield ": keepalive\n\n"
++                continue
++            if sget is not None and sget in done:
++                item, sget = sget.result(), None
++                yield side_frame(item)
++                continue
++            if not nxt.done():
++                continue
++            while side is not None and not side.empty():
++                yield side_frame(side.get_nowait())
++            task, nxt = nxt, None
++            try:
++                f = task.result()
++            except StopAsyncIteration:
++                return
++            yield f
++    finally:
++        for t in (nxt, sget):
++            if t is not None and not t.done():
++                t.cancel()
++                try:
++                    await t
++                except BaseException:
++                    pass
++
++def npu_lfm3_generates(front, model):
++    return front is not None and front.owns(model) and \
++        front.models.get(front.model_id(model), {}).get("style") == "lfm3"
++
++def _npu_shim(model, msgs, max_tokens, stream, tools, tool_choice, **kw):
++    f = {k: v for k, v in kw.items() if v is not None}
++    return ChatReq(model=model, messages=msgs, max_tokens=max_tokens, stream=stream, tools=tools,
++                   tool_choice=tool_choice, **f)
++
++def _npu_lfm3_tools(front, chat_tools, deferred):
++    import npu_api
++    if not chat_tools or not TOOL_DEFER or not deferred:
++        return chat_tools, None
++    names = [(t.get("function") or {}).get("name") for t in chat_tools]
++    if all(n in deferred for n in names):
++        return chat_tools, None
++    out, defer = [], {}
++    for t in chat_tools:
++        fn = t.get("function") or {}
++        if fn.get("name") in deferred:
++            defer[fn["name"]] = npu_api._lfm3_tool_json(fn)
++            out.append({"type": "function", "function": dict(fn, defer_loading=True)})
++        else:
++            out.append(t)
++    return out, defer
++
++async def npu_lfm3_wire(front, wire, model, http_request, shim, msgs, chat_tools, parallel=True, show_thinking=True,
++                        want_summary=False, tool_ns=None, max_out=0):
++    check_tool_schemas(chat_tools, "input_schema" if wire == "messages" else "parameters")
++    import npu_api
++    err = (lambda st, msg, code=None: anth_error(st, msg)) if wire == "messages" else oai_error
++    try:
++        mode, forced = npu_api.lfm3_tool_choice(shim.tool_choice, chat_tools)
++        tools = None if mode == "none" else (chat_tools or None)
++        pre = npu_api.lfm3_force_prefill(mode, forced, tools)
++        think = npu_api.lfm3_think(shim, front.models.get(model)) and not pre and not npu_api.audio_style(front.models.get(model, {}))
++        keep = npu_api.lfm3_keep(shim)
++        h = await front.lfm3_open(shim, msgs, tools, think, keep, pre)
++    except npu_api.NpuError as e:
++        r = err(e.status, e.message, e.code)
++        if e.code == "engine_busy":
++            r.headers["Retry-After"] = str(npu_api.RETRY_AFTER_S)
++        return r
++    except HTTPException as e:
++        return err(e.status_code, str(e.detail))
++    cid = ("msg_" if wire == "messages" else "resp_") + uuid.uuid4().hex[:24]
++    created = int(time.time())
++    split = OpenedThinkSplit() if npu_api.audio_style(front.models.get(model, {})) else ThinkSplit(think)
++    tools_p = [dict(t, function={k: v for k, v in (t.get("function") or {}).items() if k != "defer_loading"})
++               for t in tools] if tools else None
++    tstream = ToolStream(tools_p) if tools_p else None
++    gen = front.lfm3_events(shim, h, think, http_request)
++    if shim.stream:
++        it = (sse_messages(gen, cid, model, split, tstream, pre, parallel, h["n_prompt"], show_thinking)
++              if wire == "messages" else
++              sse_responses(gen, cid, created, model, split, tstream, pre, parallel, max_out, want_summary, tool_ns))
++
++        async def body():
++            async for ev in keepalive(it, SSE_KEEPALIVE_S):
++                if ev.startswith(":"):
++                    yield 'event: ping\ndata: {"type": "ping"}\n\n' if wire == "messages" else ev
++                    continue
++                yield ev
++        return StreamingResponse(body(), media_type="text/event-stream")
++    text, done = "", None
++    try:
++        async for delta, d in gen:
++            if d is not None:
++                done = d
++                break
++            text += delta
++    finally:
++        await gen.aclose()
++    if http_request is not None and await http_request.is_disconnected():
++        return Response(status_code=499)
++    if done is None or done.get("reason") == "error":
++        return err((done or {}).get("status", 500), (done or {}).get("message", "the NPU engine ended the generation"),
++                   "server_error")
++    fin = "length" if done["reason"] == "length" else "stop"
++    if wire == "messages":
++        body, _, refuse = messages_body(split, text, done, fin, tools_p, pre, False, parallel, bool(pre), cid, model,
++                                        h["n_prompt"], show_thinking, timings_of(done))
++        if refuse:
++            return anth_error(502, refuse)
++        return JSONResponse(body)
++    body, _ = responses_body(split, text, done, fin, tools_p, pre, False, parallel, bool(pre), cid, created, model, h["n_prompt"],
++                             max_out, want_summary, tool_ns, timings_of(done))
++    return JSONResponse(body)
++
++def _npu_messages_req(front, req):
++    ex = req.model_extra or {}
++    if "audio" in (ex.get("modalities") or []) or ex.get("audio") is not None:
++        return anth_error(400, "/v1/messages has no audio output: ask /v1/chat/completions (modalities audio) or /v1/audio/speech")
++    chat_tools, _, deferred = messages_tools(req.tools)
++    chat_tools, deferred = with_added_tools(chat_tools, deferred, req.messages)
++    tc, parallel = messages_tool_choice(req.tool_choice)
++    th = req.thinking if isinstance(req.thinking, dict) else {}
++    oc = req.output_config if isinstance(req.output_config, dict) else {}
++    if isinstance(oc.get("format"), dict):
++        return anth_error(400, f"'{req.model}' runs on the NPU, which does not constrain the output to a schema "
++                               f"(output_config.format)")
++    try:
++        listed, defer = _npu_lfm3_tools(front, chat_tools, deferred)
++        msgs = normalize_messages(messages_to_openai(req.system, req.messages, defer))
++    except ValueError as e:
++        return anth_error(400, str(e))
++    if not msgs or all(m.get("role") == "system" for m in msgs):
++        return anth_error(400, "messages is empty: /v1/messages needs at least one user turn")
++    try:
++        shim = _npu_shim(req.model, msgs, int(req.max_tokens), req.stream, listed, tc,
++                         enable_thinking=(None if not th else th.get("type") != "disabled"),
++                         reasoning_effort=oc.get("effort"), temperature=req.temperature, top_p=req.top_p,
++                         top_k=req.top_k, stop=req.stop_sequences)
++    except Exception as e:
++        return anth_error(400, str(e)[:300])
++    return shim, msgs, listed, parallel is not False, th.get("display") != "omitted"
++
++async def npu_messages(front, req, http_request):
++    r = _npu_messages_req(front, req)
++    if not isinstance(r, tuple):
++        return r
++    shim, msgs, listed, parallel, show = r
++    return await npu_lfm3_wire(front, "messages", req.model, http_request, shim, msgs, listed, parallel=parallel,
++                               show_thinking=show)
++
++def npu_count_tokens(front, req):
++    import npu_api
++    r = _npu_messages_req(front, req)
++    if not isinstance(r, tuple):
++        return r
++    shim, msgs, listed, _, _ = r
++    try:
++        mode, forced = npu_api.lfm3_tool_choice(shim.tool_choice, listed)
++        tools = None if mode == "none" else (listed or None)
++        pre = npu_api.lfm3_force_prefill(mode, forced, tools)
++        ids, _, _ = front.lfm3_prompt(req.model, msgs, tools, npu_api.lfm3_think(shim, front.models.get(req.model)) and not pre, npu_api.lfm3_keep(shim), pre)
++    except npu_api.NpuError as e:
++        return anth_error(e.status, e.message)
++    return JSONResponse({"input_tokens": len(ids)})
++
++async def npu_responses(front, req, http_request):
++    ex = req.model_extra or {}
++    if "audio" in (ex.get("modalities") or []) or ex.get("audio") is not None:
++        return oai_error(400, "/v1/responses has no audio output: ask /v1/chat/completions (modalities audio) or /v1/audio/speech")
++    tool_ns = {}
++    chat_tools, _ = responses_tools(req.tools, tool_ns)
++    tc = req.tool_choice
++    if isinstance(tc, dict) and tc.get("type") == "function" and "function" not in tc:
++        fn_ = tc.get("name")
++        if tc.get("namespace"):
++            fn_ = next((k for k, v in tool_ns.items() if v == (tc["namespace"], fn_)), fn_)
++        tc = {"type": "function", "function": {"name": fn_}}
++    if isinstance((req.text or {}).get("format"), dict) and (req.text or {})["format"].get("type") not in (None, "text"):
++        return oai_error(400, f"'{req.model}' runs on the NPU, which does not constrain the output to a schema (text.format)")
++    try:
++        msgs = normalize_messages(responses_messages(req.instructions, req.input, tool_ns, audio=True))
++    except ValueError as e:
++        return oai_error(400, str(e))
++    if not msgs or all(m.get("role") == "system" for m in msgs):
++        return oai_error(400, "input is empty: /v1/responses needs at least one non-system turn")
++    try:
++        nm = front.models.get(front.model_id(req.model), {})
++        import npu_api
++        dflt = npu_api.ovis_default_max(nm) if nm.get("ovis") else CHAT_MAX_TOKENS
++        shim = _npu_shim(req.model, msgs, (dflt if req.max_output_tokens is None else req.max_output_tokens),
++                         req.stream, chat_tools, tc, parallel_tool_calls=req.parallel_tool_calls,
++                         reasoning=req.reasoning if isinstance(req.reasoning, dict) else None,
++                         temperature=req.temperature, top_p=req.top_p)
++    except Exception as e:
++        return oai_error(400, str(e)[:300])
++    return await npu_lfm3_wire(front, "responses", req.model, http_request, shim, msgs, chat_tools,
++                               parallel=req.parallel_tool_calls is not False,
++                               want_summary=bool((req.reasoning or {}).get("summary") not in (None, "", "none")),
++                               tool_ns=tool_ns, max_out=shim.max_tokens)
++
++def npu_wire_routes(app, front):
++    from fastapi import Request as _Req
++
++    async def messages(req: MessagesReq, http_request: _Req):
++        if not front.owns(req.model):
++            return anth_error(404, f"The model `{req.model}` does not exist or is not loaded here (loaded: "
++                                   f"{', '.join(sorted(front.models))})")
++        if not npu_lfm3_generates(front, req.model):
++            return anth_error(400, front.wrong_route(req.model, "/v1/messages"))
++        return await npu_messages(front, req, http_request)
++
++    async def responses(req: ResponsesReq, http_request: _Req):
++        if not front.owns(req.model):
++            return oai_error(404, f"The model `{req.model}` does not exist or is not loaded here (loaded: "
++                                  f"{', '.join(sorted(front.models))})", "model_not_found")
++        if not npu_lfm3_generates(front, req.model):
++            return oai_error(400, front.wrong_route(req.model, "/v1/responses"))
++        return await npu_responses(front, req, http_request)
++    async def count_tokens(http_request: _Req):
++        try:
++            body = await http_request.json()
++        except Exception:
++            return anth_error(400, "the body is not JSON")
++        if not isinstance(body, dict):
++            return anth_error(400, "the body must be a JSON object")
++        try:
++            req = MessagesReq(**dict(body, max_tokens=body.get("max_tokens") or 1, stream=False))
++        except Exception as e:
++            return anth_error(400, str(e)[:300])
++        if not npu_lfm3_generates(front, req.model):
++            return anth_error(404 if not front.owns(req.model) else 400,
++                              f"`{req.model}` is not an LFM3 generation model loaded here")
++        return npu_count_tokens(front, req)
++    app.add_api_route("/v1/messages", messages, methods=["POST"])
++    app.add_api_route("/v1/messages/count_tokens", count_tokens, methods=["POST"])
++    app.add_api_route("/v1/responses", responses, methods=["POST"])
++
+ def build_app(tok, engine, ctx, max_cap=4096, queue_timeout=600,
+-              template=None, npu=None):
++              template=None, npu=None, lifespan=None):
+     engine.tokenizer = tok
+     load_model_filters(getattr(tok, "name_or_path", "") or "")
+     engine.fallback_ctx = ctx
++    print(f"serve_api: tokenizer split: {NATIVE_SPLIT_STATE}", flush=True)
+     client_markers_setup(tok)
++    render_once_setup(tok)
++    split_setup(tok)
+     prompt_tokens = PromptTokens(tok)
+-    app = FastAPI(title="halogen")
++    raw_tokens = PromptTokens(tok, raw=True)
++    app = FastAPI(title="halogen", lifespan=lifespan)
+     install_api_key(app)
+     install_upgrade_note(app)
+     app.state.prompt_tokens = prompt_tokens
++    app.state.raw_tokens = raw_tokens
+ 
+     RC = request_records.from_env(print)
+     app.state.records = RC
+ 
++    AG = None
++    if (os.environ.get("HALOGEN_AGENT_GUARD") or "").strip().lower() not in ("", "0", "off", "false", "no", "none"):
++        import agent_guard
++        AG = agent_guard.Guard(npu, agent_guard.mode_of(os.environ.get("HALOGEN_AGENT_GUARD")))
++        if npu is None:
++            AG.check()
++    app.state.agent_guard = AG
++    AGENT_FINAL_S = 3.0
++
+     def rec_begin(wire, http_request, sess, src, n_msgs, model, stream,
+                   effort=None, tool_choice=None):
+         if RC is None:
+@@ -3566,6 +5099,8 @@
+                 return s, i
+         return None, -1
+ 
++    prose_end = think_prose_end
++
+     def schema_for(req):
+         rf = getattr(req, "response_format", None)
+         if isinstance(rf, dict) and rf.get("type") in ("json_schema", "json_object"):
+@@ -3792,7 +5327,8 @@
+                   after=None, escape=(), think=None, seg=None, snap3=0,
+                   think_on=None, think_src=None, guard=None, keep=None,
+                   progress=None, ctl=None, agent=False, no_store=False,
+-                  tools=None, strict_info=None, asked=None):
++                  tools=None, strict_info=None, asked=None, ignore_eos=False,
++                  nocall=None):
+         limit = engine.info.get("ctx") or ctx
+         if len(ids) >= limit:
+             raise HTTPException(400, f"prompt {len(ids)} tokens exceeds "
+@@ -3845,24 +5381,28 @@
+                 yield tid, d, lp, False
+ 
+         _t_last = time.perf_counter()
+-        pmatch = (recent.best(ids) if not images
+-                  and engine.info.get("cache_mode", 1) != 0 else None)
++        plook = (recent.look() if not images
++                 and engine.info.get("cache_mode", 1) != 0 else None)
+         ctl = ctl if ctl is not None else {"stop": False}
+         ctl.setdefault("stop", False)
+         stop_n = None
+         stop_seq = None
+         sent = 0
+         kept_at = []
+-        stream = engine.generate(ids, max_tokens, eos_ids, drafter, sample,
++        tg = bool(guard is not None and guard[0] == 1 and lit
++                  and IM_START_ID is not None and IM_START_ID in lit)
++        tg_block, tg_tmpl = tg, False
++        watch = None
++        turn_cut = False
++        own_close = 0
++        stream = engine.generate(ids, max_tokens, [] if ignore_eos else eos_ids, drafter, sample,
+                                  penalty, snap=snap, snap2=snap2,
+                                  images=images, schema=schema, after=after,
+                                  escape=escape, think=think, seg=seg,
+                                  snap3=snap3, guard=guard, ctl=ctl,
+                                  keep=keep[0] if keep else None,
+                                  progress=progress, agent=agent,
+-                                 no_store=no_store, tools=tools,
+-                                 keep_end=bool(keep) and len(keep) > 2 and keep[2] == "auto"
+-                                 and FORK_AUTO_END_ONLY)
++                                 no_store=no_store, tools=tools, nocall=nocall)
+         gen_ids = [] if keep else None
+         src = held(stream) if guard else plain(stream)
+         if keep is not None and len(keep) > 2:
+@@ -3874,6 +5414,8 @@
+                 gen_ids.append(tid)
+             if lp is not None:
+                 lps.append((tid, lp))
++            if d is not None and own_close:
++                d["kept_think"] = max(0, int(d.get("kept_think", 0)) - own_close)
+             if d is not None and keep:
+                 keep[1](gen_ids, d, stop_n is not None)
+             if d is not None:
+@@ -3883,6 +5425,8 @@
+                         d["decode_ms"] = d["decode_ms"] * stop_n / n_eng
+                     d["n_gen"] = stop_n
+                     d["reason"] = "stop"
++                    if turn_cut:
++                        d["turn_cut"] = 1
+                 if asked is not None and d.get("reason") != "error":
+                     if int(d.get("room_from", -1)) < 0:
+                         d["max_tokens"] = int(d.get("max_tokens", max_tokens))
+@@ -3890,6 +5434,7 @@
+                 done = d
+                 prefix_s = ""
+                 if d.get("reason") != "error":
++                    pmatch = recent.best(ids, plook) if plook is not None else None
+                     if pmatch is not None:
+                         shared, age, plen, slen = pmatch
+                         d["prefix_n"] = shared
+@@ -3903,6 +5448,8 @@
+                     recent.add(ids, out)
+                 if d.get("think_forced") == 2:
+                     d["think_closed_by"] = "end_of_turn_guard"
++                elif d.get("think_forced") == 3:
++                    d["think_closed_by"] = "end_of_turn_in_reasoning"
+                 elif think_src and d.get("think_forced"):
+                     d["think_closed_by"] = think_src
+                 strict_s = ""
+@@ -3951,17 +5498,24 @@
+                            f" | think {'on' if think_on else 'off'}"
+                            + (f", closed at {d.get('think_seen', 0)} by "
+                               + {"answer_room": "answer room",
+-                                 "end_of_turn_guard": "the end-of-turn guard"}.get(
++                                 "end_of_turn_guard": "the end-of-turn guard",
++                                 "end_of_turn_in_reasoning":
++                                     "the end of turn the model wrote in its reasoning"}.get(
+                                      d["think_closed_by"], d["think_closed_by"])
+                               if d.get("think_closed_by") else ""))
+                 kt, kc = d.get("kept_think", 0), d.get("kept_call", 0)
+                 think_s += ((f" | end of turn kept as text: {kt} in the think "
+                              f"block, {kc} in a tool call") if kt or kc else "")
++                if d.get("turn_cut"):
++                    think_s += (" | ended at the end of turn the model wrote in "
++                                "its reasoning (a new turn followed it)")
+                 if d.get("disk_rows"):
+                     think_s += (f" | disk: restored {d['disk_rows']} rows in "
+                                 f"{d.get('disk_ms', 0.0):.0f} ms")
+                 if d.get("kfd_ms"):
+                     think_s += f" | GPU queues evicted {d['kfd_ms']} ms"
++                if nocall is not None and guard and engine.info.get("nocall"):
++                    think_s += " | tool_choice none: <tool_call> masked"
+                 print(f"serve_api: {name} {d['n_gen']} tok in {dt:.2f}s = "
+                       f"{rate} | {spec}"
+                       f"prompt {pn}{cached_s}"
+@@ -4025,24 +5579,57 @@
+                 stop_seq = hit
+                 ctl["stop"] = True
+                 continue
+-            if stops:
++            if tg_block:
++                if tid == THINK_END_ID:
++                    tg_block = False
++                if watch is not None and tid == THINK_END_ID:
++                    tail = text[sent:watch[0]] if sent < watch[0] else ""
++                    if tail:
++                        yield tail, None
++                    sent = max(watch[0], len(text) - len(delta))
++                    watch = None
++                    own_close += 1
++                if watch is not None:
++                    if tid == IM_START_ID:
++                        tail = text[sent:watch[0]] if sent < watch[0] else ""
++                        if tail:
++                            yield tail, None
++                        sent = watch[0]
++                        stop_n = watch[1]
++                        turn_cut = True
++                        ctl["stop"] = True
++                        continue
++                    if tid in lit or not delta or delta.strip():
++                        watch = None
++                if (watch is None and tg_block and kept and tid in EOS_SET
++                        and tid in lit and not tg_tmpl):
++                    at = len(text) - len(lit[tid])
++                    if prose_end(text, at):
++                        watch = (at, len(out) - 1)
++                if tid == IM_START_ID:
++                    tg_tmpl = True
++            if stops or tg:
+                 hold = 0
+-                for t in stops:
++                for t in (stops or ()):
+                     for k in range(min(len(t) - 1, len(text)), hold, -1):
+                         if text.endswith(t[:k]):
+                             hold = k
+                             break
+                 end = len(text) - hold
++                if watch is not None:
++                    end = min(end, watch[0])
+                 delta = text[sent:end] if end > sent else ""
+                 sent = max(sent, end)
+             if delta:
+                 _t_last = time.perf_counter()
+             yield delta, None
+-        if stops and stop_n is None and sent < len(text):
++        if (stops or tg) and stop_n is None and sent < len(text):
+             yield text[sent:], None
+         if done is None and stop_n is not None:
+             done = {"reason": "stop", "n_gen": stop_n, "n_prompt": len(ids),
+                     "prefill_ms": 0.0, "decode_ms": 0.0}
++            if turn_cut:
++                done["turn_cut"] = 1
+         if done is not None:
+             done["logprobs"] = lps
+             if stop_seq is not None:
+@@ -4051,133 +5638,8 @@
+                                        "n_prompt": len(ids), "prefill_ms": 0.0,
+                                        "decode_ms": 0.0, "logprobs": lps})
+ 
+-    def reasoning_tokens(d, thinking):
+-        if thinking is False:
+-            return 0
+-        if d.get("think_end"):
+-            return min(int(d["think_end"]), int(d.get("n_gen", 0)))
+-        return int(d.get("n_gen", 0)) if thinking else 0
+-
+-    def usage(d, n_prompt):
+-        u = {"prompt_tokens": n_prompt, "completion_tokens": d["n_gen"],
+-             "total_tokens": n_prompt + d["n_gen"]}
+-        if d.get("n_cached"):
+-            u["prompt_tokens_details"] = {"cached_tokens": d["n_cached"]}
+-        if "n_reasoning" in d:
+-            det = {"reasoning_tokens": d["n_reasoning"]}
+-            if d.get("think_closed_by"):
+-                det["reasoning_closed_at"] = int(d.get("think_seen", 0))
+-                det["reasoning_closed_by"] = d["think_closed_by"]
+-            u["completion_tokens_details"] = det
+-        kept = int(d.get("kept_think", 0)) + int(d.get("kept_call", 0))
+-        if kept:
+-            u.setdefault("completion_tokens_details", {})["end_of_turn_kept"] = kept
+-        if d.get("call_in_block"):
+-            u.setdefault("completion_tokens_details", {})["tool_call_from_reasoning"] = True
+-        return u
+-
+-    def responses_usage(d, n_prompt):
+-        u = usage(d, n_prompt)
+-        r = {"input_tokens": u.get("prompt_tokens", 0),
+-             "output_tokens": u.get("completion_tokens", 0),
+-             "total_tokens": u.get("total_tokens", 0)}
+-        if "prompt_tokens_details" in u:
+-            r["input_tokens_details"] = dict(u["prompt_tokens_details"])
+-        if "completion_tokens_details" in u:
+-            r["output_tokens_details"] = dict(u["completion_tokens_details"])
+-        return r
+-
+     def timings(d):
+-        pn = int(d.get("n_prompt", 0))
+-        gn = int(d.get("n_gen", 0))
+-        cached = int(d.get("n_cached", 0))
+-        processed = max(0, pn - cached)
+-        pms = float(d.get("prefill_ms", 0.0))
+-        dms = float(d.get("decode_ms", 0.0))
+-        t = {"prompt_n": processed, "predicted_n": gn,
+-             "prompt_ms": round(pms, 3), "predicted_ms": round(dms, 3),
+-             "prompt_per_second": (round(processed / (pms / 1000.0), 3)
+-                                   if pms > 0 and processed > 0 else 0.0),
+-             "predicted_per_second": round(gn / (dms / 1000.0), 3) if dms > 0 else 0.0}
+-        if "n_cached" in d:
+-            t["cache_n"] = cached
+-        if "disk_rows" in d:
+-            t["disk_restore_n"] = int(d["disk_rows"])
+-            t["disk_restore_ms"] = round(float(d["disk_ms"]), 3)
+-        if "prefix_n" in d:
+-            t["prefix_n"] = int(d["prefix_n"])
+-        if int(d.get("room_from", -1)) >= 0:
+-            t["max_tokens_clamped_from"] = int(d["room_from"])
+-            t["max_tokens_clamped_to"] = int(d["max_tokens"])
+-        if "rounds" in d:
+-            pld_r = int(d.get("pld_rounds", 0))
+-            pld_a = int(d.get("pld_accepted", 0))
+-            gram_r = int(d.get("gram_rounds", 0))
+-            gram_d = int(d.get("gram_drafted", 0))
+-            gram_a = int(d.get("gram_accepted", 0))
+-            head_r = int(d["rounds"]) - pld_r - gram_r
+-            head_a = (int(d["commit"]) - int(d["rounds"]) - int(d.get("shared", 0))
+-                      - pld_a - gram_a)
+-            if pld_r == 0 or "pld_drafted" in d:
+-                head_d = int(d["head_drafted"]) if "head_drafted" in d else max(0, head_r)
+-                t["draft_n"] = head_d + int(d.get("pld_drafted", 0)) + gram_d
+-                t["draft_n_accepted"] = max(0, head_a) + pld_a + gram_a
+-                t["speculation"] = {
+-                    "drafter": {0: "none", 1: ("mtp" if engine.info.get("mtp")
+-                                               else "lookup")}.get(int(d.get("drafter", 0)),
+-                                                          str(d.get("drafter"))),
+-                    "rounds": int(d["rounds"]),
+-                    "head": {"rounds": head_r, "drafted": head_d,
+-                             "accepted": max(0, head_a)},
+-                    "lookup": {"rounds": pld_r, "drafted": int(d.get("pld_drafted", 0)),
+-                               "accepted": pld_a},
+-                    "grammar": {"rounds": gram_r, "drafted": gram_d,
+-                                "accepted": gram_a}}
+-        return t
+-
+-    async def keepalive(frames, every, side=None, side_frame=None):
+-        if every <= 0 and side is None:
+-            async for f in frames:
+-                yield f
+-            return
+-        it = frames.__aiter__()
+-        nxt = None
+-        sget = None
+-        try:
+-            while True:
+-                if nxt is None:
+-                    nxt = asyncio.ensure_future(it.__anext__())
+-                if side is not None and sget is None:
+-                    sget = asyncio.ensure_future(side.get())
+-                done, _ = await asyncio.wait(
+-                    {nxt} if sget is None else {nxt, sget},
+-                    timeout=every if every > 0 else None,
+-                    return_when=asyncio.FIRST_COMPLETED)
+-                if not done:
+-                    yield ": keepalive\n\n"
+-                    continue
+-                if sget is not None and sget in done:
+-                    item, sget = sget.result(), None
+-                    yield side_frame(item)
+-                    continue
+-                if not nxt.done():
+-                    continue
+-                while side is not None and not side.empty():
+-                    yield side_frame(side.get_nowait())
+-                task, nxt = nxt, None
+-                try:
+-                    f = task.result()
+-                except StopAsyncIteration:
+-                    return
+-                yield f
+-        finally:
+-            for t in (nxt, sget):
+-                if t is not None and not t.done():
+-                    t.cancel()
+-                    try:
+-                        await t
+-                    except BaseException:
+-                        pass
++        return timings_of(d, engine.info)
+ 
+     async def until_gone(frames, http_request, state, every=0.5):
+         if http_request is None:
+@@ -4246,11 +5708,6 @@
+         finally:
+             await gen.aclose()
+ 
+-    def error_body(d):
+-        return {"message": d["message"],
+-                "type": ERROR_TYPES.get(d["status"], "server_error"),
+-                "param": None, "code": d.get("code")}
+-
+     async def sse(gen, cid, created, chat, split, tstream=None, pre="",
+                   parallel=True, include_usage=False):
+         def envelope():
+@@ -4350,378 +5807,6 @@
+             for f in tool_frames(*tstream.push(pre + buf)):
+                 yield f
+ 
+-    def messages_usage(d, n_prompt):
+-        cached = int(d.get("n_cached") or 0)
+-        return {"input_tokens": max(0, int(n_prompt) - cached),
+-                "output_tokens": int(d.get("n_gen") or 0),
+-                "cache_read_input_tokens": cached,
+-                "cache_creation_input_tokens": 0}
+-
+-    def messages_stop(d, called):
+-        if d.get("reason") == "length":
+-            return "max_tokens", None
+-        if called:
+-            return "tool_use", None
+-        if d.get("stop_seq"):
+-            return "stop_sequence", d["stop_seq"]
+-        return "end_turn", None
+-
+-    def tool_input(args):
+-        try:
+-            v = json.loads(args or "{}")
+-        except ValueError:
+-            return {}
+-        return v if isinstance(v, dict) else {}
+-
+-    async def sse_messages(gen, mid, model, split, tstream=None, pre="",
+-                           parallel=True, n_prompt=0, show_thinking=True):
+-        def ev(kind, **body):
+-            return "event: %s\ndata: %s\n\n" % (kind, json.dumps(
+-                dict({"type": kind}, **body)))
+-
+-        yield ev("message_start", message={
+-            "id": mid, "type": "message", "role": "assistant", "model": model,
+-            "content": [], "stop_reason": None, "stop_sequence": None,
+-            "usage": {"input_tokens": int(n_prompt), "output_tokens": 0,
+-                      "cache_read_input_tokens": 0,
+-                      "cache_creation_input_tokens": 0}})
+-        nxt = itertools.count(0)
+-        cur = None
+-        rs_text, rs_started, rs_pending = "", False, ""
+-        started, buf = False, ""
+-        calls = {}
+-
+-        def close_cur():
+-            nonlocal cur
+-            if cur is None:
+-                return ""
+-            kind, i = cur
+-            cur = None
+-            out = ""
+-            if kind == "thinking":
+-                out = ev("content_block_delta", index=i, delta={
+-                    "type": "signature_delta",
+-                    "signature": think_signature(rs_text)})
+-            return out + ev("content_block_stop", index=i)
+-
+-        def open_block(kind, block):
+-            nonlocal cur
+-            cur = (kind, next(nxt))
+-            return ev("content_block_start", index=cur[1], content_block=block)
+-
+-        def text_and_calls(td, evs):
+-            if td:
+-                if cur is None or cur[0] != "text":
+-                    yield close_cur()
+-                    yield open_block("text", {"type": "text", "text": ""})
+-                yield ev("content_block_delta", index=cur[1], delta={
+-                    "type": "text_delta", "text": td})
+-            for e in evs:
+-                i = e["index"]
+-                if not parallel and i > 0:
+-                    continue
+-                fn = e.get("function") or {}
+-                if i not in calls:
+-                    yield close_cur()
+-                    yield open_block("tool", {"type": "tool_use",
+-                                              "id": e.get("id") or "",
+-                                              "name": fn.get("name") or "",
+-                                              "input": {}})
+-                    calls[i] = cur[1]
+-                frag = fn.get("arguments") or ""
+-                if frag:
+-                    yield ev("content_block_delta", index=calls[i],
+-                             delta={"type": "input_json_delta",
+-                                    "partial_json": frag})
+-
+-        async for delta, d in gen:
+-            if d is not None and d.get("reason") == "error":
+-                yield ev("error", error=anth_error_obj(d["status"],
+-                                                       d["message"]))
+-                return
+-            if d is not None:
+-                if tstream is not None and buf:
+-                    for s in text_and_calls(*tstream.push(pre + buf, final=True)):
+-                        yield s
+-                out = close_cur()
+-                if out:
+-                    yield out
+-                d["n_reasoning"] = reasoning_tokens(d, split.thinking)
+-                sr, ss = messages_stop(d, bool(calls))
+-                u = messages_usage(d, d.get("n_prompt") or n_prompt)
+-                yield ev("message_delta",
+-                         delta={"stop_reason": sr, "stop_sequence": ss},
+-                         usage=u)
+-                yield ev("message_stop")
+-                return
+-            rd, cd = split.push(delta)
+-            if rd:
+-                if not rs_started:
+-                    rd = rd.lstrip()
+-                    if rd:
+-                        rs_started = True
+-                if rs_started and rd:
+-                    rd = rs_pending + rd
+-                    kept = rd.rstrip()
+-                    rs_pending = rd[len(kept):]
+-                    rd = kept
+-                if rd:
+-                    if cur is None or cur[0] != "thinking":
+-                        yield close_cur()
+-                        yield open_block("thinking", {"type": "thinking",
+-                                                      "thinking": ""})
+-                    rs_text += rd
+-                    if show_thinking:
+-                        yield ev("content_block_delta", index=cur[1], delta={
+-                            "type": "thinking_delta", "thinking": rd})
+-            if not cd:
+-                continue
+-            if cur is not None and cur[0] == "thinking":
+-                yield close_cur()
+-            if not started:
+-                cd = cd.lstrip("\n")
+-                if not cd:
+-                    continue
+-                started = True
+-            td, evs = cd, []
+-            if tstream is not None:
+-                buf += cd
+-                td, evs = tstream.push(pre + buf)
+-            for s in text_and_calls(td, evs):
+-                yield s
+-
+-    async def sse_responses(gen, rid, created, model, split,
+-                            tstream=None, pre="", parallel=True,
+-                            max_out=0, want_summary=False, tool_ns=None):
+-        seq = itertools.count(0)
+-
+-        def ev(kind, **body):
+-            body["type"] = kind
+-            body["sequence_number"] = next(seq)
+-            return f"event: {kind}\ndata: {json.dumps(body)}\n\n"
+-
+-        def envelope(status, output, usage_obj=None):
+-            return {"id": rid, "object": "response", "created_at": created,
+-                    "status": status, "model": model, "output": output,
+-                    "parallel_tool_calls": parallel,
+-                    "max_output_tokens": max_out or None,
+-                    "usage": usage_obj}
+-
+-        base = envelope("in_progress", [])
+-        yield ev("response.created", response=base)
+-        yield ev("response.in_progress", response=base)
+-
+-        nxt = itertools.count(0)
+-        started = False
+-        msg_id = "msg_" + rid.split("_", 1)[-1]
+-        msg_open = False
+-        msg_index = None
+-        text_out = ""
+-        buf = ""
+-        calls = {}
+-        done_items = []
+-
+-        def open_message():
+-            nonlocal msg_open, msg_index
+-            msg_index = next(nxt)
+-            msg_open = True
+-            item = {"id": msg_id, "type": "message", "role": "assistant",
+-                    "status": "in_progress", "content": []}
+-            return (ev("response.output_item.added", output_index=msg_index,
+-                       item=item)
+-                    + ev("response.content_part.added", item_id=msg_id,
+-                         output_index=msg_index, content_index=0,
+-                         part={"type": "output_text", "text": "",
+-                               "annotations": []}))
+-
+-        def close_message():
+-            item = {"id": msg_id, "type": "message", "role": "assistant",
+-                    "status": "completed",
+-                    "content": [{"type": "output_text", "text": text_out,
+-                                 "annotations": []}]}
+-            done_items.append((msg_index, item))
+-            return (ev("response.output_text.done", item_id=msg_id,
+-                       output_index=msg_index, content_index=0, text=text_out)
+-                    + ev("response.content_part.done", item_id=msg_id,
+-                         output_index=msg_index, content_index=0,
+-                         part={"type": "output_text", "text": text_out,
+-                               "annotations": []})
+-                    + ev("response.output_item.done", output_index=msg_index,
+-                         item=item))
+-
+-        rs_id = "rs_" + rid.split("_", 1)[-1]
+-        rs_open = False
+-        rs_index = None
+-        rs_text = ""
+-        rs_pending = ""
+-        rs_started = False
+-
+-        def open_reasoning():
+-            nonlocal rs_open, rs_index
+-            rs_index = next(nxt)
+-            rs_open = True
+-            item = {"id": rs_id, "type": "reasoning", "status": "in_progress",
+-                    "summary": [], "content": [], "encrypted_content": None}
+-            out = ev("response.output_item.added", output_index=rs_index,
+-                     item=item)
+-            if want_summary:
+-                out += ev("response.reasoning_summary_part.added",
+-                          item_id=rs_id, output_index=rs_index,
+-                          summary_index=0,
+-                          part={"type": "summary_text", "text": ""})
+-            return out
+-
+-        def reasoning_delta(rd):
+-            nonlocal rs_text
+-            rs_text += rd
+-            if want_summary:
+-                return ev("response.reasoning_summary_text.delta",
+-                          item_id=rs_id, output_index=rs_index,
+-                          summary_index=0, delta=rd)
+-            return ev("response.reasoning_text.delta", item_id=rs_id,
+-                      output_index=rs_index, content_index=0, delta=rd)
+-
+-        def close_reasoning():
+-            nonlocal rs_open
+-            rs_open = False
+-            item = {"id": rs_id, "type": "reasoning", "status": "completed",
+-                    "summary": ([{"type": "summary_text", "text": rs_text}]
+-                                if want_summary else []),
+-                    "content": [{"type": "reasoning_text", "text": rs_text}],
+-                    "encrypted_content": None}
+-            done_items.append((rs_index, item))
+-            if want_summary:
+-                out = ev("response.reasoning_summary_text.done",
+-                         item_id=rs_id, output_index=rs_index,
+-                         summary_index=0, text=rs_text)
+-                out += ev("response.reasoning_summary_part.done",
+-                          item_id=rs_id, output_index=rs_index,
+-                          summary_index=0,
+-                          part={"type": "summary_text", "text": rs_text})
+-            else:
+-                out = ev("response.reasoning_text.done", item_id=rs_id,
+-                         output_index=rs_index, content_index=0, text=rs_text)
+-            out += ev("response.output_item.done", output_index=rs_index,
+-                      item=item)
+-            return out
+-
+-        def text_and_calls(td, evs):
+-            nonlocal msg_open, text_out
+-            if td:
+-                if not msg_open:
+-                    yield open_message()
+-                text_out += td
+-                yield ev("response.output_text.delta", item_id=msg_id,
+-                         output_index=msg_index, content_index=0, delta=td)
+-            for e in evs:
+-                i = e["index"]
+-                if not parallel and i > 0:
+-                    continue
+-                fn = e.get("function") or {}
+-                if i not in calls:
+-                    if msg_open:
+-                        yield close_message()
+-                        msg_open = False
+-                    idx = next(nxt)
+-                    calls[i] = {"index": idx, "fc_id": f"fc_{uuid.uuid4().hex[:24]}",
+-                                "call_id": e.get("id") or "",
+-                                "name": fn.get("name") or "", "args": "",
+-                                "closed": False}
+-                    calls[i]["name"], calls[i]["extra"] = ns_call_fields(
+-                        tool_ns, calls[i]["name"])
+-                    st = calls[i]
+-                    yield ev("response.output_item.added", output_index=idx,
+-                             item={"id": st["fc_id"], "type": "function_call",
+-                                   "status": "in_progress", "name": st["name"],
+-                                   "arguments": "", "call_id": st["call_id"],
+-                                   **st["extra"]})
+-                    if not fn.get("arguments"):
+-                        continue
+-                st = calls[i]
+-                frag = fn.get("arguments") or ""
+-                if not frag:
+-                    continue
+-                st["args"] += frag
+-                yield ev("response.function_call_arguments.delta",
+-                         item_id=st["fc_id"], output_index=st["index"],
+-                         delta=frag)
+-
+-        async for delta, d in gen:
+-            if d is not None and d.get("reason") == "error":
+-                body = error_body(d)
+-                body["code"] = body["code"] or body["type"]
+-                yield ev("error", **body)
+-                return
+-            if d is not None:
+-                if rs_open:
+-                    yield close_reasoning()
+-                if tstream is not None and buf:
+-                    for s in text_and_calls(*tstream.push(pre + buf, final=True)):
+-                        yield s
+-                if msg_open:
+-                    yield close_message()
+-                for st in calls.values():
+-                    if st["closed"]:
+-                        continue
+-                    st["closed"] = True
+-                    item = {"id": st["fc_id"], "type": "function_call",
+-                            "status": "incomplete" if d.get("reason") == "length" else "completed",
+-                            "name": st["name"],
+-                            "arguments": st["args"], "call_id": st["call_id"],
+-                            **st["extra"]}
+-                    done_items.append((st["index"], item))
+-                    yield ev("response.function_call_arguments.done",
+-                             item_id=st["fc_id"], output_index=st["index"],
+-                             arguments=st["args"])
+-                    yield ev("response.output_item.done",
+-                             output_index=st["index"], item=item)
+-                status = "incomplete" if d.get("reason") == "length" \
+-                    else "completed"
+-                out = [i for _, i in sorted(done_items, key=lambda x: x[0])]
+-                d["n_reasoning"] = reasoning_tokens(d, split.thinking)
+-                final = envelope(status, out, responses_usage(d, d.get("n_prompt", 0)))
+-                if status == "incomplete":
+-                    final["incomplete_details"] = {"reason": "max_output_tokens"}
+-                    yield ev("response.incomplete", response=final, timings=timings(d))
+-                else:
+-                    yield ev("response.completed", response=final, timings=timings(d))
+-                return
+-
+-            rd, cd = split.push(delta)
+-            if rd:
+-                if not rs_started:
+-                    rd = rd.lstrip()
+-                    if rd:
+-                        rs_started = True
+-                if rs_started and rd:
+-                    rd = rs_pending + rd
+-                    kept = rd.rstrip()
+-                    rs_pending = rd[len(kept):]
+-                    rd = kept
+-                if rd:
+-                    if not rs_open:
+-                        yield open_reasoning()
+-                    yield reasoning_delta(rd)
+-            if not cd:
+-                continue
+-            if rs_open:
+-                yield close_reasoning()
+-            if not started:
+-                cd = cd.lstrip("\n")
+-                if not cd:
+-                    continue
+-                started = True
+-            if tstream is None:
+-                if not msg_open:
+-                    yield open_message()
+-                text_out += cd
+-                yield ev("response.output_text.delta", item_id=msg_id,
+-                         output_index=msg_index, content_index=0, delta=cd)
+-                continue
+-            buf += cd
+-            for s in text_and_calls(*tstream.push(pre + buf)):
+-                yield s
+-
+     @app.get("/health")
+     async def health():
+         rev = {v: k for k, v in DRAFTERS.items()}
+@@ -5016,6 +6101,8 @@
+              % (prom_label(API_VERSION), prom_label(engine.info.get("version") or "unknown"), prom_label(MODEL_ID)),
+              "The front end's release, the engine's, and the model id.", 1),
+         ]
++        if AG is not None:
++            extra += AG.metric_rows()
+         kv_pool = int(engine.info.get("kv_pool") or 0) or (
+             int(engine.info.get("kv_slots", 1)) * int(engine.info.get("slot_ctx") or 0))
+         body = engine.metrics.render(len(engine.inflight), engine.waiting,
+@@ -5105,10 +6192,12 @@
+             text = cut[:-len(EOM)]
+             stable = None
+         else:
+-            text = tok.apply_chat_template(msgs, tokenize=False,
+-                                           add_generation_prompt=True, **kw)
+             stable = tok.apply_chat_template(msgs, tokenize=False,
+                                              add_generation_prompt=False, **kw)
++            g = gen_suffix(tok, kw)
++            text = (stable + g if g is not None else
++                    tok.apply_chat_template(msgs, tokenize=False,
++                                            add_generation_prompt=True, **kw))
+         mark_at = -1
+         if mark and mark in text:
+             mark_at = text.find(mark)
+@@ -5127,7 +6216,9 @@
+             if text != tok.apply_chat_template(plain, tokenize=False,
+                                                add_generation_prompt=True, **kw):
+                 mark_at = -1
++        fe_mark("rendered")
+         ids, top = prompt_tokens.encode(text)
++        fe_mark("tokenized")
+ 
+         def boundary_at(cut):
+             if not (0 < cut < len(text)):
+@@ -5259,18 +6350,11 @@
+     IM_END_ID = tok.convert_tokens_to_ids(EOM)
+     reg = {"path": None, "loaded": False}
+     mapst = {"salt": None, "ready": None}
+-    autost = {"strikes": {}}
+     if FORK_MAP:
+         print("serve_api: HALOGEN_FORK_MAP=claude-code: each Claude Code thread (the main "
+               "conversation, each subagent) keeps its state under a name of its own",
+               flush=True)
+ 
+-    if FORK_AUTO:
+-        what = "the reply's end" if FORK_AUTO_END_ONLY else "prompt and reply"
+-        print("serve_api: HALOGEN_FORK_MAP=auto: a request that names nothing keeps its end "
+-              f"state ({what}), at most {FORK_AUTO_KEEPS} at a time, and the next request that "
+-              "starts with it finds it", flush=True)
+-
+     def release_later(hid):
+         asyncio.get_running_loop().create_task(engine.release(hid))
+ 
+@@ -5279,7 +6363,7 @@
+             return
+         try:
+             body = {"v": 1, "next": handles.next_hid, "handles": handles.by_name}
+-            if (FORK_MAP or FORK_AUTO) and mapst["salt"] is not None:
++            if FORK_MAP and mapst["salt"] is not None:
+                 body["salt"] = mapst["salt"].hex()
+             tmp = reg["path"] + ".tmp"
+             with open(tmp, "w") as f:
+@@ -5303,10 +6387,16 @@
+             with open(reg["path"]) as f:
+                 body = json.load(f)
+             if body.get("v") == 1:
+-                handles.by_name.update(body.get("handles", {}))
++                hs = body.get("handles", {})
++                for n in [n for n, h in hs.items() if isinstance(h, dict) and h.get("map") == "auto"]:
++                    old = hs.pop(n)
++                    if old.get("hid"):
++                        release_later(int(old["hid"]))
++                    print(f"serve_api: handle {n}: dropped (the retired auto map's)", flush=True)
++                handles.by_name.update(hs)
+                 handles.next_hid = max([int(body.get("next", 1))] +
+                                        [int(h["hid"]) + 1 for h in handles.by_name.values()])
+-                if (FORK_MAP or FORK_AUTO) and mapst["salt"] is None:
++                if FORK_MAP and mapst["salt"] is None:
+                     try:
+                         s = bytes.fromhex(body.get("salt") or "")
+                     except (TypeError, ValueError):
+@@ -5371,74 +6461,6 @@
+             return True
+         return len(ids) >= int(h.get("kept", 0))
+ 
+-    def auto_name(seq):
+-        return "au-" + hmac.new(mapst["salt"], array.array("I", seq).tobytes(),
+-                                hashlib.sha256).hexdigest()[:40]
+-
+-    def auto_room(name, replaces):
+-        limit = max(1, min(FORK_AUTO_KEEPS, handles.cap // 2))
+-        mine = sorted((h["used"], n) for n, h in handles.by_name.items()
+-                      if h.get("map") == "auto" and n not in (name, replaces))
+-        while mine and len(mine) + 1 > limit:
+-            n = mine.pop(0)[1]
+-            hid = handles.drop(n)
+-            if hid:
+-                release_later(hid)
+-                print(f"serve_api: handle {n}: released for a newer auto state "
+-                      f"({limit} at most, HALOGEN_FORK_AUTO_KEEPS)", flush=True)
+-        free = len(handles.by_name) - (1 if name in handles.by_name else 0) \
+-            - (1 if replaces in handles.by_name else 0)
+-        return free < handles.cap
+-
+-    AUTO_STRIKES = 2
+-    AUTO_PAUSE_S = 600.0
+-
+-    def auto_scan(ids):
+-        hit, missed, stale = None, [], []
+-        autos = sorted(((h["kept"], n, h) for n, h in handles.by_name.items()
+-                        if h.get("map") == "auto"), key=lambda x: -x[0])
+-        for k, n, h in autos:
+-            if len(ids) > k and auto_name(ids[:k]) == n:
+-                if hit is None:
+-                    hit = n
+-                else:
+-                    stale.append(n)
+-            else:
+-                m = int(h.get("n_prompt", 0)) - 2
+-                if m >= 64 and len(ids) >= m and ids[:m] == h["seq"][:m]:
+-                    missed.append(n)
+-        return hit, missed, stale
+-
+-    async def auto_begin(msgs, kw, ids, tools):
+-        await map_ready()
+-        handles_expire()
+-        hit, missed, stale = auto_scan(ids)
+-        for n in stale:
+-            hid = handles.drop(n)
+-            if hid:
+-                release_later(hid)
+-        lead = auto_name(ids[:256])
+-        now = time.time()
+-        st = autost["strikes"]
+-        for n in missed:
+-            hid = handles.drop(n)
+-            if hid:
+-                release_later(hid)
+-            c = st.get(lead, (0, now))[0] if now - st.get(lead, (0, 0.0))[1] < AUTO_PAUSE_S else 0
+-            st[lead] = (c + 1, now)
+-            print(f"serve_api: handle {n}: the request repeats its prompt but not its reply "
+-                  f"(reasoning dropped, or re-rendered differently); released", flush=True)
+-        if hit:
+-            st.pop(lead, None)
+-        elif lead in st and now - st[lead][1] >= AUTO_PAUSE_S:
+-            st.pop(lead)
+-        if len(st) > 64:
+-            for n in sorted(st, key=lambda x: st[x][1])[:len(st) - 64]:
+-                st.pop(n)
+-        if lead in st and st[lead][0] >= AUTO_STRIKES:
+-            return None
+-        return keep_for(None, msgs, kw, ids, tools, "", "auto", replaces=hit)
+-
+     def map_victim(kind):
+         for k in (("agent",) if kind == "agent" else ("agent", "main")):
+             live = [(h["used"], n) for n, h in handles.by_name.items() if h.get("map") == k]
+@@ -5446,20 +6468,13 @@
+                 return min(live)[1]
+         return None
+ 
+-    def auto_victim():
+-        live = [(h["used"], n) for n, h in handles.by_name.items() if h.get("map") == "auto"]
+-        return min(live)[1] if live else None
+-
+     def room_for(name, kind):
+-        return (handles.room(name) or auto_victim() is not None
+-                or (kind is not None and map_victim(kind) is not None))
++        return handles.room(name) or (kind is not None and map_victim(kind) is not None)
+ 
+     def make_room(name, kind):
+         if handles.room(name):
+             return
+-        v = auto_victim()
+-        if v is None and kind is not None:
+-            v = map_victim(kind)
++        v = map_victim(kind) if kind is not None else None
+         hid = handles.drop(v) if v is not None else None
+         if hid:
+             release_later(hid)
+@@ -5501,9 +6516,9 @@
+     def answer_of(gen):
+         return raw_answer(gen).strip()
+ 
+-    def keep_for(name, msgs, kw, ids, tools=None, lead="", kind=None, replaces=None):
++    def keep_for(name, msgs, kw, ids, tools=None, lead="", kind=None):
+         handles_expire()
+-        if kind != "auto" and not room_for(name, kind):
++        if not room_for(name, kind):
+             print(f"serve_api: handle {name}: not kept: {handles.cap} handles "
+                   f"are live (HALOGEN_FORK_HANDLES); release one first", flush=True)
+             return None
+@@ -5512,30 +6527,23 @@
+         def on_done(gen, d, stopped):
+             if d is None:
+                 release_later(hid)
+-                print(f"serve_api: handle {name or 'auto'}: not kept: the request ended before "
++                print(f"serve_api: handle {name}: not kept: the request ended before "
+                       f"its reply", flush=True)
+                 return
+             kept = int(d.get("kept", 0))
+             seq = list(ids) + list(gen)
+             nm = name
+-            if kind == "auto":
+-                nm = auto_name(seq[:kept]) if 0 < kept <= len(seq) else "auto"
+             why = ("a stop string ended the reply" if stopped else
+                    f"the reply ended by {d.get('reason')}"
+                    if d.get("reason") not in ("stop", "length") else
+                    "the engine kept nothing" if not 0 < kept <= len(seq) else
+-                   "" if kind == "auto" else
+                    f"{handles.cap} handles are live" if not room_for(name, kind) else "")
+-            if not why and kind == "auto":
+-                if not auto_room(nm, replaces):
+-                    why = f"{handles.cap} handles are live"
+             if why:
+                 release_later(hid)
+                 print(f"serve_api: handle {nm}: not kept: {why}", flush=True)
+                 return
+             name_ = nm
+-            if kind != "auto":
+-                make_room(name, kind)
++            make_room(name, kind)
+             head = list(seq)
+             while len(head) > len(ids) and head[-1] in eos_ids:
+                 head.pop()
+@@ -5550,12 +6558,8 @@
+             old = handles.put(name_, h)
+             if old:
+                 release_later(old)
+-            if kind == "auto" and replaces and replaces != name_:
+-                gone = handles.drop(replaces)
+-                if gone:
+-                    release_later(gone)
+             reg_save()
+-        return (hid, on_done) if kind is None else (hid, on_done, name or "auto")
++        return (hid, on_done) if kind is None else (hid, on_done, name)
+ 
+     def calls_match(h, a):
+         try:
+@@ -5686,18 +6690,16 @@
+                 handles_expire()
+                 fname = own if own in handles.by_name else parent
+                 kname = own
+-        if (FORK_AUTO and kind is None and fname is None and kname is None and not no_store
+-                and not imgs and not cont and not pre and ids is not None):
+-            out["keep"] = await auto_begin(msgs, kw, ids, tools)
+-            return out
+         if fname is None and kname is None:
+             return out
+         await reg_ready()
+         if fname is not None:
+             handles_expire()
+             fn = handle_name(fname)
+-            h = handles.get(fn, time.time()) if fn else None
++            h = handles.get(fn) if fn else None
+             f = fork_from(h, msgs, kw, imgs, cont, pre, partial_ok) if h else None
++            if f or kind is not None:
++                handles.touch(fn, time.time())
+             out["status"] = "used" if f else "unmatched" if h else "unknown"
+             out["from"] = f
+             if f:
+@@ -5711,6 +6713,14 @@
+             if kn is None:
+                 raise HTTPException(400, f"{KEEP_HEADER} takes a name of 1 to 64 "
+                                          "letters, digits or _.:-")
++            if (FORK_UNMATCHED_RELEASE and out["status"] == "unmatched"
++                    and handle_name(fname) == kn and kn in handles.by_name):
++                hid0 = handles.drop(kn)
++                reg_save()
++                if hid0:
++                    await engine.release(hid0)
++                print(f"serve_api: handle {kn}: released before this request: it names the "
++                      f"handle in both headers and cannot start from its state", flush=True)
+             if imgs:
+                 print(f"serve_api: handle {kn}: not kept: a request with images", flush=True)
+             else:
+@@ -5758,15 +6768,76 @@
+             run.cancel()
+         return resp
+ 
+-    async def serve(ids, max_tokens, stops, stream, chat, prefix,
+-                    thinking=True, drafter=None, tools=None, parallel=True,
+-                    sample=None, penalty="",
+-                    pre="", forced=False, include_usage=False, snap=0,
+-                    snap2=0, wire="chat", images=None, want_summary=False,
+-                    schema=None, think_budget=None, seg=None, snap3=0,
+-                    http_request=None, show_thinking=True, rec=None,
+-                    keep=None, progress=False, agent=False, no_store=False,
+-                    strict=None, tool_ns=None):
++    def agent_turn(msgs, tools, pre=""):
++        return AG.open(msgs, tools, pre) if AG is not None else None
++
++    async def agent_attach(resp, turn, wire):
++        if turn is None:
++            return resp
++        if isinstance(resp, dict):
++            await turn.settle(AGENT_FINAL_S)
++            resp["halogen_guard"] = turn.annotation()
++        elif isinstance(resp, StreamingResponse) and wire == "chat":
++            inner = resp.body_iterator
++
++            async def it():
++                try:
++                    async for ev in inner:
++                        if isinstance(ev, str) and ev.startswith("data: [DONE]"):
++                            await turn.settle(AGENT_FINAL_S)
++                            yield "data: %s\n\n" % json.dumps({"object": "chat.completion.chunk", "choices": [],
++                                                                "halogen_guard": turn.annotation()})
++                        yield ev
++                finally:
++                    await inner.aclose()
++            resp.body_iterator = it()
++        else:
++            turn.annotation()
++        return resp
++
++    async def flash_json(messages, schema, max_tokens):
++        ids, snap, snap2, _, seg, snap3 = render_with_images(messages, {"enable_thinking": False}, [], False)
++        body = await serve(ids, max_tokens, [], False, True, "chatcmpl", thinking=False,
++                           schema=schema_text({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}),
++                           snap=snap, snap2=snap2, seg=seg, snap3=snap3, no_store=True)
++        if not isinstance(body, dict):
++            return None
++        return json.loads(((body.get("choices") or [{}])[0].get("message") or {}).get("content") or "null")
++    if AG is not None:
++        AG.ask_flash = flash_json
++
++    async def serve(*args, **kwargs):
++        held = {}
++        try:
++            return await serve_held(held, *args, **kwargs)
++        except BaseException:
++            slot_key = held.get("slot_key")
++            if slot_key is not None:
++                try:
++                    if held.get("adopted") is not None:
++                        await stop_carrier(held["adopted"])
++                        try:
++                            await asyncio.wait_for(engine.abort(),
++                                                   timeout=ABORT_DRAIN_S + 5)
++                        except Exception:
++                            await engine.close()
++                finally:
++                    _release_slot(engine, slot_key)
++                    engine.slots.release()
++            raise
++
++    async def serve_held(held, ids, max_tokens, stops, stream, chat, prefix,
++                         thinking=True, drafter=None, tools=None, parallel=True,
++                         sample=None, penalty="",
++                         pre="", forced=False, include_usage=False, snap=0,
++                         snap2=0, wire="chat", images=None, want_summary=False,
++                         schema=None, think_budget=None, seg=None, snap3=0,
++                         http_request=None, show_thinking=True, rec=None,
++                         keep=None, progress=False, agent=False, no_store=False,
++                         strict=None, tool_ns=None, aguard=None, ignore_eos=False,
++                         no_call=False):
++        fe_mark("serve")
++        check_tool_schemas(tools, "input_schema" if wire == "messages" else "parameters")
+         asked = None
+         if max_tokens == -1:
+             max_tokens = max(1, min(max_cap, (engine.info.get("ctx") or ctx) - len(ids)))
+@@ -5797,6 +6868,9 @@
+                     think_src = "answer_room"
+         think_on = bool(thinking) if chat else None
+         guard = guard_for(ids, bool(tools)) if chat else None
++        nocall = (TOOL_CALL_ID if no_call and chat and TOOL_NONE_MASK and guard
++                  and not schema and not tools and TOOL_CALL_ID is not None
++                  and TOOL_CALL_ID in ids else None)
+         want = int(max_tokens)
+         if want > max_cap:
+             raise HTTPException(
+@@ -5841,10 +6915,12 @@
+             orphans.drop_oldest("another request wanted the slot")
+         if adopted is not None:
+             slot_key = adopted.slot_key
++            held.update(slot_key=slot_key, adopted=adopted)
+         else:
+             bg = await engine.admit(hinted, queue_timeout, len(ids) + int(max_tokens),
+                                    http_request)
+             slot_key = uuid.uuid4().hex
++            held["slot_key"] = slot_key
+             if bg is not None:
+                 engine.bg_of[slot_key] = bg
+             if hinted:
+@@ -5915,10 +6991,12 @@
+                        snap3=snap3, think_on=think_on, think_src=think_src,
+                        guard=guard, keep=keep, progress=progress_q,
+                        ctl=run_ctl, agent=agent, no_store=no_store,
+-                       tools=tools_gen, strict_info=strict_info, asked=asked)
++                       tools=tools_gen, strict_info=strict_info, asked=asked,
++                       ignore_eos=ignore_eos, nocall=nocall)
+         carrier = adopted
+         if carrier is None and okey is not None:
+             carrier = Carrier(run_gen(), run_ctl, engine, slot_key, okey)
++        held.clear()
+         if stream:
+             n_ev = 0
+             n_ka = 0
+@@ -5943,6 +7021,8 @@
+                 try:
+                     gen = (carrier.iterate() if carrier is not None
+                            else run_gen(progq))
++                    if aguard is not None:
++                        gen = aguard.wrap(gen, TC_OPEN, think_open=bool(thinking))
+                     if block_calls:
+                         gen = call_in_block(gen, split, tools, head)
+                     gen = guarded(gen)
+@@ -5951,7 +7031,7 @@
+                     stream_iter = (
+                         sse_responses(gen, cid, created, MODEL_ID, split,
+                                       tstream, pre, parallel, max_tokens,
+-                                      want_summary, tool_ns)
++                                      want_summary, tool_ns, info=engine.info)
+                         if wire == "responses" else
+                         sse_messages(gen, cid, MODEL_ID, split, tstream, pre,
+                                      parallel, len(ids), show_thinking)
+@@ -6016,6 +7096,8 @@
+         try:
+             text, done = "", None
+             gen = carrier.iterate() if carrier is not None else run_gen()
++            if aguard is not None:
++                gen = aguard.wrap(gen, TC_OPEN, think_open=bool(thinking))
+             if block_calls:
+                 gen = call_in_block(gen, split, tools, head)
+             gone, n_tok = False, 0
+@@ -6060,97 +7142,23 @@
+         fin = {"stop": "stop", "cancel": "stop",
+                "length": "length"}.get(done["reason"], "stop")
+         if wire == "messages":
+-            split.full = text
+-            reasoning, content = split.parts()
+-            answer = content
+-            tool_calls = []
+-            if tools:
+-                content, tool_calls, _ = split_tool_calls(pre + content, tools, json_only=json_only)
+-                if not parallel:
+-                    tool_calls = tool_calls[:1]
+-            if forced and not tool_calls and fin == "length":
+-                content, tool_calls, _ = partial_tool_calls(pre + (answer or ""), tools,
+-                                                            json_only=json_only)
+-                if not parallel:
+-                    tool_calls = tool_calls[:1]
+-            elif forced and not tool_calls:
++            body, tool_calls, refuse = messages_body(
++                split, text, done, fin, tools, pre, json_only, parallel, forced,
++                cid, MODEL_ID, len(ids), show_thinking, timings(done))
++            if refuse:
+                 split.full = text
+                 rec_end("error", done, [])
+-                raise HTTPException(502, "tool_choice required a call and the "
+-                                         "model did not name a tool: retry, or "
+-                                         "name the tool in tool_choice")
+-            blocks = []
+-            if reasoning:
+-                blocks.append({"type": "thinking",
+-                               "thinking": reasoning if show_thinking else "",
+-                               "signature": think_signature(reasoning)})
+-            if content:
+-                blocks.append({"type": "text", "text": content})
+-            for tc in tool_calls:
+-                blocks.append({"type": "tool_use", "id": tc["id"],
+-                               "name": tc["function"]["name"],
+-                               "input": tool_input(tc["function"]["arguments"])})
+-            done["n_reasoning"] = reasoning_tokens(done, split.thinking)
++                raise HTTPException(502, refuse)
+             rec_end("tool_calls" if tool_calls else fin, done,
+                     [tc["id"] for tc in tool_calls])
+-            sr, ss = messages_stop(done, bool(tool_calls))
+-            return {"id": cid, "type": "message", "role": "assistant",
+-                    "model": MODEL_ID, "content": blocks, "stop_reason": sr,
+-                    "stop_sequence": ss,
+-                    "usage": messages_usage(done, len(ids)),
+-                    "timings": timings(done)}
++            return body
+         if wire == "responses":
+-            split.full = text
+-            reasoning, content = split.parts()
+-            answer = content
+-            tool_calls = []
+-            if tools:
+-                content, tool_calls, _ = split_tool_calls(pre + content, tools, json_only=json_only)
+-                if not parallel:
+-                    tool_calls = tool_calls[:1]
+-            left_open = set()
+-            if forced and not tool_calls and fin == "length":
+-                content, tool_calls, left_open = partial_tool_calls(pre + (answer or ""), tools,
+-                                                                    json_only=json_only)
+-                if not parallel:
+-                    tool_calls = tool_calls[:1]
+-            out = []
+-            if reasoning:
+-                out.append({"id": "rs_" + cid.split("_", 1)[-1],
+-                            "type": "reasoning", "status": "completed",
+-                            "summary": ([{"type": "summary_text",
+-                                          "text": reasoning}]
+-                                        if want_summary else []),
+-                            "content": [{"type": "reasoning_text",
+-                                         "text": reasoning}],
+-                            "encrypted_content": None})
+-            if content:
+-                out.append({"id": "msg_" + cid.split("_", 1)[-1],
+-                            "type": "message", "role": "assistant",
+-                            "status": "completed",
+-                            "content": [{"type": "output_text",
+-                                         "text": content,
+-                                         "annotations": []}]})
+-            for tc in tool_calls:
+-                nm, extra = ns_call_fields(tool_ns, tc["function"]["name"])
+-                out.append({"id": f"fc_{uuid.uuid4().hex[:24]}",
+-                            "type": "function_call",
+-                            "status": "incomplete" if tc["id"] in left_open else "completed",
+-                            "name": nm,
+-                            "arguments": tc["function"]["arguments"],
+-                            "call_id": tc["id"], **extra})
+-            done["n_reasoning"] = reasoning_tokens(done, split.thinking)
++            body, tool_calls = responses_body(
++                split, text, done, fin, tools, pre, json_only, parallel, forced,
++                cid, created, MODEL_ID, len(ids), max_tokens, want_summary,
++                tool_ns, timings(done))
+             rec_end("tool_calls" if tool_calls else fin, done,
+                     [tc["id"] for tc in tool_calls])
+-            body = {"id": cid, "object": "response", "created_at": created,
+-                    "status": "incomplete" if fin == "length" else "completed",
+-                    "model": MODEL_ID, "output": out,
+-                    "parallel_tool_calls": parallel,
+-                    "max_output_tokens": max_tokens,
+-                    "usage": responses_usage(done, len(ids)),
+-                    "timings": timings(done)}
+-            if fin == "length":
+-                body["incomplete_details"] = {"reason": "max_output_tokens"}
+             return body
+         if chat:
+             split.full = text
+@@ -6201,7 +7209,11 @@
+             if npu.models.get(npu.model_id(req.model), {}).get("style") == "lfm3":
+                 return await npu.complete(req, http_request)
+             return oai_error(400, npu.wrong_route(req.model, "/v1/completions"))
+-        ids = tok(req.prompt, add_special_tokens=False)["input_ids"]
++        if (m := flash_model_refusal(req.model, npu)):
++            return oai_error(404, m, "model_not_found")
++        fe_mark("handler")
++        ids = await asyncio.to_thread(raw_tokens.encode_ids, req.prompt)
++        fe_mark("tokenized")
+         ids, _, _, _ = textify_pad_mentions(list(ids))
+         check_sampling(req)
+         return await serve(ids, req.max_tokens, stop_list(req.stop),
+@@ -6214,13 +7226,18 @@
+                            penalty=penalty_spec(req),
+                            include_usage=wants_usage(req),
+                            schema=schema_for(req),
++                           ignore_eos=req.ignore_eos,
+                            progress=bool(req.return_progress),
+                            no_store=no_store_of(req))
+ 
+     @app.post("/v1/chat/completions")
+     async def chat_completions(req: ChatReq, http_request: Request):
++        fe_mark("handler")
++        check_tool_schemas(req.tools)
+         if npu is not None and npu.owns(req.model):
+             return await npu.chat(req, http_request)
++        if (m := flash_model_refusal(req.model, npu)):
++            return oai_error(404, m, "model_not_found")
+         check_sampling(req)
+         for f in SAMPLING_FIELDS:
+             if getattr(req, f) is not None and f not in _warned_sampling:
+@@ -6276,6 +7293,7 @@
+         md = req.metadata if isinstance(req.metadata, dict) else {}
+         guard_run = guard_open(req, http_request, msgs) if (
+             req.guard is not None or http_request.headers.get("x-halogen-guard")) else None
++        agt = agent_turn(msgs, req.tools, pre)
+         try:
+             resp = await serve(ids, req.max_tokens, stop_list(req.stop),
+                                req.stream, True, "chatcmpl",
+@@ -6302,19 +7320,28 @@
+                                schema=schema_for(req), seg=seg, snap3=snap3,
+                                keep=keep, progress=bool(req.return_progress),
+                                agent=is_agent_turn(msgs), no_store=no_store,
+-                               strict=strict_names(req.tools) if mode != "none" else None)
++                               strict=strict_names(req.tools) if mode != "none" else None,
++                               aguard=agt if agt is not None and AG.mode == "hold" else None,
++                               no_call=mode == "none")
+         except BaseException:
+             if guard_run is not None:
+                 guard_run.cancel()
+             raise
+         if guard_run is not None:
+             resp = await guard_attach(resp, guard_run)
++        if agt is not None:
++            resp = await agent_attach(resp, agt, "chat")
+         return fork_reply(resp, fork_status, fork_same)
+ 
+     @app.post("/v1/responses")
+     async def responses(req: ResponsesReq, http_request: Request):
++        fe_mark("handler")
+         if npu is not None and npu.owns(req.model):
++            if npu_lfm3_generates(npu, req.model):
++                return await npu_responses(npu, req, http_request)
+             return oai_error(400, npu.wrong_route(req.model, "/v1/responses"))
++        if (m := flash_model_refusal(req.model, npu)):
++            return oai_error(404, m, "model_not_found")
+         if req.previous_response_id:
+             if not input_has_history(req.input):
+                 raise HTTPException(
+@@ -6401,6 +7428,7 @@
+                     if thinking and st is not None and not st[0]:
+                         thinking = False
+ 
++        agt = agent_turn(msgs, chat_tools, pre)
+         resp = await serve(ids, shim.max_tokens, stop_list(None),
+                            req.stream, True, "resp",
+                            http_request=http_request,
+@@ -6430,7 +7458,11 @@
+                            schema=schema_for(shim), keep=keep,
+                            agent=is_agent_turn(msgs), no_store=no_store,
+                            strict=strict_names(req.tools) if mode != "none" else None,
+-                           tool_ns=tool_ns)
++                           tool_ns=tool_ns,
++                           aguard=agt if agt is not None and AG.mode == "hold" else None,
++                           no_call=mode == "none")
++        if agt is not None:
++            resp = await agent_attach(resp, agt, "responses")
+         return fork_reply(resp, fork_status, fork_same)
+ 
+     MESSAGES_FIELDS = set(MessagesReq.model_fields)
+@@ -6457,6 +7489,8 @@
+                 print(f"serve_api: /v1/messages ignored the field '{f}'",
+                       flush=True)
+         chat_tools, dropped, deferred = messages_tools(req.tools)
++        chat_tools, deferred = with_added_tools(chat_tools, deferred,
++                                                req.messages)
+         if dropped:
+             key = "messages-tools:" + ",".join(sorted(set(dropped)))
+             if key not in _warned_sampling:
+@@ -6525,8 +7559,13 @@
+ 
+     @app.post("/v1/messages")
+     async def messages(req: MessagesReq, http_request: Request):
++        fe_mark("handler")
+         if npu is not None and npu.owns(req.model):
++            if npu_lfm3_generates(npu, req.model):
++                return await npu_messages(npu, req, http_request)
+             return anth_error(400, npu.wrong_route(req.model, "/v1/messages"))
++        if (m := flash_model_refusal(req.model, npu)):
++            return anth_error(404, m)
+         (shim, ids, snap, snap2, snap3, wire_imgs, seg, chat_tools, mode,
+          pre, thinking, show, msgs, kw, imgs) = messages_prompt(req)
+         mdm = req.metadata if isinstance(req.metadata, dict) else {}
+@@ -6545,6 +7584,7 @@
+                     if thinking and st is not None and not st[0]:
+                         thinking = False
+ 
++        agt = agent_turn(msgs, chat_tools, pre)
+         resp = await serve(ids, shim.max_tokens, stop_list(shim.stop),
+                            req.stream, True, "msg",
+                            http_request=http_request,
+@@ -6567,7 +7607,11 @@
+                            images=wire_imgs, seg=seg, snap3=snap3,
+                            schema=schema_for(shim), show_thinking=show, keep=keep,
+                            agent=is_agent_turn(msgs, req.messages), no_store=no_store,
+-                           strict=strict_names(req.tools) if mode != "none" else None)
++                           strict=strict_names(req.tools) if mode != "none" else None,
++                           aguard=agt if agt is not None and AG.mode == "hold" else None,
++                           no_call=mode == "none")
++        if agt is not None:
++            resp = await agent_attach(resp, agt, "messages")
+         return fork_reply(resp, fork_status, fork_same)
+ 
+     @app.post("/v1/messages/count_tokens")
+@@ -6584,6 +7628,12 @@
+             req = MessagesReq(**body)
+         except Exception as e:
+             raise HTTPException(400, str(e)[:300])
++        if npu is not None and npu.owns(req.model):
++            if npu_lfm3_generates(npu, req.model):
++                return npu_count_tokens(npu, req)
++            return anth_error(400, npu.wrong_route(req.model, "/v1/messages/count_tokens"))
++        if (m := flash_model_refusal(req.model, npu)):
++            return anth_error(404, m)
+         ids = messages_prompt(req)[1]
+         return {"input_tokens": len(ids)}
+ 
+@@ -6660,7 +7710,9 @@
+                     help="an NPU model's tokenizer directory, repeatable (each "
+                          "matched to its model by the sha256 its weight file "
+                          "records; with --engine none, --tokenizer is one)")
+-    ap.add_argument("--host", default="0.0.0.0")
++    ap.add_argument("--host", default="::",
++                    help="`::` (the default): IPv4 and IPv6, IPv4 alone where the "
++                         "host refuses IPv6")
+     ap.add_argument("--port", type=int, default=8731)
+     ap.add_argument("--context", type=int, default=32768,
+                     help="FALLBACK only: the engine's INFO reports the real "
+@@ -6692,6 +7744,7 @@
+                                args.tokenizer)
+         return
+ 
++    args.host, args.listen_name = listen_host(args.host)
+     if args.engine == "none":
+         import npu_api
+         def install_front(app):
+@@ -6700,7 +7753,8 @@
+         return npu_api.serve_only(args, ChatReq, oai_error, KEEPALIVE_S,
+                                   install_auth=install_front,
+                                   uvicorn_kw=UVICORN_PROTOCOLS,
+-                                  CompletionReq=CompletionReq)
++                                  CompletionReq=CompletionReq,
++                                  wire_routes=npu_wire_routes)
+     npu = None
+     if args.npu:
+         import npu_api
+@@ -6717,14 +7771,24 @@
+               "will be refused", flush=True)
+     host, _, port = args.engine.partition(":")
+     engine = Engine(host, int(port))
+-    app = build_app(tok, engine, args.context, args.max_tokens_cap,
+-                    args.queue_timeout, template=template, npu=npu)
++
++    @contextlib.asynccontextmanager
++    async def _lifespan(_app):
++        await _connect()
++        yield
++
++    try:
++        app = build_app(tok, engine, args.context, args.max_tokens_cap,
++                        args.queue_timeout, template=template, npu=npu,
++                        lifespan=_lifespan)
++    except (RuntimeError, ValueError) as e:
++        print(f"serve_api: {e}", flush=True)
++        sys.exit(1)
+     if npu is not None:
+         npu.add_routes(app, ours=(MODEL_ID,))
+         if app.state.records is not None:
+             npu.attach_records(app.state.records)
+ 
+-    @app.on_event("startup")
+     async def _connect():
+         await engine.connect()
+         if npu is not None:
+@@ -6733,8 +7797,15 @@
+             except Exception as e:
+                 print(f"serve_api: {e}", flush=True)
+                 os._exit(1)
++        if app.state.agent_guard is not None:
++            try:
++                app.state.agent_guard.check()
++            except RuntimeError as e:
++                print(f"serve_api: {e}", flush=True)
++                os._exit(1)
++            print("serve_api: agent guard " + app.state.agent_guard.startup_line(), flush=True)
+         print(f"serve_api: engine at {args.engine}, "
+-              f"listening on {args.host}:{args.port}", flush=True)
++              f"listening on {args.listen_name}:{args.port}", flush=True)
+         if DEFAULTS["temperature"] and not engine.info.get("sampling"):
+             print("serve_api: HALOGEN_TEMPERATURE is set but this engine "
+                   "build decodes greedy only; unset it or use a build that "
+@@ -6777,8 +7848,9 @@
+                   f"may not know how to ask for (images, for one), and the "
+                   f"answer may be wrong without any error saying so.",
+                   flush=True)
++        await warm_start(engine, tok)
+ 
+-    uvicorn.run(app, host=args.host, port=args.port, log_level="info",
++    uvicorn.run(FeTrace(app) if FE_TRACE else app, host=args.host, port=args.port, log_level="info",
+                 timeout_keep_alive=KEEPALIVE_S, **UVICORN_PROTOCOLS)
+ 
+ if __name__ == "__main__":

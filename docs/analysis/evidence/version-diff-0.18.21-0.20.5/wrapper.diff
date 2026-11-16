@@ -1,0 +1,25 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-flash-server	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/halogen-flash-server	1970-01-01 10:00:01.000000000 +1000
+@@ -9,8 +9,8 @@
+ export HALOGEN_MAX_TOK="${HALOGEN_MAX_TOK:-32768}"
+ export HALOGEN_MATMUL_ALGOS="${HALOGEN_MATMUL_ALGOS:-1}"
+ export HALOGEN_MATMUL_BUCKET="${HALOGEN_MATMUL_BUCKET:-1}"
+-export HALOGEN_MATMUL_TUNING_FILE="${HALOGEN_MATMUL_TUNING_FILE:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/flash-tune.plan}"
+-export HALOGEN_DRAFT_VOCAB_FILE="${HALOGEN_DRAFT_VOCAB_FILE:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/draft-vocab.lists}"
++export HALOGEN_MATMUL_TUNING_FILE="${HALOGEN_MATMUL_TUNING_FILE:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/flash-tune.plan}"
++export HALOGEN_DRAFT_VOCAB_FILE="${HALOGEN_DRAFT_VOCAB_FILE:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/draft-vocab.lists}"
+ export _hg_hf="${_hg_hf:-/nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/hf}"
+ export HALOGEN_TOKENIZER="${HALOGEN_TOKENIZER:-/tokenizer}"
+ export HALOGEN_PORT="${HALOGEN_PORT:-8730}"
+@@ -18,9 +18,9 @@
+ export HALOGEN_API_PORT="${HALOGEN_API_PORT:-8731}"
+ export HALOGEN_MAX_TOKENS_CAP="${HALOGEN_MAX_TOKENS_CAP:-65536}"
+ export HALOGEN_QUEUE_TIMEOUT="${HALOGEN_QUEUE_TIMEOUT:-3600}"
+-export HALOGEN_IMAGE_VERSION="0.18.21"
++export HALOGEN_IMAGE_VERSION="0.20.5"
+ export HALOGEN_IMAGE_MODES="${HALOGEN_IMAGE_MODES:-all engine api bench sweep convert inspect verify ppl niah}"
+ export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+ export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
+-exec "/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/libexec/halogen-entrypoint.sh"  "$@" 
++exec "/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/libexec/halogen-entrypoint.sh"  "$@" 

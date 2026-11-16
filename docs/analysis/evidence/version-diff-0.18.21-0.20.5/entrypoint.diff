@@ -1,0 +1,550 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/libexec/halogen-entrypoint.sh	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/libexec/halogen-entrypoint.sh	1970-01-01 10:00:01.000000000 +1000
+@@ -5,6 +5,27 @@
+ export HSA_DISABLE_COREDUMP_ON_EXCEPTION="${HSA_DISABLE_COREDUMP_ON_EXCEPTION:-1}"
+ ulimit -c 0
+ 
++_ag_mode="$(printf '%s' "${HALOGEN_AGENT_GUARD:-}" | tr 'A-Z' 'a-z')"
++case "$_ag_mode" in
++  ""|0|off|false|no|none) ;;
++  watch|hold)
++    _ag_set="halogen-spotter-0.6b"
++    [ "$_ag_mode" = hold ] && _ag_set="halogen-spotter-0.6b decider-4b"
++    for _ag in $_ag_set; do
++      case ",${HALOGEN_NPU_MODELS:-}," in
++        *,"$_ag",*) ;;
++        ,,) export HALOGEN_NPU_MODELS="$_ag" ;;
++        *) export HALOGEN_NPU_MODELS="${HALOGEN_NPU_MODELS},$_ag" ;;
++      esac
++    done
++    if [ "$_ag_mode" = hold ]; then
++      echo "halogen: HALOGEN_AGENT_GUARD=${HALOGEN_AGENT_GUARD}: halogen-spotter-0.6b (reads tool results) and decider-4b (whether a tool acts outside the conversation) are served on the NPU" >&2
++    else
++      echo "halogen: HALOGEN_AGENT_GUARD=${HALOGEN_AGENT_GUARD}: halogen-spotter-0.6b (reads tool results) is served on the NPU" >&2
++    fi ;;
++  *) echo "halogen: HALOGEN_AGENT_GUARD=${HALOGEN_AGENT_GUARD} is not a mode: use off, watch or hold" >&2; exit 1 ;;
++esac
++
+ oom_adj_raise() {
+   local want="${HALOGEN_OOM_SCORE_ADJ:-500}" f="${_hg_proc:-/proc}/$$/oom_score_adj" cur
+   case "$want" in
+@@ -87,7 +108,7 @@
+ 
+   kv_gib=$(awk -v s="$ENG_SLOTS" -v c="$ENG_CTX" -v p="$ENG_POOL" -v pool="${HALOGEN_KV_POOL:-1}" -v pp="$KV_PP" -v rr="$KV_ROWS" 'BEGIN{printf "%.1f", (pool=="0"?s*c*rr:p*pp+s*120586240)/1073741824}')
+ 
+-  cache_gib=$(awk -v c="$ENG_CTX" -v on="${HALOGEN_PROMPT_CACHE:-2}" -v ip="${HALOGEN_CACHE_INPLACE:-1}" -v f="${HALOGEN_CACHE_FILE:-}" -v n="${HALOGEN_CACHE_ENTRIES:-}" -v s="$ENG_SLOTS" -v br="${HALOGEN_CACHE_BRANCHES:-2}" -v s3="${HALOGEN_CACHE_SNAP3:-1}" -v rr="$KV_ROWS" -v fu="${HALOGEN_CACHE_FULL:-1}" 'BEGIN{if (n=="") n = s * (1 + br*((s3=="0")?1:2) + ((fu=="0")?0:1)); printf "%.1f", (on==0 || f!="")?0:(ip!="0"?n*115*1048576/1073741824:c*rr/1073741824)}')
++  cache_gib=$(awk -v c="$ENG_CTX" -v on="${HALOGEN_PROMPT_CACHE:-2}" -v ip="${HALOGEN_CACHE_INPLACE:-1}" -v f="${HALOGEN_CACHE_FILE:-}" -v n="${HALOGEN_CACHE_ENTRIES:-}" -v s="$ENG_SLOTS" -v br="${HALOGEN_CACHE_BRANCHES:-2}" -v s3="${HALOGEN_CACHE_SNAP3:-1}" -v rr="$KV_ROWS" -v fu="${HALOGEN_CACHE_FULL:-1}" -v rp="${HALOGEN_CACHE_REPLY:-1}" -v pm="${HALOGEN_PROMPT_CACHE:-2}" 'BEGIN{if (n=="") n = s * (1 + br*((s3=="0")?1:2) + ((fu=="0")?0:1) + ((rp=="0" || pm=="1")?0:1)); printf "%.1f", (on==0 || f!="")?0:(ip!="0"?n*115*1048576/1073741824:c*rr/1073741824)}')
+ 
+   local mi="${_hg_proc:-/proc}/meminfo" cma_gib=0 free_gib=""
+   avail_gib=$(awk '/^MemAvailable/{a=$2} /^CmaFree/{c=$2} END{if (a != "") printf "%.1f", (a-c)/1048576}' "$mi" 2>/dev/null || echo "?")
+@@ -479,7 +500,7 @@
+ }
+ 
+ tuning_plan_copy() {
+-  local baked=/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/flash-tune.plan
++  local baked=/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/flash-tune.plan
+   [ "${HALOGEN_MATMUL_TUNING_FILE:-}" = "$baked" ] || return 0
+   [ -r "$baked" ] || return 0
+   if cp -p "$baked" /tmp/halogen-tune.plan 2>/dev/null; then
+@@ -499,7 +520,7 @@
+   [ -f "${HALOGEN_CHECKPOINT:-}" ] || return 1
+   is_gguf && return 1
+   local out line
+-  out=$("${_hg_flash_serve:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve}" --resident-gib "$HALOGEN_CHECKPOINT" 2>/dev/null) || return 1
++  out=$("${_hg_flash_serve:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/flash_serve}" --resident-gib "$HALOGEN_CHECKPOINT" 2>/dev/null) || return 1
+ 
+   line=$(echo "$out" | grep -E '^[0-9]+\.[0-9] [01]( [01]){0,2}( [0-9]+\.[0-9])?$' | tail -n 1)
+   [ -n "$line" ] || return 1
+@@ -893,6 +914,7 @@
+   [ -n "$WATCHDOG_PID" ] && kill -9 "$WATCHDOG_PID" 2>/dev/null || true
+ 
+   [ -n "$WATCHDOG_PID" ] && wait "$WATCHDOG_PID" 2>/dev/null || true
++  [ -n "${NPU_STALL_PID:-}" ] && { kill "$NPU_STALL_PID" 2>/dev/null; wait "$NPU_STALL_PID" 2>/dev/null; } || true
+   stop_engine "$ENGINE_PID" || rc=$?
+   wait "$API_PID" 2>/dev/null || true
+   [ -n "$NPU_PID" ] && { wait "$NPU_PID" 2>/dev/null || nrc=$?; }
+@@ -1006,10 +1028,12 @@
+ HALOGEN_RECORD_TEXT HALOGEN_REPETITION_PENALTY HALOGEN_RETRY_GRACE_S HALOGEN_SSE_KEEPALIVE_S \
+ HALOGEN_TEMPERATURE HALOGEN_TEMPLATE_CHECK HALOGEN_TEMPLATE_UNCHECKED HALOGEN_THINKING_ANSWER_ROOM \
+ HALOGEN_CHAT_TEMPLATE HALOGEN_STRICT_TOOLS HALOGEN_TOKENIZE_REUSE HALOGEN_TOP_K HALOGEN_TOP_P \
+-HALOGEN_CACHE_LEAD HALOGEN_TOOL_DEFER"
++HALOGEN_CACHE_LEAD HALOGEN_TOOL_DEFER HALOGEN_RENDER_ONCE HALOGEN_TOKENIZE_SPLIT HALOGEN_TOOL_NONE_MASK HALOGEN_TOKENIZER_NATIVE"
+ 
+-FE_ONLY_FLAGS="$FE_ONLY_FLAGS HALOGEN_FORK_AUTO_END_ONLY HALOGEN_FORK_AUTO_KEEPS HALOGEN_FORK_HANDLES HALOGEN_FORK_MAP"
++FE_ONLY_FLAGS="$FE_ONLY_FLAGS HALOGEN_FORK_AUTO_END_ONLY HALOGEN_FORK_AUTO_KEEPS HALOGEN_FORK_HANDLES HALOGEN_FORK_MAP HALOGEN_FORK_UNMATCHED_RELEASE"
+ 
++FE_ONLY_FLAGS="$FE_ONLY_FLAGS HALOGEN_AGENT_GUARD"
++FE_ONLY_FLAGS="$FE_ONLY_FLAGS HALOGEN_MODEL_NAME_CHECK"
+ ENGINE_ENV_U=()
+ for _v in $FE_ONLY_FLAGS; do ENGINE_ENV_U+=(-u "$_v"); done
+ unset _v
+@@ -1018,7 +1042,7 @@
+   need_ckpt
+   memlock_note
+ 
+-  env "${ENGINE_ENV_U[@]}" /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve \
++  env "${ENGINE_ENV_U[@]}" /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/flash_serve \
+     --ck "$HALOGEN_CHECKPOINT" --port "$ENG_PORT" --bind "$BIND" \
+     --slots "$ENG_SLOTS" --ctx "$ENG_CTX" --max-tok "$ENG_MAX_TOK" --kv-pool "$ENG_POOL" &
+   ENGINE_PID=$!
+@@ -1059,7 +1083,7 @@
+ }
+ 
+ check_defaults() {
+-  if ! /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py --tokenizer "$HALOGEN_TOKENIZER" \
++  if ! /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py --tokenizer "$HALOGEN_TOKENIZER" \
+        --max-tokens-cap "${HALOGEN_MAX_TOKENS_CAP:-65536}" --check-defaults; then
+     echo "halogen: a HALOGEN_* request default is invalid (see above); not starting" >&2
+     exit 1
+@@ -1070,16 +1094,16 @@
+   need_tokenizer
+   check_defaults
+ 
+-  exec /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py \
++  exec /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py \
+     --tokenizer "$HALOGEN_TOKENIZER" \
+     --engine "${HALOGEN_ENGINE:-127.0.0.1:$ENG_PORT}" \
+-    --host 0.0.0.0 --port "$API_PORT" \
++    --host :: --port "$API_PORT" \
+     --max-tokens-cap "${HALOGEN_MAX_TOKENS_CAP:-65536}" \
+     --context "$ENG_CTX" \
+     --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}"
+ }
+ 
+-NPU_PINS="${_hg_npu_pins:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/npu/models.txt}"
++NPU_PINS="${_hg_npu_pins:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/models.txt}"
+ NPU_DIR="${_hg_npu_dir:-/models/npu}"
+ 
+ npu_pin_ids() { awk '$1 == "model" {print $2}' "$NPU_PINS" 2>/dev/null || true; }
+@@ -1106,7 +1130,7 @@
+         if (index(ids, " " fid[k] " ")) t += sz[k]
+         else if ((fid[k] in base) && index(pth[k], "devices/") == 1) t += sz[k]
+       printf "%.0f", t
+-    }' "${NPU_PINS:-${_hg_npu_pins:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/opt/halogen/npu/models.txt}}" 2>/dev/null) || s=0
++    }' "${NPU_PINS:-${_hg_npu_pins:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/models.txt}}" 2>/dev/null) || s=0
+   echo $((b + ${s:-0}))
+ }
+ 
+@@ -1280,7 +1304,11 @@
+   local id="$1" d="$2/$1" part="${3:-all}" pins paths p sz want got missing="" verify="${HALOGEN_NPU_VERIFY:-1}" known own dk
+   case "$id" in ''|*/*|.*) echo "halogen npu: '$id' is not a model id" >&2; return 1 ;; esac
+   pins=$(npu_pin_files "$id")
+-  [ "$part" = devices ] && pins=$(printf '%s\n' "$pins" | awk '$1 ~ /^devices\//')
++  [ "$part" = devices ] && pins=$(printf '%s\n' "$pins" | awk '$1 ~ /^(devices|vis|aud)\//')
++
++  [ "$part" = vis ] && pins=$(printf '%s\n' "$pins" | awk '$1 ~ /^vis\//')
++
++  [ "$part" = aud ] && pins=$(printf '%s\n' "$pins" | awk '$1 ~ /^aud\//')
+   if [ "$verify" != 0 ] && [ -z "$pins" ] && [ "$part" != devices ] && npu_pin_ids | grep -qxF -- "$id"; then
+ 
+     echo "halogen npu: $id is in this image's record, but its files are not recorded yet, so this image cannot check them." >&2
+@@ -1297,6 +1325,8 @@
+ 
+   if [ -n "$pins" ] && { [ "$verify" != 0 ] || [ -n "${HALOGEN_DOWNLOAD:-}" ]; }; then
+     paths=$(printf '%s\n' "$pins" | awk '{print $1}')
++  elif [ "$part" = vis ]; then paths="vis/devices.hnpm"
++  elif [ "$part" = aud ]; then paths="aud/devices.hnpm"
+   elif [ "$part" = devices ]; then paths="devices/devices.hnpm"
+   elif [ "$(npu_devices_of "$id")" != "$id" ]; then paths="$id.hnpw tokenizer/tokenizer.json"
+   else paths="devices/devices.hnpm $id.hnpw tokenizer/tokenizer.json"; fi
+@@ -1314,7 +1344,17 @@
+   fi
+ 
+   own=$(npu_devices_of "$id")
+-  if { [ "$part" = devices ] || [ "$own" = "$id" ]; } && ! ls "$d/devices/"*.elf > /dev/null 2>&1; then
++  if [ "$part" = vis ]; then
++    if ! ls "$d/vis/"*.elf > /dev/null 2>&1; then
++      echo "halogen npu: $id: $d/vis/ holds no .elf file (the NPU's program for the model's vision tower)" >&2
++      return 1
++    fi
++  elif [ "$part" = aud ]; then
++    if ! ls "$d/aud/"*.elf > /dev/null 2>&1; then
++      echo "halogen npu: $id: $d/aud/ holds no .elf file (the NPU's program for the model's audio encoder)" >&2
++      return 1
++    fi
++  elif { [ "$part" = devices ] || [ "$own" = "$id" ]; } && ! ls "$d/devices/"*.elf > /dev/null 2>&1; then
+     echo "halogen npu: $id: $d/devices/ holds no .elf file (the NPU's program for the model)" >&2
+     return 1
+   fi
+@@ -1353,6 +1393,10 @@
+   else
+     echo "halogen npu: $id: HALOGEN_NPU_VERIFY=0, so the files under $d are not checked against this image's record"
+   fi
++  if [ "$part" = vis ]; then
++    NPU_NEED_K=$(( ${NPU_NEED_K:-0} + $(du -sk "$d/vis" | awk '{print $1}') ))
++    return 0
++  fi
+   [ "$part" = devices ] && sz=0 || sz=$(wc -c < "$d/$id.hnpw" | tr -d ' ')
+   dk=0
+   { [ "$part" = devices ] || [ "$own" = "$id" ]; } && dk=$(du -sk "$d/devices" | awk '{print $1}')
+@@ -1364,7 +1408,7 @@
+ }
+ 
+ npu_finetune_ready() {
+-  local p="${1%:fast}" fast=0 bin="${_hg_npu_bin:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-npu}" info rc=0 task base name out f own
++  local p="${1%:fast}" fast=0 bin="${_hg_npu_bin:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/halogen-npu}" info rc=0 task base name out f own vb ab
+   [ "$p" != "$1" ] && fast=1
+   p="${p%/}"
+   if [ ! -d "$p" ]; then
+@@ -1393,6 +1437,22 @@
+   fi
+   own=$(npu_devices_of "$base")
+   npu_model_ready "$own" "$NPU_DIR" devices || return 1
++
++  NPU_FT_VIS=""
++  vb=$(npu_pin_get "$base" vis)
++  [ -z "$vb" ] && [ "$own" != "$base" ] && npu_pin_files "$base" | awk '{print $1}' | grep -q '^vis/' && vb="$base"
++  if [ -n "$vb" ]; then
++    npu_model_ready "$vb" "$NPU_DIR" vis || return 1
++    NPU_FT_VIS="$NPU_DIR/$vb/vis"
++  elif [ -f "$NPU_DIR/$own/vis/devices.hnpm" ]; then NPU_FT_VIS="$NPU_DIR/$own/vis"
++  fi
++
++  NPU_FT_AUD=""
++  ab=$(npu_pin_get "$base" aud)
++  if [ -n "$ab" ]; then
++    npu_model_ready "$ab" "$NPU_DIR" aud || return 1
++    NPU_FT_AUD="$NPU_DIR/$ab/aud"
++  fi
+   if [ -w "$p" ]; then out="$p/halogen-npu$([ "$fast" = 1 ] && echo -fast).hnpw"
+   else
+     out="/tmp/halogen-npu/$name.hnpw"; mkdir -p /tmp/halogen-npu
+@@ -1400,14 +1460,25 @@
+   fi
+   case "$task" in decision) task=decisions ;; embedding) task=embeddings ;; score) task=rerank ;; classify) task=moderation ;; seqcls) task=classification ;; generate) task="chat completions" ;; image) task=images ;; esac
+   echo "halogen npu: $name ($p): a fine-tune of $base, served for $task"
+-  "$bin" convert "$p" "$NPU_DIR/$own/devices" "$out" --name "$name" --source "$p" --if-stale || {
++  "$bin" convert "$p" "$NPU_DIR/$own/devices" "$out" --name "$name" --source "$p" --if-stale ${NPU_FT_VIS:+--vis "$NPU_FT_VIS"} ${NPU_FT_AUD:+--aud "$NPU_FT_AUD"} || {
+     echo "halogen npu: converting $p for the NPU failed (above); nothing was started" >&2; return 1; }
+   NPU_FT_NAME="$name"; NPU_FT_DEV="$NPU_DIR/$own/devices"; NPU_FT_W="$out"
+   NPU_NEED_K=$(( ${NPU_NEED_K:-0} + $(wc -c < "$out" | tr -d ' ') / 1024 + $(du -sk "$NPU_FT_DEV" | awk '{print $1}') ))
+ }
+ 
++npu_xrt_own() {
++  local r="${_hg_root:-}" n=0 f want got
++  [ -f "$r/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/xrt.sha256" ] || { echo 0; return 0; }
++  for f in libxrt_coreutil.so.2 libxrt_core.so.2 libxrt_driver_xdna.so.2; do
++    want=$(awk -v f="$f" '$2 == f {print $1}' "$r/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/xrt.sha256")
++    got=$(${_hg_sha256:-sha256sum} "$r/opt/xilinx/xrt/lib/$f" 2>/dev/null | awk '{print $1}')
++    [ -n "$want" ] && [ "$want" = "$got" ] && n=$((n + 1))
++  done
++  echo "$n"
++}
++
+ npu_preflight() {
+-  local r="${_hg_root:-}" gpu="${1:-0}" node x xv drv out rc=0
++  local r="${_hg_root:-}" gpu="${1:-0}" node x xv drv out rc=0 own ownv
+   node="$r/dev/accel/accel0"; x="$r/opt/xilinx/xrt/lib"
+   if [ ! -e "$node" ]; then
+     echo "halogen npu: this container has no NPU device (/dev/accel/accel0)." >&2
+@@ -1428,6 +1499,12 @@
+   fi
+ 
+   local f t="" bad=""
++  own=$(npu_xrt_own); ownv=$(cat "$r/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/opt/halogen/npu/xrt.version" 2>/dev/null || true)
++  NPU_XRT_OWN=0; [ "$own" = 3 ] && NPU_XRT_OWN=1
++  if [ "$own" = 1 ] || [ "$own" = 2 ]; then
++    echo "halogen npu: /opt/xilinx/xrt/lib mixes a host's XRT libraries with this image's XRT $ownv. Mount all three of them, or none: with no mount the image uses its own." >&2
++    return 1
++  fi
+   for f in libxrt_coreutil.so.2 libxrt_core.so.2 libxrt_driver_xdna.so.2; do
+     if [ -L "$x/$f" ] && [ ! -e "$x/$f" ]; then bad="$f"; t=$(readlink "$x/$f"); break; fi
+   done
+@@ -1445,23 +1522,26 @@
+     return 1
+   fi
+   if [ ! -e "$x/libxrt_coreutil.so.2" ]; then
+-    echo "halogen npu: no XRT in this container (/opt/xilinx/xrt/lib/libxrt_coreutil.so.2)." >&2
+-    echo "  Mount the host's: -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro (the host needs AMD's XRT with its NPU plugin installed there; the container uses the host's so it matches the host's driver)." >&2
++    echo "halogen npu: no XRT in this container (/opt/xilinx/xrt/lib/libxrt_coreutil.so.2): what is mounted at that path holds none." >&2
++    echo "  Remove the mount and the image uses its own XRT. Or mount a host's: -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro, where AMD's XRT with its NPU plugin is installed there." >&2
+     echo "  A distribution's XRT lives in the system library directory instead (Ubuntu: /usr/lib/x86_64-linux-gnu; Arch and CachyOS: /usr/lib): mount libxrt_coreutil.so.2, libxrt_core.so.2 and libxrt_driver_xdna.so.2 each twice, at /opt/xilinx/xrt/lib/ and at that same path, since they load each other from there." >&2
+     return 1
+   fi
+   if [ ! -e "$x/libxrt_driver_xdna.so.2" ]; then
+-    echo "halogen npu: the host's XRT has no NPU plugin (/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2). Install the one AMD's NPU driver ships (or your distribution's: Ubuntu libxrt-npu2, Arch and CachyOS xrt-plugin-amdxdna), on the host." >&2
++    echo "halogen npu: the host's XRT mounted here has no NPU plugin (/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2). Remove the mount and the image uses its own XRT. Or install the plugin AMD's NPU driver ships (or your distribution's: Ubuntu libxrt-npu2, Arch and CachyOS xrt-plugin-amdxdna), on the host." >&2
+     return 1
+   fi
+   xv=$(basename "$(readlink -f "$x/libxrt_coreutil.so.2" 2>/dev/null || echo "$x/libxrt_coreutil.so.2")")
+   xv="${xv#libxrt_coreutil.so.}"
+-  case "$xv" in *.*) xv="XRT $xv" ;; *) xv="XRT (its version is not in the mounted file's name)" ;; esac
++  case "$xv" in *.*) xv="XRT $xv (the host's)" ;; *) xv="the host's XRT (its version is not in the mounted file's name)" ;; esac
++  [ "$NPU_XRT_OWN" = 1 ] && xv="XRT $ownv (this image's)"
++  NPU_XRT_V="$xv"
+   drv=$(cat "$r/sys/module/amdxdna/version" 2>/dev/null || true)
+   [ -n "$drv" ] || drv="(the kernel's own)"
+-  out=$("${_hg_npu_bin:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-npu}" 2>&1) || rc=$?
++  NPU_XRT_DRV="$drv"
++  out=$("${_hg_npu_bin:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/halogen-npu}" 2>&1) || rc=$?
+   if [ "$rc" != 1 ] || ! printf '%s\n' "$out" | grep -q '^usage: halogen-npu'; then
+-    echo "halogen npu: the NPU engine does not load against the host's $xv (exit $rc):" >&2
++    echo "halogen npu: the NPU engine does not load against $xv (exit $rc):" >&2
+     printf '%s\n' "$out" | head -3 | sed 's/^/    /' >&2
+     echo "  The host's XRT is older than this image needs, or was built for a newer C++ runtime than the image carries (glibc 2.41, GLIBCXX_3.4.33). Tested: AMD's XRT 2.25 and Ubuntu 26.04's XRT 2.21." >&2
+     return 1
+@@ -1533,7 +1613,7 @@
+ 
+ start_npu_engine() {
+   local gpu="$1" port="${HALOGEN_NPU_PORT:-8740}" ids id n=0 first=1 rc dev w tokd own enc vis
+-  local bin="${_hg_npu_bin:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-npu}"
++  local bin="${_hg_npu_bin:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/halogen-npu}"
+   local -a nargs
+   npu_retired || exit 1
+   ids=$(printf '%s' "${HALOGEN_NPU_MODELS:-}" | tr ',' ' ')
+@@ -1545,11 +1625,13 @@
+   NPU_API_ARGS=(--npu "127.0.0.1:$port")
+   nargs=(listen)
+   for id in $ids; do
+-    enc=""; vis=""
++    enc=""; vis=""; aud=""
+     case "$id" in
+       /*) npu_finetune_ready "$id" || exit 1
+-          dev="$NPU_FT_DEV"; w="$NPU_FT_W"; tokd="${id%:fast}"; tokd="${tokd%/}" ;;
+-      *) if [ -n "$(npu_pin_files "$id")" ] && ! npu_pin_files "$id" | awk '{print $1}' | grep -qxF -- "$id.hnpw"; then
++          dev="$NPU_FT_DEV"; w="$NPU_FT_W"; tokd="${id%:fast}"; tokd="${tokd%/}"
++
++          vis="$NPU_FT_VIS"; aud="$NPU_FT_AUD" ;;
++      *) if { [ -n "$(npu_pin_files "$id")" ] || [ -n "$(npu_pin_get "$id" vis)" ]; } && ! npu_pin_files "$id" | awk '{print $1}' | grep -qxF -- "$id.hnpw"; then
+ 
+            echo "halogen npu: $id is the NPU's program for your own checkpoint; put the checkpoint under /models/<dir> and name that path in HALOGEN_NPU_MODELS" >&2
+            exit 1
+@@ -1566,13 +1648,19 @@
+     if [ "$first" = 1 ]; then nargs+=("$dev" "$w" "127.0.0.1:$port"); NPU_TOK1="$tokd"; first=0
+     else nargs+=(--model "$dev" "$w"); fi
+     [ -n "$enc" ] && nargs+=(--model "$enc" "$enc/weights.hnpw")
+-    [ -n "$vis" ] && nargs+=(--model "$vis" "$vis/weights.hnpw")
++
++    [ -n "$vis" ] && nargs+=(--model "$vis" "$([ -f "$vis/weights.hnpw" ] && echo "$vis/weights.hnpw" || echo "$w")")
++
++    [ -n "$aud" ] && nargs+=(--model "$aud" "$([ -f "$aud/weights.hnpw" ] && echo "$aud/weights.hnpw" || echo "$w")")
+     NPU_API_ARGS+=(--npu-tokenizer "$tokd")
+   done
+   npu_memlock "$NPU_NEED_K" || exit 1
+   case "${HALOGEN_NPU_RESTARTS:-3}" in
+     ''|*[!0-9]*) echo "halogen npu: HALOGEN_NPU_RESTARTS=${HALOGEN_NPU_RESTARTS} is not a count" >&2; exit 1 ;;
+   esac
++  case "${HALOGEN_NPU_KILL_S:-1800}" in
++    ''|*[!0-9]*) echo "halogen npu: HALOGEN_NPU_KILL_S=${HALOGEN_NPU_KILL_S} is not a number of seconds (0 = off)" >&2; exit 1 ;;
++  esac
+   NPU_OUT="${_hg_npu_out:-/tmp/halogen-npu.out}"
+   NPU_BIN="$bin"; NPU_ARGS=("${nargs[@]}"); NPU_RESTARTS=0
+   NPU_STOP=0
+@@ -1580,9 +1668,14 @@
+   rc=0; npu_launch || rc=$?
+   case "$rc" in
+     1) echo "halogen npu: the NPU engine exited before it was ready (rc=$NPU_RC; its own lines are above)" >&2
++       if [ "${NPU_XRT_OWN:-0}" = 1 ]; then
++         echo "  It ran on $NPU_XRT_V against the host's kernel $(uname -r), driver amdxdna $NPU_XRT_DRV. If that driver is what refused it, use the host's XRT: -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro, or for a distribution's packages the mounts in the NPU page's host section." >&2
++       fi
+        exit 1 ;;
+     2) exit 0 ;;
+   esac
++  npu_stall_watchdog "$port" &
++  NPU_STALL_PID=$!
+ }
+ 
+ npu_launch() {
+@@ -1591,6 +1684,7 @@
+   "$NPU_BIN" "${NPU_ARGS[@]}" > >(tee -a "$NPU_OUT") &
+   NPU_PID=$!
+   NPU_UP=$SECONDS
++  echo "$NPU_PID" > "${_hg_npu_pidfile:-/tmp/halogen-npu.pid}" 2>/dev/null || true
+ 
+   until grep -q '^READY' "$NPU_OUT" 2>/dev/null; do
+     if ! kill -0 "$NPU_PID" 2>/dev/null; then
+@@ -1613,24 +1707,93 @@
+     { [ -z "$WATCHDOG_PID" ] || kill -0 "$WATCHDOG_PID" 2>/dev/null; }
+ }
+ 
++npu_running_ms() {
++  local line
++  line=$( { exec 9<>"/dev/tcp/127.0.0.1/$1" || exit 0; printf 'INFO 0\n' >&9; read -r -t 5 line <&9; printf '%s' "$line"; } 2>/dev/null )
++  case "$line" in *'"running_ms":'*) ;; *) return 0 ;; esac
++  line="${line#*\"running_ms\":}"
++  line="${line%%[!0-9]*}"
++  echo "$line"
++}
++npu_stall_watchdog() {
++  local port="$1" limit="${HALOGEN_NPU_KILL_S:-1800}" step="${_hg_npu_poll:-10}" parent=$$
++  local pf="${_hg_npu_pidfile:-/tmp/halogen-npu.pid}" pid="" ms s killed="" dlast=0 now t
++  if [ "$limit" -le 0 ]; then
++    echo "halogen npu: stall watchdog OFF (HALOGEN_NPU_KILL_S=$limit)"
++    return 0
++  fi
++  echo "halogen npu: stall watchdog on: one job holding the NPU for ${limit} s takes the NPU engine down and starts it again (HALOGEN_NPU_KILL_S)"
++  while kill -0 "$parent" 2>/dev/null; do
++    wd_sleep "$step"
++    pid=""; { read -r pid < "$pf"; } 2>/dev/null || true
++    case "$pid" in ''|*[!0-9]*) continue ;; esac
++    wd_alive "$pid" || continue
++    [ "$pid" = "$killed" ] && continue
++    ms=$(npu_running_ms "$port")
++    case "$ms" in ''|*[!0-9]*) continue ;; esac
++    s=$((ms / 1000))
++    [ "$s" -ge "$limit" ] || continue
++    if [ "$(wd_state "$pid")" = D ]; then
++      now=$SECONDS
++      if [ $((now - dlast)) -ge 60 ] || [ "$dlast" = 0 ]; then
++        dlast=$now
++        echo "halogen npu: one job has held the NPU for ${s} s (HALOGEN_NPU_KILL_S=${limit}) and a thread of the NPU engine is in uninterruptible sleep (state D, inside the kernel). Not taken down: SIGKILL does not reach it and killing the engine there is what leaves the driver holding its memory (issue #79). Deferred; checked again in ${step} s." >&2
++      fi
++      continue
++    fi
++    echo "halogen npu: one job has held the NPU for ${s} s (HALOGEN_NPU_KILL_S=${limit}); the device is not coming back. Stopping the NPU engine; it is started again (HALOGEN_NPU_RESTARTS) and the Flash engine serves on. Requests waiting for the NPU are answered 503." >&2
++    kill -TERM "$pid" 2>/dev/null || true
++    t=0
++    while wd_alive "$pid" && [ "$t" -lt "${_hg_npu_term_s:-10}" ]; do wd_sleep 1; t=$((t + 1)); done
++    if wd_alive "$pid"; then
++      if [ "$(wd_state "$pid")" = D ]; then
++        echo "halogen npu: the NPU engine did not exit on SIGTERM and a thread of it is now in uninterruptible sleep (state D); SIGKILL deferred (issue #79)." >&2
++      else
++        echo "halogen npu: the NPU engine did not exit on SIGTERM within ${t} s; sending SIGKILL" >&2
++        kill -KILL "$pid" 2>/dev/null || true
++      fi
++    fi
++    killed="$pid"
++  done
++}
++
+ npu_again() {
+   local wrc="$1" max="${HALOGEN_NPU_RESTARTS:-3}" step="${_hg_npu_backoff:-5}" up rc
+-  up=$((SECONDS - NPU_UP))
+-  [ "$up" -ge 600 ] && NPU_RESTARTS=0
+-  echo "halogen npu: the NPU engine exited (rc=$wrc) after ${up} s; the Flash engine serves on" >&2
++  local paused="${NPU_PAUSED:-0}"
++  NPU_PAUSED=0
++  if [ "$paused" = 0 ]; then
++    up=$((SECONDS - NPU_UP))
++    [ "$up" -ge 600 ] && NPU_RESTARTS=0
++    echo "halogen npu: the NPU engine exited (rc=$wrc) after ${up} s; the Flash engine serves on" >&2
++  fi
+   while [ "$NPU_RESTARTS" -lt "$max" ]; do
+     NPU_RESTARTS=$((NPU_RESTARTS + 1))
+-    echo "halogen npu: starting the NPU engine again in $((step * NPU_RESTARTS)) s (restart $NPU_RESTARTS of $max, HALOGEN_NPU_RESTARTS)" >&2
+-    wd_sleep $((step * NPU_RESTARTS))
++    if [ "$paused" = 1 ]; then
++      paused=0
++    else
++      echo "halogen npu: starting the NPU engine again in $((step * NPU_RESTARTS)) s (restart $NPU_RESTARTS of $max, HALOGEN_NPU_RESTARTS)" >&2
++      wd_sleep $((step * NPU_RESTARTS))
++    fi
+     [ "${HG_STOP:-0}" = 1 ] && return 1
+     rc=0; npu_launch || rc=$?
+     case "$rc" in
+-      0) echo "halogen npu: the NPU engine is serving again"; return 0 ;;
++      0) NPU_ROOM_S=0; echo "halogen npu: the NPU engine is serving again"; return 0 ;;
+       2) return 1 ;;
+     esac
++    if [ "$NPU_RC" = 76 ]; then
++      NPU_RESTARTS=$((NPU_RESTARTS - 1))
++      NPU_ROOM_S=$(( ${NPU_ROOM_S:-0} > 0 ? NPU_ROOM_S * 2 : ${_hg_npu_room_s:-30} ))
++      [ "$NPU_ROOM_S" -gt 300 ] && NPU_ROOM_S=300
++      echo "halogen npu: the host is under the NPU engine's memory floor (HALOGEN_NPU_HOST_FLOOR_GIB; its line is above): trying again in ${NPU_ROOM_S} s, until there is room. Its routes answer 503 until then and the Flash engine serves on" >&2
++      ( wd_sleep "$NPU_ROOM_S" ) &
++      NPU_PID=$!
++      NPU_PAUSED=1
++      return 0
++    fi
+     echo "halogen npu: the NPU engine exited before it was ready (rc=$NPU_RC; its own lines are above)" >&2
+   done
+   NPU_PID=""
++  : > "${_hg_npu_pidfile:-/tmp/halogen-npu.pid}" 2>/dev/null || true
+   echo "halogen npu: the NPU engine stays down after $max restarts (HALOGEN_NPU_RESTARTS): its routes answer 503 until the container restarts; the Flash engine serves on. The device's side is in the host's kernel log (sudo dmesg | grep -i amdxdna)." >&2
+   return 0
+ }
+@@ -1640,9 +1803,9 @@
+   start_npu_engine 0
+   API_PID=""
+   trap 'NPU_STOP=1; kill -TERM "$NPU_PID" $API_PID 2>/dev/null || true' TERM INT
+-  "${_hg_python:-/nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3}" /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py \
++  "${_hg_python:-/nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3}" /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py \
+     --engine none --tokenizer "$NPU_TOK1" "${NPU_API_ARGS[@]}" \
+-    --host 0.0.0.0 --port "$API_PORT" --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}" &
++    --host :: --port "$API_PORT" --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}" &
+   API_PID=$!
+ 
+   set +e
+@@ -1651,6 +1814,7 @@
+   elif ! kill -0 "$NPU_PID" 2>/dev/null; then who="NPU engine"
+   else who="front end"; fi
+   kill -TERM "$NPU_PID" "$API_PID" 2>/dev/null || true
++  [ -n "${NPU_STALL_PID:-}" ] && { kill "$NPU_STALL_PID" 2>/dev/null; wait "$NPU_STALL_PID" 2>/dev/null; } || true
+   wait "$NPU_PID" 2>/dev/null || nrc=$?
+   wait "$API_PID" 2>/dev/null || arc=$?
+   if [ "$NPU_STOP" = 1 ]; then
+@@ -1677,7 +1841,7 @@
+ 
+   NPU_PID=""; NPU_API_ARGS=()
+   [ -n "${HALOGEN_NPU_MODELS:-}" ] && start_npu_engine 1
+-  env "${ENGINE_ENV_U[@]}" "${_hg_flash_serve:-/nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve}" --ck "$HALOGEN_CHECKPOINT" \
++  env "${ENGINE_ENV_U[@]}" "${_hg_flash_serve:-/nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/flash_serve}" --ck "$HALOGEN_CHECKPOINT" \
+       --port "$ENG_PORT" --bind 127.0.0.1 \
+       --slots "$ENG_SLOTS" --ctx "$ENG_CTX" --max-tok "$ENG_MAX_TOK" --kv-pool "$ENG_POOL" &
+   ENGINE_PID=$!
+@@ -1692,10 +1856,10 @@
+     exit 1
+   fi
+ 
+-  "${_hg_python:-/nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3}" /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py \
++  "${_hg_python:-/nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3}" /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py \
+     --tokenizer "$HALOGEN_TOKENIZER" \
+     --engine "127.0.0.1:$ENG_PORT" \
+-    --host 0.0.0.0 --port "$API_PORT" \
++    --host :: --port "$API_PORT" \
+     --max-tokens-cap "${HALOGEN_MAX_TOKENS_CAP:-65536}" \
+     --context "$ENG_CTX" \
+     --queue-timeout "${HALOGEN_QUEUE_TIMEOUT:-3600}" "${NPU_API_ARGS[@]}" &
+@@ -1726,7 +1890,7 @@
+   BENCH_LOG=/tmp/halogen-api.log
+   : > "$BENCH_LOG"
+ 
+-  env "${ENGINE_ENV_U[@]}" /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --ck "$HALOGEN_CHECKPOINT" \
++  env "${ENGINE_ENV_U[@]}" /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/flash_serve --ck "$HALOGEN_CHECKPOINT" \
+       --port "$ENG_PORT" --bind 127.0.0.1 \
+       --slots "$ENG_SLOTS" --ctx "$ENG_CTX" --max-tok "$ENG_MAX_TOK" --kv-pool "$ENG_POOL" \
+       > /tmp/halogen-engine.log 2>&1 &
+@@ -1736,7 +1900,7 @@
+   echo "halogen bench: loading model (cold load can take minutes)"
+   wait_for_engine "$ENG_PORT" "$ENGINE_PID" /tmp/halogen-engine.log || exit 1
+ 
+-  env -u HALOGEN_API_KEY -u HALOGEN_API_KEY_FILE /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/serve_api.py \
++  env -u HALOGEN_API_KEY -u HALOGEN_API_KEY_FILE /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/serve_api.py \
+     --tokenizer "$HALOGEN_TOKENIZER" \
+     --engine "127.0.0.1:$ENG_PORT" \
+     --host 127.0.0.1 --port "$API_PORT" \
+@@ -1762,11 +1926,11 @@
+   fi
+ 
+   if [ "$MODE" = sweep ]; then
+-    /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/halogen-bench.py \
++    /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/halogen-bench.py \
+       --api "http://127.0.0.1:$API_PORT" "$@"
+   else
+     HALOGEN_API="http://127.0.0.1:$API_PORT" HALOGEN_API_LOG="$BENCH_LOG" \
+-      /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/bench-serving.py \
++      /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/bench-serving.py \
+         "${1:-serial,mtp}" "${2:-256}" "${3:-low}" "${4:-1}"
+   fi
+   RC=$?
+@@ -1788,7 +1952,7 @@
+   [ -d "$OUTDIR" ] && [ -w "$OUTDIR" ] || { echo "halogen convert: cannot write into $OUTDIR (is the volume mounted read-write?)" >&2; exit 1; }
+   need_head "$(dirname "$IN")"
+   echo "halogen convert: $IN -> $OUT (the table and the draft head folded in; a few minutes to ten on an NVMe disk)"
+-  /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/flash_serve --repack "$IN" --out "$OUT" --with-table --head "$HALOGEN_MTP_HEAD"
++  /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/flash_serve --repack "$IN" --out "$OUT" --with-table --head "$HALOGEN_MTP_HEAD"
+   RC=$?
+   if [ "$RC" -eq 0 ]; then
+     echo "halogen convert: done. Start the image with HALOGEN_CHECKPOINT=$OUT (no GGUF is needed beside it;"
+@@ -1815,9 +1979,9 @@
+     echo "halogen $MODE: $FILE under this image's engine environment (tuning plan: ${HALOGEN_MATMUL_TUNING_FILE:-none}; quality sidecar: ${HALOGEN_CK_OVERLAY:-beside the checkpoint, if any}; trunk pinned: ${HALOGEN_FLASH_PIN_TRUNK:-1})" >&2
+ 
+     need_tokenizer
+-    exec /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/halogen_tools.py "$MODE" "$FILE" --tokenizer "$HALOGEN_TOKENIZER" "$@"
++    exec /nix/store/q4wf934v83ab6z79828l7wcgm8a8p7wg-python3-3.14.8-env/bin/python3 /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/halogen_tools.py "$MODE" "$FILE" --tokenizer "$HALOGEN_TOKENIZER" "$@"
+   fi
+-  exec /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/bin/halogen-tools "$MODE" "$FILE" "$@"
++  exec /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/bin/halogen-tools "$MODE" "$FILE" "$@"
+   ;;
+ *) [ "${1:-}" = npu ] && echo "halogen: there is no npu mode any more: the NPU's models run in the default mode beside the Flash model; set HALOGEN_NPU_MODELS (and drop the npu argument)." >&2
+    echo "usage: entrypoint.sh [all|engine|api|bench|sweep|convert IN.gguf OUT.hgn|inspect|verify|ppl|niah [FILE] ...]" >&2; exit 2 ;;

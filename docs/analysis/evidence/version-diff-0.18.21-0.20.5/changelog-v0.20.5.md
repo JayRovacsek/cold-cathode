@@ -1,0 +1,4903 @@
+# Changelog
+
+## 0.20.5
+
+Faster decoding with several requests at once, Hindi, Thai and other Indic-script prompts read the way the model was
+trained, LFM3 on the NPU reads long prompts about twice as fast and generates faster, and fixes for structured output,
+the answer guard, Claude Code's mid-session tool changes, unknown model names and kept conversations. The Flash
+checkpoints and the GEMM tuning are 0.20.4's.
+
+### Changed
+
+- Faster decoding when several requests run at once, and saved conversations take less memory, so the prompt cache
+  keeps more of them. At temperature 0 a reply can occasionally read differently from 0.20.4 where two words were
+  nearly tied; quality is unchanged in our checks. If you see a change in answer quality on very long contexts, set
+  `HALOGEN_DN_STATE=fp32` to restore the previous behaviour exactly, and please open an issue.
+- A prompt cache saved to disk by an earlier version is not reused after this upgrade; it is rebuilt on first use.
+- Hindi, Thai and other Indic-script prompts are now tokenized the way the model was trained: those prompts take fewer
+  tokens and are read more accurately. Text without combining marks (English, code, most other languages) is tokenized
+  exactly as before. `HALOGEN_TOKENIZER_NATIVE=0` restores the previous tokenization.
+- LFM3 on the NPU shows its first text sooner: under 0.2 s after a 1,024-token prompt (was about 0.4 s), and streamed
+  text is no longer held back except where it could be the start of a tool call or a stop string.
+- The NPU runtime libraries in the image are updated to XRT 2.27.
+- LFM3 reads long prompts about twice as fast on the NPU: its first text comes about 1.7 s after an 8,000-token prompt
+  (was 2.6 s), about 6.3 s after a 32,000-token one (was 13.7 s), and a prompt near the full context reads in about 2
+  minutes (was about 8). A reply can read slightly differently from 0.20.4's; quality is unchanged in our checks.
+- LFM3 generates about 8% faster on the NPU after a short prompt, and up to 25% faster (`:fast`) after a long one.
+- `LFM3-1.7B` (full quality) now agrees with the original model more often, at the same speed.
+- Speech-to-text and a few other NPU models answer about 1% faster. Their answers are unchanged.
+- The LFM3 device files are new; they are fetched again on the first start with `HALOGEN_DOWNLOAD`. A converted LFM3
+  weight file from an earlier version is converted again once, automatically.
+- `HALOGEN_AGENT_GUARD=watch` no longer loads the hold mode's decision model, saving about 5 GiB (#250).
+
+### Fixed
+
+- A reply can end on a `#### 18`-style answer line again (#259, reported by @Johnny-dai-git). The answer guard held a
+  turn open on any heading-shaped last line, which cost GSM8K-style answers; it now never holds a reply on a bare answer
+  line, and holds a heading only very deep into a long reply.
+- Positive numbers in a pretty-printed JSON array no longer come back negative under structured output (#258,
+  reported by @eric717273).
+- A model name that is one of halogen's own models but is not loaded now gets a 404 `model_not_found` instead of being
+  answered by another model (#257, reported by @tkajdro). Names from other products that clients send by default are
+  still answered by the loaded model.
+- **Claude Code no longer gets a 400 when its tool list changes mid-session** (#261, reported by @sergeant82d). When an
+  MCP connector connected late, or a tool was added or removed during a session, Claude Code sent the change as a
+  system message with `tool_addition` / `tool_removal` blocks and the Messages endpoint refused the whole request. An
+  added tool is now declared from the block: the model sees its definition at that point of the conversation, a call
+  to it comes back as a tool call, and the start of the prompt stays the same, so the prompt cache still hits.
+- **Structured output takes an `anyOf` of up to 32 tool-shaped branches** (#263, reported by @slamdunk111). A
+  `response_format: json_schema` whose `anyOf` lists one object per tool was refused with a 400 once it had more than
+  8 branches, and a branch without `additionalProperties` counted as five. Each branch now counts once and up to 32 are
+  accepted, with every branch's arguments still enforced. A schema past the limit still gets the 400, with the count.
+- A request that names the same kept state in `X-Halogen-From` and `X-Halogen-Keep` but cannot start from it no longer
+  waits up to `HALOGEN_FORK_TTL_S` on that state (#265, reported by @Gobutsu). The old state is released before the
+  request runs, and its cached prefix stays usable.
+- A job that never finished on the NPU (`engine_stalled` in the NPU health until the container was restarted) now takes
+  the NPU engine down after `HALOGEN_NPU_KILL_S` seconds (default 1800, 0 turns it off) and it starts again by itself
+  while the GPU keeps serving; requests waiting for the NPU get a 503.
+- Two diagnostic lines (`dn swap:`, `decode prefetch: N launches`) no longer print in the default server log; they
+  print under `HALOGEN_SERVE_TRACE=1`.
+
+## 0.20.4
+
+Short follow-up turns start sooner, more throughput with more than 8 requests at once, and `tool_choice: "none"` holds in a
+conversation that already has tool calls. The Flash checkpoints, the runtime and the GEMM tuning are 0.20.3's.
+
+### Changed
+
+- Short follow-up turns start sooner: a message of a few words to a few sentences added to a cached conversation is read 15 to
+  50% faster, more on long conversations. At temperature 0 such a turn can occasionally read differently from 0.20.3 where two
+  words were nearly tied; quality is unchanged in our checks.
+- More throughput past 8 concurrent requests (servers started with `HALOGEN_KV_SLOTS` above 8): with 16 requests generating at
+  once the combined rate is up by about 10 to 20%. Replies at temperature 0, and sampled replies with a client seed, are
+  unchanged. Servers at the default 4 slots are unaffected.
+
+### Fixed
+
+- A tool call the client had turned off no longer arrives as text (#253, reported by @bugsyb). With `tool_choice: "none"` in a
+  conversation that already holds tool calls, the model could still write one, and it reached the client as raw `<tool_call>`
+  markup in the reply. Open WebUI 0.13 sends exactly that request to end a tool loop (after a failed or repeated call, or at its
+  iteration limit), so a chat with thinking off sometimes ended on XML. The server now answers such a request in prose, on the
+  chat, Responses and Messages endpoints. Requests without `tool_choice: "none"`, or whose conversation holds no call, are
+  unchanged.
+
+## 0.20.3
+
+Faster `d3-nano` decisions on the NPU. Everything else is unchanged from 0.20.2.
+
+### Changed
+
+- `d3-nano` answers 7 to 9% faster on the NPU and uses less energy. Its scores can differ from 0.20.2's in the last digits, with
+  the same accuracy in our checks.
+
+## 0.20.2
+
+Faster generation with several requests at once, a sooner first token on long conversations, and faster NPU decisions.
+The Flash checkpoints are 0.20.1's, and at temperature 0 Flash's replies read as on 0.20.1.
+
+### Changed
+
+- Slightly faster when several requests generate at once, up to about 1%. Replies are unchanged.
+- Faster time to first token on long conversations, up to about 4%.
+- NPU decisions on long prompts start a little sooner.
+- `d3-lite` answers 14 to 18% faster on the NPU and uses less energy. Its scores can differ from 0.20.1's in the last digits, with
+  the same accuracy in our checks.
+
+## 0.20.1
+
+Faster follow-up turns, an answer when the model ends its turn inside its reasoning, and a quieter log.
+The Flash checkpoints, the runtime and the GEMM tuning are 0.20.0's. A first turn at temperature 0 reads as on 0.20.0. A follow-up that resumes from the cached end of the previous reply, and a turn whose reasoning the server now closes, can differ from 0.20.0's (below).
+
+### Changed
+
+- **Faster follow-up turns: the end of each reply is cached.** When a client sends a reply back exactly as it was generated (thinking off, or the reasoning returned with the history), the next turn resumes from the end of that reply instead of reading it again. In our tests (thinking off, two machines) the time to the first token of a follow-up fell from 0.60 s to 0.19 s on a code-edit session, from 0.36 s to 0.21 s on a long-document chat and from 0.82 s to 0.70 s on a short agent turn; the saving grows with the length of the previous reply. It is an ordinary prompt-cache entry, one per conversation, kept in RAM only (about 112 MiB each, one more entry per slot: the start line reads 3.1 GiB of prompt cache at 4 slots, was 2.7) and forgotten like any other entry when memory is needed; it never holds memory a running request needs. Clients that drop or rewrite the previous reply see no change. A follow-up resumed this way reads the same tokens through different arithmetic, so later turns can differ from 0.20.0's in the last bits, as with any prompt-cache hit.
+- **Retired: the automatic reply-end keep (`HALOGEN_FORK_MAP=auto`).** The cached reply end above does what it did, by default and without pinning memory. A configuration that still sets it starts normally, prints one line saying it is ignored, and gets the new behaviour. `HALOGEN_FORK_AUTO_KEEPS` and `HALOGEN_FORK_AUTO_END_ONLY` are no longer read. Named keeps (`X-Halogen-Keep` / `X-Halogen-From`) and `HALOGEN_FORK_MAP=claude-code` are unchanged.
+- The `kv pool: ... cannot grow ... the turn runs in the N positions it has left` line is now an ordinary log line (stdout) instead of an error (stderr), so `journalctl` no longer shows it in red on every follow-up turn of a long session. It is routine: a turn that reaches that room grows its region and gets its whole `max_tokens`. When a turn really is cut short because nothing could make room, the server logs one warning on stderr, `kv pool: request N was shortened by the room its region had left, ...`, naming what was cut (the reply at `max_tokens`, the thinking budget, or both).
+
+### Fixed
+
+- Turns that ended with reasoning and no answer. When the model ended its own turn inside its reasoning (an `<|im_end|>` written before it closed the think block), the reply stopped there, sometimes with a stray `<|im_end|>` at the end of the reasoning. The server now closes the reasoning at that point and the model writes its answer; `usage.completion_tokens_details.reasoning_closed_by` reads `end_of_turn_in_reasoning` when this happens. Other replies are unchanged. With a response schema or strict tools the earlier behaviour stays. Thanks to the Discord user who sent the session.
+
+## 0.20.0
+
+Document parsing on the NPU with your own OvisOCR3, the image on ROCm 10.1, faster prompt reading, and a fix for strict tool calls under concurrency.
+The Flash checkpoints are unchanged. This is a numeric release: at temperature 0 Flash's replies can differ from 0.19.1's in the last bits, and the quality gates read the same as on 0.19.1.
+
+### Added
+
+- **Document parsing on the NPU with your own OvisOCR3 checkpoint.** Name its folder in `HALOGEN_NPU_MODELS` (`/models/OvisOCR3`) and it answers on `/v1/chat/completions`, `/v1/messages` and `/v1/responses`: a page in, Markdown out, with tables as HTML and formulas as LaTeX, one or two pictures a request. Against the model's own code its page text and table scores stay within a point, and OCRBench reads 85.7 against 85.3. A typical page takes about 20 seconds, with the first text after about 3.4 seconds on an A4 page; Flash keeps the GPU. The image ships the NPU programs only; the weights stay yours. See the NPU page. Known: beside several NPU generation models the NPU driver can refuse one allocation about once a run (the server retries, no request fails), and two runs of the same page can differ at a near tie, on about one page in a hundred on some hosts; and when OvisOCR3 and several other NPU generation models start work at once, Flash's next request can wait about 40 seconds while its weights come back into memory (`HALOGEN_WEIGHTS_LOCK=1` keeps them resident). Thanks @xuyongroger for the request (#245).
+
+### Changed
+
+- **The image now runs ROCm 10.1.** On a stock host a reply draws less power while it generates (about 9 to 15% less package energy in our measurements, from the runtime no longer keeping a CPU core busy while it waits) at the same speed. Outputs can differ from 0.19.1 in the last bits, as with any change of compiler and GEMM library; the GEMM tuning was redone for the new library.
+- **Faster prompt reading on Qwen3.8-Flash-Next:** about 3.5% (v2) and 5.7% (ht43) at 2,048 tokens, 2.5% and 5.6% at 8,192 and 2.0% and 3.5% at 32,768, from a change in how the engine lays out three activation and weight buffers and a new router kernel. The router's scores are computed in a different order, so outputs can differ from 0.19.1 in the last bits. Generation with drafting reads as on 0.19.1; without drafting, ht43 reads about 0.7% slower on one of our two machines.
+- A lone request starts reading its lookup rows as soon as it arrives, so a prompt whose rows are not in the file cache waits a few milliseconds less. Replies are unchanged.
+
+### Fixed
+
+- A crash with strict tool calls under concurrency. Parallel requests sharing a strict tool set could read mask memory that another request's growth had just freed, ending the engine with a GPU memory fault. A long strict request could also lose its compiled schema once eight other distinct schemas or tool sets were admitted. Replies are otherwise unchanged.
+- On `/v1/completions`, a prompt that extends an earlier one could be tokenized differently from the same text sent fresh when a character split into several byte tokens sat at the reuse point (a long run of emoji, for example): part of that character was dropped. The reused tokens now match a fresh tokenization.
+
+## 0.19.1
+
+The image now carries XRT, so the NPU needs only the host's driver and firmware, and a malformed tool schema can no longer use up the generation slots.
+The Flash checkpoints are unchanged. At temperature 0 every Flash reply is byte-identical to 0.19.0's.
+
+### Added
+
+- `/v1/completions` takes `ignore_eos`: a fixed-length run for benchmarks. The reply is `max_tokens` long and end-of-text tokens are ordinary tokens. Off unless a request asks for it; the chat, Messages and Responses routes keep the model's stops whatever they send. On text that does not end, a greedy run with it gives plain greedy's replies at about its decode speed, so a benchmark no longer needs a sampled workaround with a logit bias. Use text that does not end: past a reply's real end the model writes a repeating loop that decodes unusually fast and is not a speed for real text.
+
+### Changed
+
+- **The image now carries XRT, so the NPU needs only the host's driver and firmware.** It ships XRT 2.25.37 with its NPU plugin, built from AMD's source, about 7 MB. Drop `-v /opt/xilinx/xrt:/opt/xilinx/xrt:ro` and the per-file mounts from your command. Keep them if you prefer: a host's XRT mounted there replaces the image's, and the start line says which one is running. Mount all three libraries or none, because a mix is refused by name. Thanks @nahsi (#238).
+- **If your XRT was Ubuntu 26.04's 2.21, decider-0.8b takes about 0.5 to 0.9 ms longer a decision on the image's XRT 2.25** (1 to 2%). Answers are bitwise the same on every NPU model. Every other model we timed reads within our measurement. AMD's XRT 2.25 already had this cost.
+- **With every generation model loaded at once, a short NPU request can now wait for the reply in progress.** The server now accounts for what XRT 2.25 holds in the NPU's memory, so the driver no longer refuses a request under that load. In our heaviest test, 3 of about 850 requests waited for a generation to finish, 70 to 100 seconds.
+- `/v1/completions` answers faster on a prompt that extends a recent one: it no longer tokenizes the whole prompt again, and tokenizing no longer holds up other requests. A long-context first token arrives ~100 ms sooner at 64k tokens. Replies are unchanged.
+
+### Fixed
+
+- A tool schema that is not an object (`parameters` or `input_schema` as a string, a number, a boolean or a filled array) now gets a 400 naming the tool on all three APIs. It used to return a 500 and keep a generation slot until a restart, so a few such requests could stop every language request. Thanks to @denis-susan for the report. Closes #243.
+- Any error after a request takes a slot and before generation starts now frees that slot.
+- The startup log no longer prints a FastAPI `on_event` deprecation warning. Nothing about startup changed except that line.
+
+### Documentation
+
+- The NPU page's host section now treats a host's XRT as an option. A distribution's XRT 2.25 or newer on Debian or Ubuntu mounts at `/opt/xilinx/xrt/lib/` and `/opt/xilinx/lib/x86_64-linux-gnu/`.
+- The agent harness page's hermes-agent row: a level set with `--reasoning`, `/reasoning` or `agent.reasoning_effort` does reach a custom base URL. Thanks @kell-t (#241).
+
+## 0.19.0
+
+An opt-in agent guard on the NPU, as a preview, whole-file rewrites about a third faster, the API port on IPv6, and NPU fixes.
+The Flash checkpoints are unchanged. At temperature 0 every Flash reply is byte-identical to 0.18.23's.
+
+### Added
+
+- **An opt-in agent guard, as a preview: `HALOGEN_AGENT_GUARD=watch|hold`.** With the NPU, a small model, Halogen Spotter, reads each new tool result while Flash reads it. `hold` keeps a side-effecting tool call out of a turn with a flagged result until you say so, and says what it held and why. A second pair of eyes for an agent, not a security boundary: office-style tasks were measured, coding agents and attackers who know the model were not. Off by default, and off runs none of it. See `docs/agent-guard.md`.
+
+### Changed
+
+- **Rewrites of a whole file are about a third faster, with identical output.** A coding agent that reads a file and writes it back gets about 30% more tokens per second (40% on a 2,000-token file), about 20% on Edit calls, 12-15% on search-and-replace blocks, and a few percent on ordinary agent turns; prose is unchanged. Prompt lookup now follows the file it is copying, reads a line-numbered or JSON-escaped tool result as its original text, and leaves every other round to the draft head. Every token is still the one the model would have picked. Nothing to configure.
+
+### Fixed
+
+- **The API port listens on IPv4 and IPv6.** With Podman's `-p`, an IPv6 connection was reset, because the server inside the container listened on IPv4 alone. Where the host refuses IPv6, it listens on IPv4 as before. Nothing to configure. Thanks @mgoltzsche (#231).
+- **`d3-lite` and `d3-nano` on `/v1/systemone` no longer ignore a key they do not read.** A question's text goes in `instructions` and the text it is about in `state`. Both have defaults, so a request with `question` was accepted and answered from the template and the options alone, with the same answer for every input. Any other key, on a question or on the request, is now a 422 naming where the text belongs. A client that sends an extra key beside the right ones gets the same 422 and needs that key removed. Thanks @tkajdro (#234).
+- **LFM3 on the NPU takes a prompt as long as its context.** A plain prompt past about 220,000 to 233,000 tokens failed at once with a 500 saying the NPU engine closed the connection, and every other NPU request in flight failed with it. Thanks @tkajdro (#235).
+- **The NPU engine comes back after a fault even with the host at its memory floor.** A restart refused by `HALOGEN_NPU_HOST_FLOOR_GIB` used up the restart count in 30 seconds and left the NPU's routes down until the container restarted. It now spends no restart and tries again every 30 seconds to 5 minutes until there is room (#235).
+- **A generation on the NPU answers the documented errors.** A refusal for host memory is a 503 `host_memory`, a full queue or a device fault a 503 `engine_busy` with `Retry-After`, and NPU memory a 503 `npu_memory`. They were all a 500 `server_error` (#235).
+
+### Documentation
+
+- `gguf.md` says that `Q5_0` is not read on the gate/up experts, so a plain `Q5_0` file is refused at its first gate/up tensor. Thanks @Tsury (#233).
+- `troubleshooting.md` has a section on the stall when a second large program shares the machine, including swap on zram. Thanks @rrdahan2001 (#237).
+
+## 0.18.23
+
+The LFM3 family on the NPU: your own LFM3-VL-2B (pictures and video), LFM3-Audio-2B (speech in and speech out) and
+LFM3-Omni-2B (every medium on one model), plus a fix for a wrong answer from LFM3-1.7B, and faster decoding with
+several requests at once. The Flash checkpoints are unchanged. At temperature 0 every Flash reply is byte-identical to
+0.18.22's, alone or beside other requests, except where the two fixes below apply (#232, #227).
+
+### Added
+
+- **Your own LFM3-VL-2B on the NPU: pictures and video.** Put a LiquidAI LFM3-VL-2B checkpoint (or a fine-tune of it)
+  on the models volume and name its path in `HALOGEN_NPU_MODELS`; `:fast` runs the 5-bit form beside it, as for
+  LFM3-1.7B. It answers `/v1/chat/completions`, `/v1/messages` and `/v1/responses`, streamed or not, with tool calls
+  and pictures in tool results; a video is `{"type": "video", "frames": [...], "fps": 2}`. A picture is read at up to
+  4 megapixels, and a picture sent again, or the part of a long conversation a later turn shares, is not read again.
+  A 640 x 480 picture with a short answer takes about 1.3 seconds; it decodes about 27 tokens a second at full quality
+  and 39 with `:fast`. On MMStar, RealWorldQA and OCRBench its answers score within 0.2 points of the model's own code
+  (58.47%, 72.94% and 81.9% against 58.40%, 73.07% and 81.9%). The weights stay yours, under their own license (LFM
+  Open License v1.0). See docs/NPU.md.
+- **Your own LFM3-Audio-2B on the NPU: speech in.** Send a WAV clip as an `input_audio` part on chat completions or
+  `/v1/responses`, or to `/v1/audio/transcriptions` (`json` or `text`). A 3.5-second clip is read in about 0.1 second.
+  On LibriSpeech test-clean the word error rate is 2.967% against 2.946% for the model's own code (difference +0.02,
+  95% interval -0.03 to +0.07), and on MMAR the score is 50.9% against 50.5% (+0.40, -0.40 to +1.30). A reply the
+  model opens with its own `<think>` block comes back as reasoning, with the answer after it as content.
+- **LFM3-Audio-2B speech out.** `/v1/audio/speech` speaks text as a WAV, as raw 24 kHz PCM, or as PCM streamed while
+  it is made; a chat request with `modalities: ["text", "audio"]` answers with spoken audio and its transcript in
+  `message.audio`, from text or from speech. Two voices (`female`, `male`; OpenAI's voice names map to them) and 19
+  languages (`language`). It speaks at 0.54 of real time on the 8-bit form and 0.41 with `:fast`, with the first audio after
+  about 130 milliseconds. Against the model's own code, TTS word error rate is 1.823 against 1.866 (-0.04, -0.22 to +0.12) and
+  voice chat 1.307 against 1.139 (+0.17, -0.28 to +0.64), with speech quality scores within their margins. Speech out
+  needs the checkpoint's whole folder, `audio_tokenizer/` included; a folder copied without it converts with no
+  speech out and the log says so.
+- **Your own LFM3-Omni-2B on the NPU: every medium on one model.** Pictures, video, a video with its soundtrack (the
+  video item's `audio` field), speech clips in, and text, spoken or mixed replies out, under one model id. Thinking is
+  off by default; a picture is read at up to 2 megapixels and a video holds 4 to 384 frames. It starts to answer a
+  picture in about 0.24 second, a video with its soundtrack in about 0.7 second, and a 2-minute recording in about 1
+  second. Against the model's own code, nine benchmarks differ by less than 0.7 points (MMStar -0.60, RealWorldQA
+  +0.00, OCRBench +0.40, LibriSpeech word error rate +0.042, MMAR -0.20, MVBench +0.64, Daily-Omni +0.00, TTS word
+  error rate -0.11, voice chat -0.26). Its speech runs at 0.54 of real time (0.41 with `:fast`).
+- **A request with a picture or speech waits behind an LFM3 reply in progress, and the other way round** (a known
+  limit, documented in docs/NPU.md). Decisions, embeddings, reranks and moderations still run between two of its
+  tokens.
+
+### Fixed
+
+- **A reply no longer goes on to invent the user's next message (#232).** When the model ended its own turn inside its
+  reasoning, the end-of-turn guard kept that marker as text and generation went on, and the model sometimes wrote the
+  next turn of the conversation itself: a user message nobody sent, which an agent could later quote back as the
+  user's words. The reply now ends where the model ended its turn, the invented turn is never sent, and
+  `usage.completion_tokens_details.end_of_turn_in_reasoning` says so. Templates the model quotes in its reasoning are
+  unchanged. Thanks @dgalaganov for the report and the transcripts.
+- **A tool argument that quotes the call format's closing tags is no longer cut (#227).** A string value holding
+  `</parameter>`, `</function>` and `</tool_call>` on their own lines followed by more text was cut at those tags, and
+  the rest went into the answer, so a file written through a tool came out shorter with no error. It now arrives
+  whole. A call followed by text in the same reply now finishes at the end of the reply rather than at its own closing
+  tag. Thanks @Tsury for the report and the analysis.
+- **LFM3-1.7B could answer a prompt of 2,049 to 4,096 tokens wrongly.** After a prompt longer than 4,096 tokens and
+  then some short requests, the next prompt of 2,049 to 4,096 tokens (and each one after it, until another prompt past
+  4,096 tokens ran) was read on the wrong rotary position tables, so its answer could change. Present in 0.18.21 and
+  0.18.22; found while testing LFM3-VL-2B. Every such request now answers as a fresh server would. d1-2B was not
+  affected.
+- **Your own LFM3-1.7B, d1-2B or FLUX.2-klein checkpoint was converted again at every start, even on a read-write
+  models volume.** The server now keeps the converted file beside the checkpoint and reuses it; a changed checkpoint
+  or a server update converts it again. Each later start saves about half a minute and a 4 GB write per LFM3 format.
+  Thanks to the Discord user who reported it. A converted LFM3-Audio-2B file from an earlier build is converted once
+  more on the first start (it gains speech-sampling settings).
+- **A client that left during a speech request got a 500 and a traceback.** It is now a quiet 499, as on the other
+  routes.
+
+### Changed
+
+- **The first request after the server starts no longer waits for one-time setup.** The server now runs one short
+  request of its own before it reports ready, so the work a fresh engine does on its first pass happens at startup
+  instead of inside your first request. Startup takes about a third of a second longer, the startup log says what
+  the warm-up took, and its short prompt counts as one entry in the prompt cache's counters. Replies are unchanged.
+- **Faster with several requests decoding at once.** Four requests at once decode 1.8 to 3.4% faster and two requests
+  1.1 to 1.3% faster; one request alone is unchanged. On the ht43 weights file there is about 1% more at four
+  concurrent requests. Measured served against 0.18.22 on two machines, greedy and sampled. Replies are unchanged at
+  temperature 0. The server holds about 430 MiB more device memory for this, and the context it fits accounts for it.
+- **Sampling is exact in every speculative path.** With several sampled requests decoding at once, or at the token
+  that opens a strict tool call, the server could pick a token from a distribution very slightly off the one your
+  sampling settings define (about 4 tokens in 1,000 at the default settings, more at the start of a strict tool
+  call). Every sampled token is now drawn from exactly the requested distribution, at the same speed. A seeded sampled
+  reply sent beside other requests may read differently from earlier versions; greedy output is unchanged.
+- **Sampled requests with strict tool calls no longer use the forced-token drafter.** Measured again on today's
+  build, it no longer paid for itself on sampled requests: turning it off makes a sampled strict tool call that carries
+  code about 2% faster, with no change on an agent turn. Replies are drawn from the same distribution as before, so a
+  seeded sampled tool call can read differently from the previous version. Greedy requests are unchanged.
+- **A d1-2B question during an LFM3 reply no longer waits for it.** It now joins the reply in progress: a wait of 14
+  to 28 seconds is about 0.5 to 1.2 seconds, and Flash is not slowed. A decision that arrives beside a continuous
+  stream of d1-2B questions may wait a little longer in its queue.
+- **A short NPU job that hosts other short requests runs on a generation's credit.** d1-2B beside a busy embedder
+  answers in 1 to 3 seconds instead of 13 to 21; the embedder runs at about 0.65 of its speed while a long NPU job is
+  running, and a short embedding can wait for it. Every answer is the same as before.
+
+### Documentation
+
+- **A correction to 0.18.20's note on sampled requests.** 0.18.20 said sampled requests decoding two or three at
+  once got about 7 to 10% faster for two and 3 to 4% for three. Measured again so that each comparison draws its own
+  sampled texts (the earlier measurement repeated one set of texts per version), the gain is about 4 to 7% for two
+  and 2 to 4% for three, depending on the machine and the weights file. Greedy numbers and every other figure are unchanged.
+
+Thanks @rekillicloud for asking for the LiquidAI models (#229).
+
+## 0.18.22
+
+Your own d1-2B on the NPU: decisions over text, pictures and video, with boxes. The Flash checkpoints and the Flash
+engine are unchanged: every Flash reply is byte-identical to 0.18.21's.
+
+### Added
+
+- **Your own d1-2B on the NPU.** Put a LiquidAI d1-2B checkpoint on the models volume and name its path in
+  `HALOGEN_NPU_MODELS` (`/models/d1-2B`). It answers `POST /v1/systemone` in its own form: a state (text, a JSON
+  value, or none), up to 16 named questions in one pass (yes / no, choice, multiple choice, score, a value read from
+  the text, a number estimate with a range), and `media`, pictures and videos that head the state. On a picture it
+  also locates things: `box` answers one object's edges, `boxes` every instance. A video is its frames and their rate
+  (`{"type": "video", "frames": [...], "fps": 24}`); two frames a second are read, as d1-2B reads them. On CV-Bench
+  and MMStar its answers match d1-2B's own run on 99.6% and 98% of items (accuracy within 0.2 points). A question
+  about a picture takes about 0.35 seconds, the picture included; a box question about a photo well under a second.
+  The server converts the checkpoint at start; the NPU programs are fetched under `HALOGEN_DOWNLOAD` (programs only,
+  no weights). The weights stay yours, under their own license (LFM Open License v1.0). See docs/NPU.md.
+
+## 0.18.21
+
+Your own LFM3-1.7B on the NPU, and a long request to an NPU model no longer waits for a whole generated reply. The
+Flash checkpoints and the Flash engine are unchanged: every Flash reply is byte-identical to 0.18.20's.
+
+### Added
+
+- **Your own LFM3-1.7B on the NPU.** Put a LiquidAI LFM3-1.7B checkpoint (or a fine-tune of it, or LFM3-1.7B-Base) on
+  the models volume and name its path in `HALOGEN_NPU_MODELS`: `/models/<dir>` runs it at full quality (8-bit), and
+  `/models/<dir>:fast` runs a faster 5-bit format of the same checkpoint, served as `<dir>-fast`. The server converts
+  the checkpoint at start; the NPU programs are fetched under `HALOGEN_DOWNLOAD` (programs only, no weights). Chat
+  completions stream with tool calls, `/v1/completions` takes raw text for a base checkpoint, and a prompt may be as
+  long as the model's 262,144-token context. It decodes about 27 tokens a second on a short prompt and 22 at 32k
+  tokens at full quality, about 38 and 28 with `:fast`. The weights stay yours, under their own license (LFM Open
+  License v1.0). See docs/NPU.md.
+
+### Changed
+
+- **A long request to an NPU model no longer waits for a whole generated reply.** While `qwen3.5-2b` or an LFM3 model
+  generates, a decision, embedding, rerank or moderation request to another NPU model, of any length, now runs between
+  two of its tokens. Before, one over 1,024 tokens waited for the reply in progress: beside two LFM3 generations a
+  2,900-token decision took up to 80 seconds or timed out, and now takes under 3. Under a heavy, continuous mix of NPU
+  requests the generating reply keeps about a third of the NPU, so it finishes sooner than before (about 46 seconds
+  instead of 83 in our heaviest test), while short requests beside it take longer (an embedding's median about 0.6
+  seconds instead of 0.1). With no generation running nothing changes. Every answer is the same as before.
+
+### Documentation
+
+- **The README's Flint preview command named a tag that does not exist** (`0.18.20-flint-preview`, since 0.18.20). It
+  names the preview's own tag, `0.18.14-flint-preview`, again.
+
+## 0.18.20
+
+Faster decoding with two or three requests at once, a JSON schema and strict tools on requests with images, and a
+clear NPU error on an old XRT. The Flash checkpoints are unchanged. At temperature 0 every reply is byte-identical to
+0.18.19's, alone or beside other requests ([measured](docs/performance.md#measured)).
+
+### Changed
+
+- **Two requests decoding at once are about 20% faster, three about 9%.** With several requests running, each now
+  drafts several tokens ahead in the shared round, as a request alone already did. Sampled requests gain less (about
+  7 to 10% for two, 3 to 4% for three). One request alone is unchanged. Measured served against 0.18.19 on the same
+  machines. At temperature 0 every reply is still byte-identical to the same request run alone; a sampled reply with a
+  fixed seed, run beside other requests, now reads differently from its alone text more often (each token is still
+  drawn from the model's own distribution, see `docs/sampling.md`).
+
+### Fixed
+
+- **A JSON schema now works on a request with images.** `response_format` (`json_schema` or `json_object`),
+  `text.format` on `/v1/responses` and `output_config.format` on `/v1/messages` used to be a 400 when the
+  request also carried an image. They now hold the reply to the schema as on any other request, at any temperature.
+  `/health` `structured_output.images` says so. Reported on Discord.
+- **Strict tools are enforced on a request with images.** A tool declared `strict: true` used to run as if not strict
+  when the request carried an image. Its calls are now held to its schema as on any other request.
+- **On a host whose XRT is older than 2.20, the NPU engine stopped at start with only `halogen-npu: stoul`
+  (#224).** XRT 2.19 and older cannot read the server's NPU programs. The engine now names the host's XRT
+  version and says to install 2.20 or newer, and the NPU page states the floor. Thanks @bin1357 for the
+  report.
+
+## 0.18.19
+
+Slightly faster decoding with three requests at once, and fixes from the issue tracker. The Flash checkpoints are
+unchanged. At temperature 0 every reply is byte-identical to 0.18.18's, alone or beside other requests
+([measured](docs/performance.md#measured)).
+
+### Changed
+
+- **Three requests decoding at once are about 3% faster, and a request alone up to 1% faster.** Measured served, greedy and
+  sampled, against 0.18.18 on the same machines. At temperature 0 every reply is still byte-identical to the same
+  request run alone.
+
+### Fixed
+
+- **A request may carry more than 64 images (#218, #219).** The server refused any request with more than 64
+  images, so an agent session that reads a screenshot each turn failed on every turn after its 65th. There is no
+  fixed limit now: a request may carry as many images as fit in the context. Thanks @wangbinyq and @Tsury for the
+  reports.
+- **On `/v1/messages`, a prompt over the context is refused with the Anthropic API's own message** (`prompt is too
+  long: N tokens > M maximum`), which Claude Code compacts and retries on. Other endpoints keep their message.
+- **A streamed `/v1/responses` error names its class in `code`** (`invalid_request_error` for a refused request,
+  `engine_busy` as before), so a gateway can tell a request it must not retry from a busy server (#218).
+- **Two tool-call regressions from 0.18.18 (#221).** When text after a finished call held another closing tag,
+  it was folded into the call's last argument. A call with no parameter was dropped when another call's opener
+  came later in the reply, so a request with a forced `tool_choice` failed with a 502. Both read as they did in
+  0.18.17 again, and every argument from #216 still arrives whole. A call that ends with its own closing tags now
+  finishes there again when prose follows it, not at the end of the reply. Thanks @pugant for the report.
+- **A `HALOGEN_KV_POOL_POSITIONS` that is not a multiple of 256 no longer stops the server.** The pool is allocated
+  in units of 256 positions; such a size, or a `HALOGEN_CTX` whose default pool (twice the context) is not one, was
+  refused at startup. It is now rounded up to the next multiple of 256 and the log says so.
+- **An image request that arrived while another request's prompt was being read could be refused.** With a
+  slot free, 0.18.18 could start it before its pictures reached the engine, and it failed with `GEN declared N
+  images but 0 arrived` (a 400 inside the stream). It now waits for its pictures as it did in 0.18.17, and a
+  short text request still starts inside a long read. Reported on Discord.
+
+### Documentation
+
+- **`HALOGEN_WEIGHTS_LOCK` is in `docs/FLAGS.md` (#222).** It was described in `docs/host-setup.md` and missing
+  from the flag reference. Thanks @svenstaro for the report.
+- **NPU page: holding the fabric clock is not a full fix on every host (#139).** Some owners still get hard hangs
+  with it held. The page links AMD's tracking issue and says to install the maker's newest BIOS.
+
+## 0.18.18
+
+A fixes-only release: fixes from the issue tracker and Discord, and ggml-org's official GGUF of this model now
+loads. The Flash checkpoints are unchanged. Apart from the fixes below, at temperature 0 every reply is
+byte-identical to 0.18.17's, and speed is unchanged ([measured](docs/performance.md#measured)).
+
+### Fixed
+
+- **Claude Code sessions that load tools on demand keep their prompt cache.** Since 0.18.17, each tool Claude Code's
+  tool search loaded (MCP tools included) made the server read the whole conversation again, tens of seconds on a
+  long session. A loaded tool now joins the conversation where Claude Code loads it, and the rest of the prompt stays
+  cached: in a Claude Code session with MCP tools, every turn reused all of the previous turn's prompt. If you set
+  `ENABLE_TOOL_SEARCH=false` as a workaround, you can remove it. Thanks to the Discord user who reported it.
+- **A short request that takes a paused reply's slot starts during a long prompt (#214).** With a reply paused by
+  `HALOGEN_RETRY_GRACE_S` (its client went away), a short request that needed its slot waited for another
+  conversation's whole long prompt to be read instead of starting inside it: 29.5 s instead of 0.5 to 1.4 s beside a
+  60,000-token prompt in our tests. A stop, a pause or a resume arriving during a long prompt no longer holds back a
+  short request that comes after it. Thanks @fiddlythings for the report and the analysis.
+- **A tool call's string argument holding a literal `</tool_call>` arrives whole (#216).** An argument with
+  `</function>`, `</parameter>` or a `<function=NAME>` tag followed by `</tool_call>` was cut there, and the rest
+  came back as content, streamed or not. A `</tool_call>` now ends a call only when the reply ends there or another
+  call follows. A call followed by prose now finishes at the end of the reply. Thanks @eliasstepanik for the report
+  and the cases.
+- **ggml-org's `Qwen3.8-Flash-Next-GGUF` (`IQ4_NL`) loads (#217).** Its lookup table is stored as `Q4_0`, which the
+  engine refused; it is now read losslessly. A GGUF re-encoded from an already quantized file (a tensor written
+  back as `F32`) is still refused, and the message now says why. Thanks @johnlkj for the report and the workaround.
+- The log no longer prints a progress line at every reply's second token.
+
+### Documentation
+
+- The Hugging Face repositories are linked: the Flash model's from the README and the Quickstart, and each NPU
+  model's beside its short name on the NPU page (#215). Thanks @kamjin3086.
+
+## 0.18.17
+
+A fix for conversations that keep their state between turns on a full server, plus four fixes and one addition
+from the issue tracker. The Flash checkpoints are unchanged. At temperature 0 every reply is byte-identical to
+0.18.16's, and speed is unchanged ([measured](docs/performance.md#measured)).
+
+### Fixed
+
+- **With a keep in use, a full KV pool no longer hands one conversation another's turn.** With
+  `HALOGEN_FORK_MAP=claude-code`, `HALOGEN_FORK_MAP=auto` or named keeps (`X-Halogen-Keep`), when the pool had no
+  room and two conversations shared an opening (the same system prompt, as a coding agent's main thread and its
+  subagents do), the server could make room by writing one conversation's turn over rows another conversation had
+  kept for its next turn. That conversation then answered as if the other's turn were its own. The server now leaves
+  a conversation's kept rows alone when it makes room, and lets an automatic keep go first. At the defaults (no keep)
+  nothing changes. Thanks @dgalaganov for the report that led here (#208), and to the Discord users who described
+  agents going off script.
+- **With `HALOGEN_FORK_MAP=auto`, a resumed conversation no longer waits on its own kept reply (#207).** A request
+  that resumed a conversation partway through its history could wait for the kept reply's timer, up to ten minutes,
+  with one core busy. It now takes its place at once, as with the keep off; a request waiting for room with nothing
+  running no longer keeps a core busy, and the server stops promptly while one waits. Thanks @peterurbanec for the
+  report and the logs.
+- **Claude Code's MCP tool search works on `/v1/messages`.** A `tool_result` holding `tool_reference` blocks, which
+  Claude Code sends after its tool search loads MCP tools, was refused with a 400, so each session paid a rejected
+  request and fell back to loading every tool up front (#210). Each reference now reads as a line naming the loaded
+  tool; every declared tool, `defer_loading` or not, is already in the prompt. Thanks @Tsury for the report and repro.
+- **A tool call's string argument that contains tool-call markup arrives as the model wrote it.** An argument holding
+  `</function>`, a whole example `<tool_call>` block or a repeated `<parameter=...>` tag (a parser fixture, a test, a
+  heredoc) was cut short, had another parameter overwritten, or gained a key the tool never declared, on every route,
+  streamed or not (#209). The parser now ends a call where its markup balances and opens a parameter only on a name not
+  yet written. Long file writes also cost the server less time per token. Thanks @Tsury for the report and cases, and
+  @eliasstepanik for the analysis.
+- **A short request starts during a long prompt even while `/metrics` is scraped (#212).** A `/metrics` or `/cache`
+  read during a long prompt made a short request that arrived after it wait for the whole prompt instead of starting
+  inside it: 41.5 s instead of about 1.5 s beside an 85,000-token prompt in our tests. Thanks @fiddlythings for the
+  report and the repro.
+
+### Added
+
+- **`/v1/models` says whether the model takes images.** Each model entry now carries `architecture.input_modalities`
+  (`["text", "image"]` with the vision tower loaded, `["text"]` without) and `output_modalities` (`["text"]`), in
+  OpenRouter's spelling, so a harness that builds its model list from `/v1/models` no longer needs the capability set
+  by hand. The value always matches `/health`'s `vision.enabled` (#211). Thanks @claudejaune for the request.
+
+## 0.18.16
+
+The automatic reply-end keep is off by default again, a conversation the server moves aside to make room keeps its whole
+history, and generation with drafting is back to full speed. The Flash checkpoints are unchanged. At temperature 0 every
+reply is byte-identical to 0.18.15's with `HALOGEN_FORK=0`.
+
+### Changed
+
+- **The automatic keep is off by default (#207, #208).** 0.18.15 kept each conversation's state at the end of its reply
+  for its next turn. That keep could stall a request for up to ten minutes with one core busy (#207), and it put every
+  conversation behind the fault fixed below (#208). Each turn reads its history in again, as in 0.18.14. Named keeps
+  (`X-Halogen-Keep`) and `HALOGEN_FORK_MAP=claude-code` are unchanged. Thanks @peterurbanec and @dgalaganov for the
+  reports and logs.
+- **Generation with drafting is back to full speed**, about 1.5% faster than 0.18.15 and at or above 0.18.14
+  ([measured](docs/performance.md#measured)). Replies are unchanged.
+
+### Fixed
+
+- **A conversation moved aside to make room keeps its kept reply (towards #208).** When the KV pool slides an idle
+  conversation aside so another can grow, it now copies the state kept for that conversation's next turn whole. Before,
+  it copied the conversation's history but not its last reply, so a turn started from a named keep or the Claude Code map
+  could read another conversation's text in place of its own reply. With the automatic keep, every conversation was
+  exposed to this in 0.18.15.
+
+## 0.18.15
+
+A conversation's next turn now starts where the previous reply ended, long answers no longer stop inside a code
+block, and a request whose client has gone no longer holds up the requests behind it. The Flash checkpoints are
+unchanged. At temperature 0 a single request's reply is byte-identical to 0.18.14's unless the new answer guard keeps
+it from ending (see Fixed).
+
+### Added
+
+- **A 2,097,152-position KV pool, eight full-length conversations at once (#200).** With `HALOGEN_KV8=1`,
+  `HALOGEN_KV_SLOTS=8`, `HALOGEN_MAX_TOK=16384` and `HALOGEN_KV_POOL_POSITIONS=2097152`, the default checkpoint fits on
+  a 128 GB machine, about 41 GB on the device. Measured with eight 242k-token conversations resident, every answer
+  identical to the same request run alone. It leaves little host memory, so run it without NPU models. The default pool
+  is unchanged.
+
+### Changed
+
+- **A conversation's next turn starts from where the previous reply ended, by default.** The server keeps each
+  conversation's state at the end of its reply (`HALOGEN_FORK_MAP=auto`, up to `HALOGEN_FORK_AUTO_KEEPS`
+  conversations, about 0.1 GiB of host memory each), so a follow-up turn skips reading the reply back in. When the KV
+  pool needs room, one of these states is released first, which costs that conversation a prefill, never a wrong
+  answer. With it on, the `X-Halogen-Keep` / `X-Halogen-From` headers and `/halogen/handles` are live on every server;
+  keep the port private. `HALOGEN_FORK=0` turns it off.
+- **Generation with drafting is about 1% slower at the defaults**, the cost of the reply-end keep above and of the
+  answer guard below; `HALOGEN_FORK=0` and `HALOGEN_ANSWER_GUARD=0` give 0.18.14's speed
+  ([measured](docs/performance.md#measured)).
+- **Structured output and strict tool calls decode faster**, most of all when several such requests run at once.
+  Greedy replies are unchanged. `HALOGEN_DV_GRAMMAR=0` and `HALOGEN_GRAMMAR_JOINT=0` give the previous behaviour.
+- **Short NPU requests and the streaming guard no longer wait behind long NPU jobs.** A decision, an embedding, a
+  rerank or a moderation of up to 1,024 tokens runs between two steps of a long NPU job (an image, a transcription, a
+  generation, a speech request) in a fraction of a second, and the streaming guard's checks run there first, so a
+  guarded reply keeps its checks beside speech and images. This was off in 0.18.14. Under a heavy mix of NPU requests
+  the long jobs wait longer in turn. `HALOGEN_NPU_SPLICE=0` turns it off. Every result is the same either way.
+
+### Fixed
+
+- **A request whose client disconnects while it waits is no longer prefilled (#204).** When a request was queued
+  behind another prompt's prefill and its client went away before it started, it was still admitted afterwards and its
+  whole prompt was read for nobody, so every request behind it waited that long. Its cancel is now applied before it
+  is admitted. Thanks @Gobutsu for the report and repro script, and @Tsury for confirming it.
+- **Long answers no longer stop inside a code block, on a heading or on a label (towards #89).** Deep in a long
+  context the model sometimes ends its turn where no answer can end. The server now keeps it from ending its turn
+  inside an open fenced code block, on a heading line, on a line that ends in `:` or opens `**` without closing it, or
+  on the blank line after one of those. Inside a code block that writes a ChatML template, an `<|im_end|>` the model
+  writes is kept as text. A reply that never reaches one of those places is unchanged. `HALOGEN_ANSWER_GUARD=0` turns
+  it off. Thanks @fiddlythings for the measurements.
+- **A host running out of memory no longer takes your session with it (#199).** The server's processes start with an
+  out-of-memory score of 500 (`HALOGEN_OOM_SCORE_ADJ`, `0` leaves the inherited value), so if the host runs out, the
+  kernel ends this container before the desktop session or the container runtime, and a restart policy brings it
+  back. Thanks @tkajdro for the report.
+- **The NPU models' host memory is counted (#199).** Each NPU model takes host memory that cannot be swapped as it is
+  used, up to about the size of its files. The startup check now adds up the models in `HALOGEN_NPU_MODELS` and warns
+  when the host cannot hold them beside the Flash model's weights and KV pool. While it runs, the NPU engine keeps at
+  least 4 GiB of host memory available (`HALOGEN_NPU_HOST_FLOOR_GIB`) and answers a request that would need more with
+  a 503 and the code `host_memory`, instead of the host running out of memory.
+- **A speech request the NPU cannot fit no longer stops every NPU model.** When the NPU's memory was short during a
+  text-to-speech request, the NPU engine ended and every NPU request after it failed until a restart. The request now
+  frees the other models' idle NPU memory and tries once more; if it still cannot run, that request alone gets a 503
+  with the reason, and the NPU engine keeps serving.
+- **A forced tool call that runs out of `max_tokens` is no longer a 502.** With `tool_choice` set to `required` or to
+  a named function, a reply that hit the token limit while writing the call came back as HTTP 502 Bad Gateway. It is
+  now a normal reply with the call so far: on chat completions `finish_reason: "length"` and the arguments written up
+  to the limit (not valid JSON, as the stream already sent them); on the Messages API `stop_reason: "max_tokens"` and
+  the `tool_use` block with an empty `input`; on the Responses API an `incomplete` response whose `function_call`
+  item is `incomplete`. A model that declines a forced call still gets the 502.
+- **`/detokenize` no longer stalls the server.** A long list of token ids held every route, `/health` included, for
+  minutes. It now answers in milliseconds at any length.
+
+## 0.18.14
+
+Text to speech on the NPU, and a long answer the prompt cache had cut short now gets the room it asked for.
+Generation is a little faster. The Flash checkpoints are unchanged. At temperature 0 each reply is byte-identical to
+0.18.13's, to the same request alone and to serial greedy decode.
+
+### Added
+
+- **Text to speech on the NPU (#183).** Qwen3-TTS-12Hz CustomVoice, 0.6B and 1.7B, with its nine preset voices, on
+  `/v1/audio/speech` (OpenAI's request shape: wav or pcm, or pcm streamed as it is made). The 1.7B also takes a speaking
+  style in `instructions`. The talker runs on the NPU and the audio is decoded on the CPU, so the GPU stays with the LLM.
+  On a Strix Halo the 0.6B speaks about 1.5 times faster than real time and the 1.7B a little faster than real time,
+  with the first audio in about 0.3 and 0.4 seconds. Name `qwen3-tts-0.6b-customvoice` or `qwen3-tts-1.7b-customvoice`
+  in `HALOGEN_NPU_MODELS`. Other NPU requests wait while a speech request is spoken (see docs/NPU.md). Thanks to
+  @0x62ash for the request.
+
+### Changed
+
+- **Generation is a little faster** on both checkpoints, at the same output
+  ([measured](docs/performance.md#measured)).
+- **Opt-in: a short NPU request can run between a long one's steps** (`HALOGEN_NPU_SPLICE=1`). A decision,
+  embedding, rerank or moderation request of up to 1,024 tokens that arrives while another NPU model generates an image,
+  transcribes a recording, speaks or generates text then runs in a fraction of a second instead of waiting up to about
+  20 seconds. It is off by default because under a heavy mix of NPU requests it delays the streaming guard.
+- **The decision models' sets were republished** (`decider-0.8b`, `d3-lite`, `d3-nano`): decisions over prompts of 65 to
+  128 tokens are faster, and the answers are unchanged. This image fetches them by itself (`HALOGEN_DOWNLOAD`).
+
+### Fixed
+
+- **A long answer is no longer cut short by the prompt cache** (reported on Reddit). When the server lowered a request's
+  `max_tokens` to the room its conversation had left (the log's warning), the answer stopped there even though the
+  memory held by idle cached conversations could have carried it. Now an answer that reaches that point gets more room,
+  from free space or from the oldest idle conversations, up to what the request asked for. `HALOGEN_POOL_GROW=0`
+  restores the previous behaviour.
+
+## 0.18.13
+
+Replies that are streaming keep moving while another request's long prompt is read in, a short
+request no longer waits behind one, and a fault on the NPU no longer takes the server down. The
+Flash checkpoints are unchanged. At temperature 0 each reply is byte-identical to 0.18.12's, to
+the same request alone and to serial greedy decode.
+
+### Changed
+
+- **Streaming replies keep moving while a long prompt is read in.** `HALOGEN_ADMIT_SPLICE_MS` is
+  now on by default (`500`, for every streaming reply: `HALOGEN_ADMIT_SPLICE_FOR=all`). Before,
+  every reply in progress paused for as long as one piece of a new long prompt took, which in our
+  tests was 18 to 22 seconds beside a 90,000-token prompt; now the longest pause is about one
+  second. The long prompt's own first token comes about 5 to 7 percent later while other replies
+  stream beside it. `HALOGEN_ADMIT_SPLICE_MS=0` restores the previous behaviour.
+- **A short request starts while a long prompt is read in** (`HALOGEN_ADMIT_NEST=1`, the default).
+  A request of up to 1,024 new tokens (`HALOGEN_ADMIT_NEST_MAX`) that arrives during another
+  request's long prompt is read in at once instead of waiting for that piece (up to about 20
+  seconds for a 32,768-token piece); in our tests the slowest such first token came in 0.6 to 1.3
+  seconds. It holds about 0.33 GiB more pinned host memory and 32 MiB of GPU memory from start-up. `HALOGEN_ADMIT_NEST=0` turns it off.
+- **The NPU model sets were republished** with more of their start-up moved onto the faster path;
+  every NPU request saves a few more milliseconds, and the answers are unchanged. This image
+  fetches them by itself (`HALOGEN_DOWNLOAD`).
+
+### Fixed
+
+- **A fault on the NPU no longer takes the server down** (towards #196, reported by @cannibal3004).
+  When an NPU command did not complete, the NPU engine used to refuse every later request of that
+  size ("bad command state, can't launch"), and could stop the whole container. Now it answers
+  busy (503) and exits, and the server starts it again by itself, up to `HALOGEN_NPU_RESTARTS`
+  times (default 3), while the Flash model keeps serving.
+
+## 0.18.12
+
+Prompts and generation run a little faster, every NPU model starts its work sooner, and image edits
+take up to four pictures. The Flash checkpoints are unchanged. At temperature 0 each reply is
+byte-identical to 0.18.11's and to serial greedy decode. This image needs the NPU model files it
+fetches for it (see Changed).
+
+### Added
+
+- **Image edits with up to four pictures** (towards #179, requested by @leng45-cpu).
+  `/v1/images/edits` takes one to four `image` parts, for example a scene and an object to place in
+  it, and the prompt names them as image 1 to image 4 in the order sent. Four is the model's limit.
+  An edit with one picture can also come out at 1024x1024. See docs/NPU.md.
+- **`halogen:gpu_queues_evicted_seconds_total` in `/metrics`**, and `evicted_ms` on each request
+  line: the seconds the kernel driver held the engine's GPU queues evicted because the host moved
+  memory the GPU maps (compaction or reclaim). Every request in flight stalls for them. Shown only
+  on a host that reports it.
+- **`HALOGEN_ADMIT_SPLICE_MS`, opt-in.** Keeps replies that are already streaming moving while
+  another request's long prompt is read in. Off by default. See docs/FLAGS.md.
+
+### Changed
+
+- **Faster.** Prompts process faster on both checkpoints, a step that checks
+  several drafts at once launches less work, and a host running with the IOMMU off reads ahead
+  during generation. See docs/performance.md for the measured figures.
+- **Every NPU model starts its work sooner.** All the shipped NPU model sets were republished with
+  a faster start-up path on the NPU. Every kind of NPU request is faster, from about 2 percent
+  (a 1024x1024 image) to about 36 percent (a picture question) when warm, and the answers are
+  unchanged. This image fetches the new sets by itself (`HALOGEN_DOWNLOAD`), and the new sets need
+  0.18.12 or later; an older image keeps fetching the sets it was released with.
+- **The prompt cache's copies go through a pinned staging buffer** (`HALOGEN_CACHE_STAGE=2`, the
+  default). When the host moves memory the GPU maps, the driver pauses every GPU queue; this
+  halves that lost time in our tests. Replies are unchanged. `HALOGEN_CACHE_STAGE=0` restores the
+  previous copies.
+
+## 0.18.11
+
+Three or four requests at once decode faster, and two Decision 3.0 models run on the NPU, pictures
+included. The Flash checkpoints are unchanged. At temperature 0 each reply is byte-identical to
+0.18.10's, to the same request alone and to serial greedy decode.
+
+### Added
+
+- **Decision 3.0 on the NPU.** `d3-lite` and `d3-nano` (vLLM Semantic Router's 0.8B and 2B decision
+  models) run on the NPU beside the Flash model: name them in `HALOGEN_NPU_MODELS` and ask System One
+  questions on `/v1/systemone` (a choice of up to 255 options, a yes or no, a score), about a text of
+  up to 8,192 tokens and, optionally, one picture. Their answers match the models' own runtime.
+  See docs/NPU.md.
+
+### Changed
+
+- **Three or four requests generating at once decode faster.** They now draft together and one step
+  checks every draft, as two requests already did, while that pays. Greedy replies are unchanged.
+  `HALOGEN_SPEC_GROUP=0` turns it off.
+- **A quieter console.** A successful `/health` or `/metrics` request, as a dashboard or a health
+  check polls them, no longer prints a line. Every other request, and any failed one, still does.
+  `HALOGEN_ACCESS_LOG=all` prints every request as before; `off` prints none.
+
+### Fixed
+
+- **Drafting after the prompt cache moved a conversation.** When the cache moved a long conversation
+  to make room, the draft head lost a little of that conversation's context, so it drafted worse
+  for the rest of the request and decoded a little slower. Replies were never affected.
+
+## 0.18.10
+
+Prompts process a little faster, and a reported fault with sampled structured output is fixed.
+The Flash checkpoints are unchanged. At temperature 0 the output is byte-identical to 0.18.9's
+and to serial greedy decode.
+
+### Fixed
+
+- **A sampled reply to a recursive schema could take the server down** (#192, reported by
+  @okaros). At temperature 1.0 the model sometimes nests a recursive schema's value past the
+  structured-output depth limit (a family tree 16 generations deep), and at the limit no token
+  was legal, so the engine failed with a GPU fault or a 400. Near the limit the grammar now
+  offers only the closing brackets, so the reply stays valid JSON, and a schema whose smallest
+  value is deeper than the limit is refused up front with the reason. An invalid token can no
+  longer reach the GPU on any path.
+
+### Changed
+
+- **Prompts process faster** at every length, on both checkpoints, and the first request of a
+  new conversation with the prompt cache on (the default) no longer waits for its cache memory
+  to be prepared.
+- **The image's `sweep` measures the cache-on case cold.** Its requests no longer share a first
+  line with its own calibration request, which the prompt cache used to serve, so a cache-on
+  `sweep` now reads a few percent lower than the same server did under 0.18.9's `sweep`. The
+  cache-off figures stay about the same.
+
+## 0.18.9
+
+An opt-in 8-bit KV cache, and fixes for three reported issues. The Flash checkpoints are unchanged.
+At the defaults, decode and prefill speed are unchanged, and at temperature 0 the output is still
+byte-identical to serial greedy decode.
+
+### Added
+
+- **An 8-bit KV cache, opt-in** (#142, asked by @apartje, with measurements from @jane-alesi and
+  @pugant). `HALOGEN_KV8=1` keeps the attention cache's keys and values in 8 bits instead of 16.
+  The default 524,288-position pool then takes about 8.2 GiB instead of 14.4, or
+  `HALOGEN_KV_POOL_POSITIONS=925184` fits in the memory the default pool took before. Perplexity
+  moved by -0.3% to +0.5% on both checkpoints, and retrieval of planted facts at 128k and 250k
+  tokens scored the same as the 16-bit cache. Prefill speed is unchanged. Decode is 0.2 to 0.6%
+  slower on short contexts and 1.7 to 1.9% slower with a 32k context (serial greedy decode on our
+  two machines). With drafting on, the text itself can differ from the 16-bit cache's, and a
+  reply's speed then moves with how well that text drafts. It cannot be combined with
+  `HALOGEN_COMPOSABLE_CONTEXT=1`, and `/health` reports the cache's format as `kv_cache`.
+
+### Fixed
+
+- **The engine could loop without end while making room in the KV pool** (#190, reported by
+  @byspy). With `HALOGEN_FORK` keeping a handle and `HALOGEN_COMPOSABLE_CONTEXT=1`, a request that
+  needed more room than the pool had kept trying to free a region the kept handle still held,
+  until the watchdog restarted the engine. The request now waits for room instead, and its wait
+  line says how many positions kept handles hold. They are freed when the handle is released or
+  idle past `HALOGEN_FORK_TTL_S`.
+- **A second GPU stopped the server from starting** (#188, reported by @thvk-beta). With another
+  GPU attached, the engine chose the Strix Halo GPU but failed at its first kernel launch. When
+  ROCm shows more than one GPU and no visibility variable is set, the engine now restarts itself
+  with only the chosen GPU visible, which is what the reporter's working `HIP_VISIBLE_DEVICES`
+  setting did by hand. Setting that variable yourself still wins. We have no two-GPU machine, so
+  this restart has not run on one here.
+- **An NPU answer with a non-finite number returned an HTTP 500.** The server now runs that request
+  once more and, if the answer is still not finite, returns a clean error.
+
+### Changed
+
+- **Image edits accept the sizes generations serve** (#189, requested by @xuyongroger). A frontend
+  that keeps one image-size setting for both routes no longer gets a 400 from
+  `/v1/images/edits`. Edits still come out at 512x512, and the response's `size` says so.
+
+## 0.18.8
+
+Long conversations keep their prompt cache, and a coding agent's subagents reuse the project
+context their parent already sent. The Flash checkpoints are unchanged. At temperature 0 the
+output is still byte-identical to serial greedy decode, and decode and prefill speed are unchanged.
+
+### Changed
+
+- **A long conversation keeps its cache when many short ones arrive in between.** At the cache's
+  entry limit the server used to forget the least recently used conversation first, so a long
+  coding session interrupted by a few dozen short requests paid for its whole prompt again. It now
+  keeps each conversation until about its own length of other work has been processed since it was
+  last used. On a 174,000-token conversation, the next turn after 24 and after 40 other short
+  conversations started in 1.1 to 1.2 s instead of 97 to 106 s, on both of our machines. Workloads
+  that never reach the limit are unchanged. `HALOGEN_CACHE_EVICT=1` restores 0.18.7's rule.
+
+### Added
+
+- **Subagents reuse the project context.** Claude Code and Codex send the same project
+  instructions at the start of every new thread, the main agent's and each subagent's. The server
+  now keeps that shared part cached on its own, so a subagent starts from it instead of
+  reprocessing it. In a session of three rounds of a main agent fanning out three subagents, with
+  eight unrelated conversations in between, the prompt tokens processed without the cache fell
+  by 61% and the session took 257 s instead of 629 s. Other harnesses already put the project
+  instructions in the system prompt, which was cached before. `HALOGEN_CACHE_LEAD=0` turns it off.
+
+### Fixed
+
+- **NPU models under a concurrent mix on the stock kernel driver.** With several NPU models busy
+  at once, the driver's device memory ran out and requests were refused and retried, logging
+  kernel errors. The NPU runtime now budgets that memory before asking for it. In our
+  all-models-busy test the kernel's memory errors went from 230 to 0, every answer unchanged.
+
+## 0.18.7
+
+Short replies decode quickly again, and GGUF checkpoints decode faster. The Flash checkpoints are
+unchanged. At temperature 0 the output is still byte-identical to serial greedy decode.
+
+### Fixed
+
+- **Short replies were slower since 0.18.5** (#186, reported by @George000017). The draft head
+  kept proposing tokens past the end of the turn, so the last step of every reply did extra work,
+  and on a reply of a few tokens that step is most of the decode time. A draft chain now ends at
+  the end of the turn. On one-word answers, decode went from 41 to 72 tok/s on v2, from 42 to 72
+  tok/s on ht43 and from 31 to 54 tok/s on a GGUF (UD-IQ4_XS), above 0.18.4 on all three. Longer
+  replies are unchanged, and so is the output.
+
+### Changed
+
+- **GGUF checkpoints decode faster.** On a GGUF the draft head now scores a short list of likely
+  tokens, as it already did on the native checkpoints, instead of the whole vocabulary. Greedy
+  decode of long replies on UD-IQ4_XS went from 53.1 to 57.8 tok/s (+9%). Sampled decode is
+  unchanged.
+
+## 0.18.6
+
+Sampled requests decode faster, and a new flag swaps the chat template without moving files.
+The Flash checkpoints are unchanged. At temperature 0 the output is still byte-identical to
+serial greedy decode, and greedy speed is unchanged.
+
+### Changed
+
+- **Sampled requests decode faster.** For a request with a temperature above 0 that runs alone,
+  the draft head now proposes up to seven tokens a round instead of three, and stops early when
+  its own draws become unlikely. The output keeps the model's distribution; a reply sampled with
+  a fixed seed can read differently from 0.18.5's. Over our ten-prompt `bench` set, code decoded
+  7 to 12% faster than on 0.18.5 at temperature 0.7 and 1.0, the whole set 4 to 5% faster, and
+  chat and prose within 1%; several requests decoding at once are unchanged.
+  `HALOGEN_SAMPLED_DEPTH=3 HALOGEN_SAMPLED_GATE=0.95,0.97` restores 0.18.5's sampled path.
+
+### Added
+
+- **`HALOGEN_CHAT_TEMPLATE`**: the path of one jinja file that replaces the tokenizer's chat
+  template, for comparing templates without moving files around. The startup line and `/health`
+  name the file and its sha256, and the template checks run on it; a missing or unreadable file
+  stops the server at start with one line naming the path. Unset, nothing changes.
+
+## 0.18.5
+
+Decoding is faster in two places: a strict tool call (greedy and sampled requests), and a draft chain that now stops when the
+draft head is unsure (greedy requests). The Flash checkpoints are unchanged. At temperature 0 the output is still
+byte-identical to serial greedy decode.
+
+### Changed
+
+- **Tool calls under strict tools decode faster.** Inside a tool call whose arguments the schema
+  forces (names, keys, punctuation), the server now proposes the forced text itself and checks it
+  in one step of up to 8 rows. Greedy requests: on a coding-agent session an agent's tool-call decode
+  ran 15 to 20% faster and its whole turn 1 to 3% faster, with identical replies. Sampled requests
+  use the same drafter and keep their output distribution; tool-call decode ran about 20% faster at
+  temperature 1.0 and between no change and 18% faster at 0.7 (sampled sessions differ from run to
+  run, so treat these as a range). `HALOGEN_GRAMMAR_DRAFT=0` turns it off; `HALOGEN_GRAMMAR_DRAFT_SAMPLED=0`
+  turns it off for sampled requests only.
+- **The draft head's chain stops when it is unsure.** For a greedy request the head proposes up to
+  seven tokens a round and ends the chain at the first one it is less than 90% sure of
+  (`HALOGEN_MTP_GATE_P`, `0` = the previous fixed two or three). Decode over our ten-prompt `bench` set
+  ran 6.4% faster on v2 and 5.2% on ht43 (60.3 to 64.2 and 61.5 to 64.7 tokens per second); code
+  gains most. Replies are identical. Sampled requests are not changed by this rule.
+- The server reserves room for 8-row checks instead of 4: about 18 MiB more device memory.
+  Prompt-cache entries saved to disk by 0.18.4 stay valid.
+
+### Added
+
+- **`timings.speculation.grammar`**: the rounds, drafted and accepted tokens of the tool-call
+  drafter, beside `head` and `lookup`; the three add up to `draft_n` and `draft_n_accepted`.
+
+## 0.18.4
+
+Prompts are processed faster at most lengths, a large token budget runs in the room the context
+has instead of failing, and replies say how their speculation went. The Flash checkpoints are
+unchanged. At temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports: issues #174 and #175 ([@Tsury](https://github.com/Tsury)),
+#178 ([@slamdunk111](https://github.com/slamdunk111)).
+
+### Changed
+
+- **Prompts are processed faster** at most prompt lengths. The engine now computes them in a
+  slightly different order, so a reply can differ a little from 0.18.3's for the same prompt.
+  Prompt-cache entries that 0.18.3 saved to disk (`HALOGEN_CACHE_DIR`) are not reused after the
+  upgrade: each conversation's next request is processed in full once.
+
+### Fixed
+
+- **A token budget larger than the room the prompt leaves now runs in that room** (#178), instead
+  of a 400. The reply says so in `timings.max_tokens_clamped_from` / `max_tokens_clamped_to`, and
+  the log line reads `max_tokens clamped`. A budget over the server's cap, and a prompt longer
+  than the context, still answer 400.
+- **Two token budget names that disagree no longer fail** (#178). The server uses
+  `max_completion_tokens` when it is sent, then `max_output_tokens`, then `max_tokens`, and logs
+  which value it used.
+- **A client that leaves while its request waits for a slot gives the slot back** (#174), also
+  when the slot comes free in the same moment it leaves.
+
+### Added
+
+- **`timings.speculation`** (#175): the drafter, its rounds, and the draft head's and prompt
+  lookup's rounds, drafted and accepted tokens, which add up to `draft_n` and `draft_n_accepted`.
+- **Request records keep the budgets.** With `HALOGEN_RECORD_DIR` set, each record's `req` now
+  holds `max_tokens`, `max_thinking_tokens` (as sent, or the server's default), and `think_cap`
+  with `think_src`: the thinking budget the request actually ran with and what set it.
+
+### Known issue
+
+- **K-quant GGUF files and concurrent requests** (#172). With unsloth's `UD-Q4_K_XL`, a request
+  that overlaps another one can return an empty reply. The same requests are normal on
+  `UD-IQ4_XS` and on the engine's own checkpoints; use one of those if you serve more than one
+  request at a time.
+
+## 0.18.3
+
+Three new NPU models and image edits. A server that says when a request is waiting. Fixes for
+hosts with a second GPU, and for replies that ran on past their end. The Flash checkpoints are unchanged.
+At temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports: issues #173 ([@erlendstromsvik](https://github.com/erlendstromsvik)),
+#171 ([@vladsimachkov](https://github.com/vladsimachkov)),
+#143 and #161 ([@dardeaw](https://github.com/dardeaw)),
+#155 ([@earthquake02](https://github.com/earthquake02)),
+#163 ([@nr23730](https://github.com/nr23730)).
+
+### Added
+
+- **EmbeddingGemma 2 on the NPU** (#143). `embeddinggemma-2` embeds text up to
+  8,192 tokens, pictures and audio clips into one space on `/v1/embeddings`.
+  Send a picture as an `image_url` item or an audio clip as an `input_audio`
+  item (WAV, up to 30 seconds). `prompt_name` picks the model's `query` or
+  `document` prompt. Name it in `HALOGEN_NPU_MODELS`.
+
+- **WeMM-Embedding-4B on the NPU** (#155). `wemm-embedding-4b` embeds text and
+  pictures into one space on `/v1/embeddings`. Pictures larger than 768
+  pixels on a side are scaled down. It runs on the `decider-4b` program, so
+  the two share one download of it.
+
+- **Image edits and variations on the NPU** (#163). `/v1/images/edits` and
+  `/v1/images/variations` take a picture and return a new 512x512 one, with
+  `flux2-klein-4b`. `HALOGEN_NPU_IMAGE_EDITS=0` turns them off.
+
+- **A streaming safety check for chat replies**, opt-in. With
+  `qwen3guard-stream-0.6b` loaded, a chat request that sets `guard` (or the
+  `X-Halogen-Guard` header) gets the reply checked as it streams, with an
+  event when a part looks unsafe. It watches and reports; it does not stop
+  the reply.
+
+- **A request that waits for its turn now says so** (#171). After 30 s in the queue the log
+  names what it waits for (busy slots, how long the oldest has run, the positions it reserves,
+  how many are ahead), again every five minutes, and once more when it starts or gives up.
+  `/metrics` adds `halogen:queue_waited_total`, `halogen:queue_wait_seconds_total`,
+  `halogen:queue_wait_longest_seconds` and `halogen:queue_gave_up_total`. `/health` adds
+  `longest_wait_s` beside `queued`.
+
+- **`max_tokens: -1`** asks for the most the server allows (the cap, or the room left).
+  It used to return one token. `0` and other negative values are refused
+  with a 400.
+
+- **llama.cpp-shaped `/props`, `/slots`, `/tokenize` and `/detokenize`.**
+
+- **Codex tool namespaces** come back on `function_call` items, so a namespaced tool call
+  round-trips.
+
+- **`HALOGEN_FORK_MAP=auto`**, opt-in: each conversation's reply end is kept, so the next
+  turn starts from it. Needs `HALOGEN_FORK=1`.
+
+- **`HALOGEN_TEMPLATE_CHECK`** (default `warn`): a startup line that says whether the loaded
+  chat template re-renders a conversation the way the prompt cache needs to reuse earlier turns.
+
+- **A host with a second AMD GPU runs on the Strix Halo GPU by itself.** The server used to
+  take whichever GPU ROCm listed first, and stopped at its first kernel when that was an
+  external card. `HALOGEN_GPU_DEVICE` picks another device by number.
+
+### Changed
+
+- Image generation on the NPU is a little slower, and its pictures are the
+  same. On some machines the faster setting could, rarely, return a wrong
+  picture without an error. `HALOGEN_NPU_FLUX_REUSE=1` brings back the
+  faster setting.
+
+- Decisions on the NPU are a little faster.
+
+### Fixed
+
+- **A client that hangs up while its request is queued leaves the queue at once.** It used
+  to take a slot when its turn came.
+
+- **A generation that ends with the model's second end-of-text token now stops** (#173).
+  The model declares two, and the server stopped on one, so such a reply ran on to
+  `max_tokens` past where the model had finished, and came back empty or with text after
+  the end.
+
+- **A host with an external AMD GPU starts with NPU models.** The fabric-clock check now
+  reads only the Strix Halo GPU, so another card's state neither blocks the start nor stands
+  in for it. The host unit (`deploy/host/halogen-fabric-clock`) holds that GPU's clock only.
+
+- **The memory budget at startup** counts memory the kernel keeps for contiguous
+  allocations (`CmaFree`) as not available, on hosts that reserve it.
+
+- **`HALOGEN_ADMIT_CHUNK`'s startup line** shows the value it read beside the piece it
+  uses (#161). With `HALOGEN_PROMPT_CACHE=1` a smaller value rounds up to one prefill
+  chunk, which the line now says.
+
+- `HALOGEN_NPU_VERIFY=0` refused the rerankers and the guard models at
+  start. They start now.
+
+- An embedding model on the NPU could miss a speed setting in the first
+  request after the driver loaded. It no longer does.
+
+## 0.18.2
+
+Strict tool schemas. Decisions on the NPU that take a longer text and can reuse
+what they already read. A server that works around old GPU firmware by itself.
+Six smaller fixes. The Flash checkpoints are unchanged.
+At temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports: issues #147 ([@superbarne](https://github.com/superbarne)),
+#160 ([@Philosjay](https://github.com/Philosjay)),
+#162 ([@cmcmaster1](https://github.com/cmcmaster1)),
+#166 ([@CandidNull](https://github.com/CandidNull)),
+#167 ([@tkajdro](https://github.com/tkajdro)), and the earlier #6 and #128.
+
+### Added
+
+- **Strict tool schemas** (#147). A tool declared `strict: true`
+  (`function.strict` on `/v1/chat/completions`, `strict` on a
+  `/v1/responses` or `/v1/messages` tool) gets a call that names one of the
+  request's tools and arguments that match its parameter schema. `enum` and
+  `const` values, each parameter's type, every required parameter, and no
+  parameter the schema does not declare, at any temperature. Parameters may
+  come in any order. `parallel_tool_calls: false`
+  (`disable_parallel_tool_use` on `/v1/messages`) then allows one call. A
+  request with no strict tool is unchanged. `HALOGEN_STRICT_TOOLS=0` accepts
+  `strict` without enforcing it.
+
+- **Decisions on the NPU take texts up to 8,192 tokens** on `decider-0.8b`
+  and `decider-4b`, where before they took 4,096 (#162). A text of about
+  1,000 to 4,000 tokens also answers faster now, with the same answers.
+
+- **Several questions about one text, on the NPU**, opt-in (#162).
+  `HALOGEN_NPU_DEC_RESUME=1` reads a text once and prefills only what follows
+  for each further question of it. `=2` lets a later request reuse what an
+  earlier one read, when its text only adds to it. The answers are the same
+  as without it. Off by default. See the NPU page.
+
+### Fixed
+
+- **A host with GPU firmware from before 2026 no longer stops on prompts of
+  about 70 to 2,000 tokens or on images** (#166, #128, #6). The server reads
+  the firmware version at startup and on such a host runs as with
+  `HALOGEN_QSA_FORCE_SEL=1`, which it says in one line. `HALOGEN_QSA_FORCE_SEL=0`
+  keeps the previous behaviour. Current linux-firmware is still the lasting
+  fix.
+
+- **An image or a transcription that does not fit beside the other NPU models
+  no longer answers 502** (#167). The server closes the other models' idle
+  parts and tries again. A request that still cannot fit answers 503 and says
+  so, and the server keeps running.
+
+- **A sampled request with a schema and tools now starts its JSON as promptly
+  as a greedy one** when the model would rather answer in plain text. Since
+  0.18.1 such a reply ran its plain text to the limit first.
+
+- **A `response_format` schema with an open object, or an array without
+  `items`, no longer stalls the server** for about a minute the first time it
+  is sent. An example is `{"type": "object", "properties": {"x": {"type":
+  "string"}}}`, with no `additionalProperties`. Every release since 0.8.0 had
+  it. A schema whose `anyOf` refers to itself with no object or array between
+  is now a 400 that says so.
+
+- **Chat-template markup written inside a message is read as text.** A
+  `<|im_end|>` or `<|im_start|>` inside a message, a tool result or a tool
+  description now reaches the model as the characters that were typed, and
+  not as one of the template's own markers. Assistant history keeps the
+  markers the model itself wrote, so a client that echoes back a previous
+  reply still matches. `HALOGEN_CLIENT_MARKERS=special` gives the behaviour
+  before this change.
+
+- **The startup line about the host memory left no longer reads 0.0 GiB** with
+  a GGUF checkpoint and `HALOGEN_WEIGHTS_LOCK=1` (#160). It was the line
+  alone. The memory and the server were fine.
+
+## 0.18.1
+
+Structured output at any temperature, a way to keep side requests out of the
+prompt cache, replies that survive a dropped connection, Claude Code
+sessions that keep their state, and fairer scheduling when a long prompt
+arrives. The Flash checkpoints are unchanged.
+At temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports: issues #151 ([@jerry426](https://github.com/jerry426)),
+#161 ([@dardeaw](https://github.com/dardeaw)) and #165
+([@featalion](https://github.com/featalion)).
+
+### Added
+
+- **Structured output at any temperature.** A request with a JSON schema
+  (`response_format`, `text.format` or `output_config.format`) may now set a
+  temperature above 0. Every token is drawn from the tokens the schema
+  allows, so a sampled reply parses and validates like a greedy one. It used
+  to be refused with a 400. A schema with an image, or with `logprobs`, is
+  still a 400.
+- **`prompt_cache_policy: "no_store"`** (#151). A top-level request field on
+  `/v1/chat/completions`, `/v1/messages`, `/v1/responses` and
+  `/v1/completions`. The request reads the prompt cache as usual and stores
+  nothing: no new cache entry, nothing written to `HALOGEN_CACHE_DIR`, and
+  every cached conversation left as it was. Use it for side requests, such
+  as a summarizer or a title generator, that share the server with a
+  conversation. Absent or `"default"` is the usual caching, and any other
+  value is a 400. Under memory pressure such a request still needs room like
+  any other, so it can make the server forget an idle conversation.
+- **A reply survives a dropped connection.** When a client disconnects in
+  the middle of a reply, the server pauses the reply for 20 seconds instead
+  of stopping it. If the same request arrives again in that time, as a
+  client's automatic retry does, the reply continues where it paused, and
+  what was already generated is sent first. At temperature 0 or with a
+  `seed`, the retried reply is the same as an uninterrupted one. A paused
+  reply gives up its slot at once when another request needs it. Some
+  harnesses resend a different request once part of the answer has reached
+  them, and that request starts fresh. `HALOGEN_RETRY_GRACE_S` sets the wait,
+  and `0` stops the reply at once, as before.
+- **Claude Code sessions**, opt-in. With `HALOGEN_FORK=1` and
+  `HALOGEN_FORK_MAP=claude-code`, the server keeps each Claude Code thread's
+  state (the main conversation and each subagent) and starts that thread's
+  next request from it, with nothing to set in Claude Code. Off by default.
+  See the README's *Sessions* section.
+
+### Changed
+
+- **A long prompt no longer holds up short requests** (#161, in part). A
+  short request that arrives while a long prompt is being read now runs
+  between two pieces of it instead of waiting for all of it, and a request
+  from a person goes ahead of queued agent turns (requests whose last
+  message is a tool result). Every reply is unchanged. A reply that is
+  already streaming still pauses while each piece of the long prompt is
+  read.
+
+### Fixed
+
+- **Claude Code's first request answered 400.** A current Claude Code asks
+  for its model's full output limit (128,000 tokens) on every request, above
+  this server's cap, so the README's setup failed at once unless
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS` was set. On `/v1/messages` such a request
+  now runs with the cap, and the server says so once in its log. The other
+  routes still refuse a `max_tokens` above the cap with a 400.
+- **`previous_response_id` without the history** (`/v1/responses`). This
+  server keeps no response store, and a request that sent only its new input
+  with `previous_response_id` was answered without its context. It is now
+  refused with a 400 that asks for the history. A request that sends its
+  history too is served as before.
+- **Clients that offer HTTP/2** (#165). Java's HTTP client, and editors
+  built on it, offer to switch every plain-HTTP request to HTTP/2. The server
+  answered over HTTP/1.1 as it should, but logged two misleading warnings per
+  request, one of them suggesting a WebSocket library. It now logs one plain
+  line per protocol, and the HTTP parser is pinned, so an added package
+  cannot change it.
+
+## 0.18.0
+
+Speech to text on the NPU, larger and non-square images, sessions a harness
+can keep and fork, and a prompt cache fix for clients that change their newest
+message every turn. The Flash checkpoints are unchanged. At temperature 0 the
+output is still byte-identical to serial greedy decode. For the reports:
+issues #152 ([@dardeaw](https://github.com/dardeaw)), #153
+([@FrancescoBrunoDev](https://github.com/FrancescoBrunoDev)) and #158
+([@Rutimka](https://github.com/Rutimka)).
+
+### Added
+
+- **Speech to text on the NPU** (#153). Name `qwen3-asr-0.6b` or
+  `qwen3-asr-1.7b` (Qwen3-ASR) in `HALOGEN_NPU_MODELS` and
+  `/v1/audio/transcriptions` answers on the same port, in OpenAI's shape. It
+  takes a WAV file of up to 20 minutes or 25 MiB, an optional `language` and
+  `prompt`, and `response_format` `json` or `text`. Any model name reaches the
+  loaded speech model, so a client that sends `whisper-1` works unchanged. See
+  the NPU page's *Speech to text* section.
+- **Images up to 1024x1024, square or not** (#152). `flux2-klein-4b` now draws
+  20 sizes, from 256x256 to 1024x1024, landscape and portrait included. `size`
+  takes `WxH`, and a size it does not serve is refused with the list. The
+  model's files changed, so start once with `HALOGEN_DOWNLOAD` set.
+- **Sessions: keep, fork and join**, opt-in. A client can keep a
+  conversation's state under a name and start several requests from it at
+  once, from inside a reply too (`HALOGEN_FORK=1`, off by default). See the
+  README's *Sessions* section.
+
+### Fixed
+
+- **Prompt cache: a client that changes or drops part of its newest message
+  on the next turn** (some agent harnesses add per-turn context there) now
+  continues in its own cache space instead of copying the whole prompt every
+  turn, and with `HALOGEN_CACHE_DIR` the disk cache no longer writes a full
+  copy of the conversation per request (#158). Two new `/metrics` series,
+  `halogen:cache_last_message_rewrites_total` and
+  `halogen:cache_disk_cut_back_total`.
+- **`steps` on image requests** (#152). The field was accepted and ignored.
+  FLUX.2-klein draws in four steps, so any other value is now refused with a
+  clear error.
+- **`/health` names every NPU model that is loaded.** `npu.loaded` listed
+  the first model's device files only.
+- **`flux2-klein-4b` read its prompt with its own tokenizer only when it was
+  listed first in `HALOGEN_NPU_MODELS`.** Listed after another NPU model, it
+  could draw from that model's reading of the prompt. It now always uses its
+  own.
+- **An image size that did not fit in the NPU's memory beside the other NPU
+  models stopped the server.** That request now gets an error and the server
+  keeps running.
+
+## 0.17.5
+
+Faster prompt reading and drafted decoding, prompt progress you can ask for
+on the stream, the prompt cache on `/metrics`, and fixes for long host memory
+stalls and for stopping the container. The checkpoints are unchanged. At
+temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports: issues #85 ([@zom-2018](https://github.com/zom-2018)),
+#156 ([@0x62ash](https://github.com/0x62ash)) and #157
+([@jane-alesi](https://github.com/jane-alesi)).
+
+### Added
+
+- **Prompt progress on the stream, opt-in.** Send `"return_progress": true`
+  on a streamed `/v1/chat/completions` or `/v1/completions` request and the
+  stream carries `prompt_progress` chunks while the prompt is read, before
+  the first token, in the shape llama.cpp's server sends: `total`, `cache`,
+  `processed` and `time_ms`. Without the field nothing changes.
+- **`HALOGEN_NEXT_TOKEN_S`** (#85): how long a stream waits between two
+  tokens before it answers 504. By default it now follows the engine
+  watchdog's own settings.
+- **The prompt cache on `/metrics`** (#156): hits, misses, prompt tokens
+  saved, entries, bytes and evictions, the disk tier's size and hits,
+  whether a request is waiting for room in the KV pool, whether the engine
+  is answering, and `halogen:build_info`. A scrape never stalls on a busy
+  engine. `/cache` keeps the full report.
+
+### Fixed
+
+- **A stream no longer fails with a 504 while the server is waiting out a
+  host memory stall it has not judged a wedge** (#85). The wait between two
+  tokens used to be a fixed 300 s, shorter than the watchdog's own patience,
+  so a request could fail seconds before the engine answered again.
+- **The startup note on a full host no longer suggests
+  `HALOGEN_FLASH_PIN_TRUNK=0` to checkpoints that refuse it** (#85).
+- **The stop path no longer depends on the image's files** (#157): on a
+  host whose runtime removes the container's root filesystem during a stop,
+  the grace periods and the after-exit memory check now still wait, and the
+  stop no longer logs ~190 errors.
+- **A stop you asked for exits 0.** Every stop of the default mode exited 1,
+  so a systemd unit logged a failure each time. A component that ends on its
+  own still exits 1.
+
+### Changed
+
+- **Prompts are read faster on both checkpoints, and drafted decoding is a
+  little faster.** Greedy output is unchanged. A fixed `seed` can give
+  different sampled text than on 0.17.4; each reply is still a sample from
+  the same distribution.
+- **The prompt cache saves new conversations faster** when many arrive, as
+  on a server shared by several agents.
+
+## 0.17.4
+
+API keys you can turn on, larger models on the NPU, and faster prompt
+reading on the default checkpoint. The Flash checkpoints are unchanged. At
+temperature 0 the output is still byte-identical to serial greedy decode.
+For the report behind the larger NPU models: issue #154
+([@nr23730](https://github.com/nr23730)).
+
+### Added
+
+- **API keys, opt-in.** Set `HALOGEN_API_KEY` (one key, or several separated
+  by commas) or `HALOGEN_API_KEY_FILE`, and every route but `/health` needs a
+  key, sent as `Authorization: Bearer <key>` or `x-api-key: <key>`, the way
+  the OpenAI and Anthropic clients already send one. Unset, nothing changes.
+- **Larger models on the NPU** (#154): `decider-4b`, `qwen3-embedding-4b`
+  and `qwen3-reranker-4b` by name in `HALOGEN_NPU_MODELS`, and fine-tunes of
+  Qwen3-Embedding-4B and Qwen3-Reranker-4B from a `/models` path, the way
+  the 0.6B fine-tunes load today.
+- **Your own classifiers on the NPU.** A Hugging Face sequence-classification
+  fine-tune of a supported size, loaded from a `/models` path, answers on
+  `POST /classify`.
+
+### Changed
+
+- **Prompts are read a little faster on the default checkpoint.** Their
+  results can differ from 0.17.3's in the last digits, as with any change of
+  kernel, so a near-tie token, or the text a fixed `seed` gives, can differ
+  too.
+- **The first token comes sooner on long conversations.** The server
+  prepares a long multi-turn history faster before it starts generating, most
+  on agent sessions with many messages. The prompt it sends is unchanged.
+- **Images and large embedding requests on the NPU are a little faster.**
+  The images and the embeddings themselves are unchanged.
+
+## 0.17.3
+
+Faster sampled decoding, request records you can turn on, and one fix for
+the prompt cache on disk. The checkpoints are unchanged. At temperature 0
+the output is still byte-identical to serial greedy decode.
+
+### Added
+
+- **Request records, opt-in.** Set `HALOGEN_RECORD_DIR` to a mounted
+  directory and the server keeps one JSON line per request it answers (the
+  API, the client, the request's sizes and settings, how it finished, its
+  tool calls and timings) and, by default, the text of the messages and the
+  reply, each message stored once however often a client resends it.
+  `HALOGEN_RECORD_TEXT=none` keeps the lines without any text;
+  `HALOGEN_RECORD_GIB` and `HALOGEN_RECORD_DAYS` bound the size and the age.
+  Nothing on a request's path waits for it. The API port has no
+  authentication, so on a server others can reach, their requests are
+  recorded too. The README's *Request records* section has the run line and
+  the file layout. Unset, nothing is written.
+
+### Fixed
+
+- **A server default no longer starts the prompt cache on disk cold.** With
+  `HALOGEN_CACHE_DIR`, setting a request default such as
+  `HALOGEN_ENABLE_THINKING` or `HALOGEN_TEMPERATURE` gave the cache a
+  configuration of its own, so conversations saved before were read again
+  from the start, and with `HALOGEN_CACHE_PRUNE_OLD=1` their files were
+  removed. Settings that only change how requests are read and answered no
+  longer count as a configuration of the cache.
+
+### Changed
+
+- **Sampled requests decode faster** when the server is generating one reply
+  at a time, most on code. Greedy requests are unchanged.
+- **A fixed `seed` gives different sampled text than on 0.17.2.** Each answer
+  is still a sample from the same distribution, and greedy requests are
+  unaffected. A `seed` reproduces a request served alone. Beside other
+  requests, or between a first request and a repeat that reads its prompt
+  from the prompt cache, a seeded reply can differ, and the README now says
+  so.
+
+## 0.17.2
+
+Faster decoding and faster long prompts, and one fix for clients that send a
+system message partway through a conversation. The checkpoints are
+unchanged. At temperature 0 the output is still byte-identical to serial
+greedy decode.
+
+### Fixed
+
+- **A system or developer message after the first turn is no longer refused
+  on Chat Completions.** It was a 400 naming the message's position. It is now
+  read as user text at its place, the way the Messages route already reads
+  one, so a client that re-sends its instructions partway through a
+  conversation keeps working and keeps its cached prefix. One that arrives
+  between a tool call and its results waits until the results end. An image
+  in a late system message is still refused.
+
+### Changed
+
+- **Decoding is faster**, most on code and in languages other than English.
+  The output is unchanged. The server uses about 0.3 GB more GPU memory for
+  it.
+- **Long prompts of new text are read faster**, most when several arrive
+  together or one arrives while other conversations are generating. The
+  output is unchanged.
+- **`HALOGEN_MTP_DEPTH` is unset by default.** Unset, the server chooses the
+  draft depth for each conversation. Setting it fixes one depth for every
+  request, as before; if you set it to 3 for code, unsetting it is now the
+  better all-round choice.
+
+## 0.17.1
+
+Two fixes for tool calling. The checkpoints and the speed are unchanged. For
+the reports behind them: issues #144
+([@elpablos](https://github.com/elpablos)) and #145
+([@superbarne](https://github.com/superbarne)).
+
+### Fixed
+
+- **A JSON schema with tools no longer loops on tool calls when thinking is
+  on.** With a schema and tools, a reply may start with free text before the
+  JSON. That text was cut off after 32 tokens, and the model then had to pick
+  between the JSON and a tool call, so a longer summary of a tool result was
+  cut mid-sentence and the model called the tool again, every turn. Chat
+  Completions and Messages with thinking on were affected. A reply that ends
+  its text on its own now goes straight to the JSON. The text may run to half
+  of what `max_tokens` leaves after thinking, up to 1024 tokens, so the JSON
+  always keeps room. If the limit is reached, the JSON is forced and a tool
+  call is no longer offered, so the worst case is a cut preamble, not a loop.
+  From issue #144 ([@elpablos](https://github.com/elpablos)).
+- **A nullable string argument stays a string.** A tool parameter declared as
+  `["string", "null"]`, or as an `anyOf` of string and null (what Pydantic
+  writes for every `Optional[str]`), came back as a number when its value was
+  all digits, so a company number or a postal code failed the client's check.
+  The server now takes the non-null type of a type list, `anyOf` or `oneOf`,
+  and prefers `string` when several remain. A literal `null` still comes back
+  as null. A parameter declared as `oneOf` integer or string now comes back as
+  a string. From issue #145
+  ([@superbarne](https://github.com/superbarne)).
+
+## 0.17.0
+
+Image generation on the NPU, and two conversations that speculate together.
+The checkpoints are unchanged. At temperature 0 the output is still
+byte-identical to serial greedy decode, alone or beside another conversation.
+For the requests behind it: issues #141
+([@xuyongroger](https://github.com/xuyongroger)) and #123
+([@Takayuki-Ishimaru](https://github.com/Takayuki-Ishimaru)).
+
+### Added
+
+- **Image generation on the NPU: `flux2-klein-4b`.** FLUX.2-klein-4B, converted
+  for the Ryzen AI NPU, answers OpenAI's `/v1/images/generations` beside the
+  Flash model: 256x256 or 512x512, one to four images a request, PNG as
+  `b64_json` or a data URL. A `seed` makes an image repeatable. Name it in
+  `HALOGEN_NPU_MODELS` like the other NPU models. It needs about 8 GB of the
+  host's memory. `quality: low` is refused for now. From issue #141
+  ([@xuyongroger](https://github.com/xuyongroger)).
+- **Two conversations speculate together.** When exactly two conversations
+  generate, the draft head now drafts for both, and one forward pass checks
+  both drafts. Before, the drafter stopped as soon as a second conversation
+  was generating. Each stream's output is what it would be alone, greedy or
+  sampled. When the joint rounds stop paying, the server decodes the pair as a
+  plain batch and tries again later. A request with a JSON schema decodes in
+  the plain batch. One conversation alone, and three or more, decode as
+  before. On by default, with no setting. From issue #123
+  ([@Takayuki-Ishimaru](https://github.com/Takayuki-Ishimaru)).
+
+### Changed
+
+- **Decode on new text is faster.** The n-gram lookup table's rows are read
+  ahead of their use. The output is unchanged.
+
+### Deprecated
+
+- **w4b still loads in 0.17.0.** 0.16.3 planned to stop loading it in this
+  release. That moves to a later one. It is still deprecated and still outside
+  our release testing.
+
+## 0.16.4
+
+One fix, in the server's streaming. The checkpoints and the engine are
+unchanged.
+
+### Fixed
+
+- **A streamed reply no longer sends whitespace around tool calls.** With two
+  or more tool calls in one reply, the streamed content carried the newline
+  between the calls, where the non-streamed reply's content was empty.
+  Whitespace at the start or end of a streamed reply on a request with tools
+  went out the same way. Streamed content now matches the non-streamed content
+  exactly, on `/v1/chat/completions`, `/v1/responses` and `/v1/messages`. The
+  tool calls themselves were always correct. Found in our own testing.
+
+## 0.16.3
+
+Five fixes, three additions and a deprecation. The checkpoints are unchanged.
+At temperature 0 the output is still byte-identical to serial greedy decode. A
+request that sends both a JSON schema and tools now answers differently, as
+the first fix below describes.
+
+### Fixed
+
+- **A request with both a JSON schema and tools no longer loops on tool
+  calls.** The schema bound the reply from its first token, so a model that
+  opens its answer with a sentence could only start the JSON or call a tool.
+  After a tool result it often called again, until the client's turn limit.
+  Now the reply starts free. A tool call is a tool call, and the JSON is held
+  to the schema from its first `{`. If the model would end its reply before
+  the JSON, it starts the JSON instead. A line written before the JSON is
+  dropped, so the content is the JSON alone. A schema whose root is an array
+  keeps the old behavior. `HALOGEN_SCHEMA_ESCAPE=off` restores the old
+  behavior for every schema. Found with the structured output scenarios of
+  [tool-eval-bench](https://github.com/SeraphimSerapis/tool-eval-bench).
+- **A conversation resumes from the longest prefix the disk cache holds.**
+  With `HALOGEN_CACHE_DIR` set, a short match in memory, such as a shared
+  system prompt, could hide a longer match on disk. That happened after a
+  restart, or once memory had dropped the conversation. The request then
+  processed again what the disk already held. The longest match now wins.
+  `HALOGEN_CACHE_DISK_DEEPEN=0` keeps the old order.
+- **Routine engine notices no longer count as errors in the container log.**
+  The prompt cache's eviction lines, the KV pool's relocation lines, the
+  per-request progress lines and the grammar lines were written to stderr,
+  which journald and most log readers record at error priority. A healthy
+  server showed thousands of "errors" a day. They now go to stdout. Failures,
+  refusals and warnings stay on stderr. From issue #133
+  ([@rihaku899](https://github.com/rihaku899)).
+- **Small embedding and rerank requests are no longer slower with batching
+  on.** The batched NPU pass pads to its bucket, so it costs the same for 2
+  inputs as for 8, and the server sent every group of 2 or more short inputs
+  through it, the leftover group of a larger request included. A group now
+  runs batched only when its inputs one by one would take longer, which in
+  practice means 6 or more inputs of up to 128 tokens, or 5 or more of up to
+  512. Small groups now run as single passes. A full batch of 8 is as fast as
+  before. Each result is bit for bit what it was, and
+  `HALOGEN_NPU_EMB_BATCH=0` still turns batching off. From issue #132
+  ([@Gobutsu](https://github.com/Gobutsu)).
+- **`ppl --json` and the other tool modes parse again past the native
+  context.** With `HALOGEN_CTX` above 262,144 the entrypoint printed its
+  max-tok notice, and its `HALOGEN_CACHE_FILE` notice with
+  `HALOGEN_CACHE_INPLACE=0`, on stdout ahead of the JSON object, so
+  `json.loads` failed. Both now go to stderr. Server mode is unchanged, since
+  both streams reach the container log. From issue #134
+  ([@arc-uri-el](https://github.com/arc-uri-el)).
+
+### Added
+
+- **`POST /v1/systemone`, the typed-question interface of TypeSafe's Jev, on
+  `decider-0.8b`.** Send a `state` and questions of type `choice`, `score` or
+  `noul`, and each answer carries its probabilities and a `confidence`. Each
+  question is one pass on the NPU. A client written for System One can point
+  at the server. There is no API key, and `model` can be any name, since the
+  decision model loaded runs it. A choice or score takes 2 to 10 options here,
+  where System One takes up to 255. See "System One questions" in the NPU
+  guide.
+- **`HALOGEN_ADMISSION_RESERVE`, an opt-in slot reserve for latency-critical
+  requests.** Set it to N and N of the engine's slots are held back from
+  requests that do not send the header `X-Halogen-Priority: 1`. A plain
+  request waits in the server's queue, and a request with the header is
+  admitted whenever a slot is free, so a turn a person is waiting on does not
+  queue behind agent background work. Nothing is preempted or cancelled, no
+  answer changes, and off (0) is the default. When it is on, `/health` reports
+  the reserve and the requests waiting on it, and `/metrics` adds three gauges
+  for the same. From issue #137 ([@Aleks-0](https://github.com/Aleks-0)).
+- **`docker-compose.npu.yml`, the NPU as one compose container.** The
+  two-container `docker-compose.yml` starts no NPU engine, because the NPU's
+  models are served from the same process group as the Flash model. The new
+  file runs the single container with the NPU device, the host's XRT and all
+  five NPU models, fetched by `HALOGEN_DOWNLOAD`. From issue #135
+  ([@nr23730](https://github.com/nr23730)).
+
+### Changed
+
+- **Decode with several streams at once is slightly faster.** The output is
+  unchanged, and `HALOGEN_PLE_PAR=0` restores the old path.
+
+### Deprecated
+
+- **The w4b checkpoint (`qwen38-flash-next-w4b.hgn`) is deprecated.** v2 has
+  been the default since 0.15.0, and ht43 is the opt-in alternative. 0.16.x
+  still loads w4b, but it has not been part of our release testing since
+  0.16.1. A later release will stop loading it, planned for 0.17.0. A volume
+  that holds only w4b already prints how to switch at startup. Put
+  `qwen38-flash-next-v2.hgn` and `qwen38-flash-next-ngram.hgn` in the volume
+  and start with `-e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2.hgn`.
+  With `HALOGEN_DOWNLOAD` set, that start fetches both files itself. The two
+  take about 110 GiB, a little less than w4b and its sidecar. They sit beside
+  w4b until it is removed, so remove w4b first if the disk is tight. The w4b
+  files stay on Hugging Face for older images.
+
+### Documentation
+
+- The NPU guide now gives the batching limits (up to 8 inputs of up to 512
+  tokens, padded) and when batching pays.
+- The NPU guide's Start command names all five NPU models, and the Moderation
+  and Generation sections say how those models are fetched. From issue #131
+  ([@tkajdro](https://github.com/tkajdro)).
+
+## 0.16.2
+
+Two new models on the NPU, a prompt cache that keeps more conversations, and
+faster NPU passes. The checkpoints are unchanged. At temperature 0 the output
+is still byte-identical to serial greedy decode.
+
+### Added
+
+- **Moderation on the NPU** with `qwen3guard-gen-0.6b` (Qwen3Guard-Gen-0.6B),
+  on OpenAI's route, `/v1/moderations`. `flagged` is the model's Unsafe;
+  `"strict": true` also flags Controversial. Each result adds `label` and
+  `label_scores`. A reply is checked in its conversation with `messages`.
+  Your own fine-tune runs by its `/models` path, as for the other models.
+  [docs/NPU.md](docs/NPU.md#moderation) has the request.
+- **Text generation on the NPU** with `qwen3.5-2b` (Qwen3.5-2B, thinking
+  off), on `/v1/chat/completions`, for summaries and other short jobs beside
+  the main model. Text only. Prompts up to 16,384 tokens.
+  [docs/NPU.md](docs/NPU.md#generation) has the request.
+
+### Changed
+
+- **The prompt cache keeps each conversation's latest point and a shared
+  system prompt** when it is full. Before, with more than about four
+  conversations taking turns, the shared system prompt was forgotten first
+  and a new conversation on it started cold, and past about eight each turn
+  fell back to the system prompt. `HALOGEN_CACHE_EVICT=0` keeps the old
+  order. `/cache` now counts the longer entries a hit replaces under
+  `dropped`, so `evicted` counts only what the cache forgot for room.
+- **The embedder, the reranker and the moderation model share one NPU
+  program**, so a host that serves more than one downloads it once. The
+  reranker now takes up to 4,096 tokens a pair.
+- **NPU embeddings, reranking and decisions are faster**, most on short
+  texts.
+
+## 0.16.1
+
+Fixes from three reports and our own testing, and faster decode. The
+checkpoints are unchanged. At temperature 0 the output is still
+byte-identical to serial greedy decode. For the reports behind it: issues
+#121 ([@g30ff1rl](https://github.com/g30ff1rl)), #126
+([@ndrewpj](https://github.com/ndrewpj)) and #127
+([@bastooky](https://github.com/bastooky)).
+
+### Fixed
+
+- **A burst of `/v1/embeddings` requests** (#127) now waits for room on
+  the NPU, up to `HALOGEN_QUEUE_TIMEOUT`, instead of answering 503 at once.
+  A request that still cannot get in answers 503 with `Retry-After: 5`, and
+  the rest of its inputs stop waiting. `HALOGEN_NPU_QUEUE` sets how much
+  work the NPU queues.
+- **An XRT library link that points at nothing inside the container**
+  (#126) is now named at start, with the mounts to use. This happens when
+  `/opt/xilinx/xrt/lib` holds links into the system library directory, as
+  hand-made links on Arch and CachyOS do. [docs/NPU.md](docs/NPU.md) covers
+  those distributions.
+- **With the prompt cache on disk (`HALOGEN_CACHE_DIR`)** (#121), a
+  conversation moved in memory while its copy was still being written could
+  restore another conversation's rows after a restart and answer wrongly.
+  The move now waits for the write.
+- **A request waiting for room** (#121) no longer forgets cached
+  conversations whose memory could not have made room for it, so they still
+  resume from cache. When nothing could make room, a request that resumes
+  from another conversation's cached prompt now runs in that space instead
+  of waiting for a running request to finish. That conversation then reads
+  its own history in again.
+- **`HALOGEN_MTP=0`** on its own stopped the server at start. It now starts
+  with prompt lookup off and says so.
+
+### Changed
+
+- **Decode is faster on both checkpoints**, most with several conversations
+  generating at once.
+- **The NPU models answer somewhat faster.** Their device files on the Hub
+  are new builds. The weights are unchanged. A volume that ran 0.16.0's NPU
+  models fetches the new files at its first start under `HALOGEN_DOWNLOAD`,
+  with the volume mounted read-write.
+- The NPU files download without the Hub client's progress bars.
+
+## 0.16.0
+
+Small models on the NPU, a smaller checkpoint you can opt into, and fixes
+from three reports and our own testing. The default checkpoint is
+unchanged. At temperature 0 the output is still byte-identical to serial
+greedy decode. For the reports behind it: issues #122
+([@semidark](https://github.com/semidark)), #123
+([@Takayuki-Ishimaru](https://github.com/Takayuki-Ishimaru)) and #124
+([@wszgrcy](https://github.com/wszgrcy), with
+[@pugant](https://github.com/pugant)'s numbers).
+
+### Added
+
+- **Small models on the Ryzen AI NPU**, beside the Flash model and behind
+  the same port: decisions (`decider-0.8b`), embeddings
+  (`qwen3-embedding-0.6b`, `/v1/embeddings`) and reranking
+  (`qwen3-reranker-0.6b`, `/v1/rerank`). Name them in
+  `HALOGEN_NPU_MODELS`, and `HALOGEN_DOWNLOAD` fetches their files. Your own
+  fine-tune of one of them runs from its directory on the models volume.
+  The host needs the NPU driver and XRT, and the GPU's fabric clock held
+  while the two work together. The server holds it itself when run as root
+  with `-v /sys:/host/sys`, and `deploy/host/` has a unit that holds it at
+  every boot for rootless podman. The Flash model runs somewhat slower while
+  the NPU works. See [docs/NPU.md](docs/NPU.md). Leave `HALOGEN_NPU_MODELS`
+  unset and nothing changes.
+- **`qwen38-flash-next-ht43.hgn`, a smaller checkpoint, opt in.** It holds
+  about 8 GiB less in memory than the default. Prompts are read somewhat
+  slower with it, and decode with the draft head a few percent slower.
+  Start with `HALOGEN_CHECKPOINT=/models/qwen38-flash-next-ht43.hgn`. The
+  default is unchanged.
+
+### Fixed
+
+- **A cancel or a disconnect during a long prompt** (#122) now stops it
+  within about a second. It used to wait until the whole prompt was read.
+  A non-streaming request whose client hung up was noticed only at its
+  first token. It is now noticed while the prompt is read too.
+  `HALOGEN_PREFILL_CANCEL=0` restores the old behaviour.
+- **`timings.draft_n` and `/metrics`' `draft_tokens_total`** (#124) now
+  count every token the draft head proposes. Since 0.14.0 the head proposes
+  up to two a round and the count took one, so the accepted count could
+  read above it.
+- **A one- or two-token prompt on `/v1/completions`** stopped the server,
+  in every release since 0.6.0.
+- The startup line on the default checkpoint no longer says "the bare
+  checkpoint runs". That checkpoint carries its own precision and needs no
+  sidecar.
+
+### Documentation
+
+- The README no longer says that speculating inside a batch was measured
+  to pay for two streams only (#123). It says only that it is not built.
+
+## 0.15.3
+
+Prompts are read faster. No weight change. At temperature 0 the output is
+still byte-identical to serial greedy decode.
+
+### Changed
+
+- **Prompts of every length are read faster on both checkpoints.** Their
+  results can differ from 0.15.2's in the last digits, as with any change
+  of kernel.
+
+## 0.15.2
+
+Fixes from four reports and our own testing, and short prompts read
+faster. No weight change. At temperature 0 the output is still
+byte-identical to serial greedy decode. For the reports behind it: issues
+#118 and #119 ([@citizenanalog](https://github.com/citizenanalog)), #120 and
+#121 ([@g30ff1rl](https://github.com/g30ff1rl)).
+
+### Changed
+
+- **Short prompts are read faster on the default checkpoint.** Their
+  results can differ from 0.15.1's in the last digits, as with any change
+  of kernel.
+
+### Added
+
+- **`HALOGEN_ADMIT_TICKS`** (#120) sets how many generation steps the
+  conversations already generating get between two pieces of a prompt being
+  read in beside them. Answers are unchanged; a larger value delays that
+  prompt's first token.
+- **`HALOGEN_PREFILL_KEEP_TRUNK`**, an opt-in that keeps the default
+  checkpoint's trunk unpacked in memory (about 5.5 GiB) so longer prompts
+  are read faster. The startup pool fit counts it, and the server refuses
+  to start rather than fail later when the memory is not there.
+
+### Fixed
+
+- **`bench` and `sweep` now send temperature 0** (#118). A server default
+  such as `HALOGEN_TEMPERATURE=0.7` had turned a run printed as greedy into
+  a sampled one, and the identity check then failed on correct output.
+- **`ppl` with `HALOGEN_VISION_TOWER=1` set** (#119) failed with
+  `checkpoint: cannot open 1`. The modes that never take images (`ppl`,
+  `niah`, `inspect`, `verify`, `bench`, `sweep`) now drop the setting and
+  say so.
+- **The line for a request waiting for room** (#121) now gives the free
+  positions, the largest free gap, and whether the room is missing or only
+  split.
+- **The startup `memory:` line counts the vision tower** when it is on. Its
+  scratch is added at the first image.
+- **On a kernel built without the GPU driver's shared virtual memory
+  support**, the refusal to register the model file now says so.
+- `HALOGEN_CK_OVERLAY=none` on a checkpoint with its own precision now says
+  it has no effect.
+
+### Documentation
+
+- **The kernel requirement is two properties, not a version:** AMD's two
+  gfx1151 fixes (Linux 6.18.4 or later, or Ubuntu's backports) and a kernel
+  built with `CONFIG_HSA_AMD_SVM`. Fedora kernels before 6.18.7-200 lack the
+  second (#37). "7.0 or newer" was an inference from one report.
+- The default checkpoint holds about 5.9 GiB less than 0.14's w4b with its
+  sidecar (3.5 GiB was against w4b's base file alone).
+- The README's speed table is labelled as w4b's measurements.
+
+## 0.15.1
+
+Fixes from four reports, and the Anthropic Messages API. No weight change.
+At temperature 0 the output is still byte-identical to serial greedy
+decode. For the reports behind it: issues #112
+([@tatianyi](https://github.com/tatianyi)), #114
+([@disarticulate](https://github.com/disarticulate)), #115
+([@xuyongroger](https://github.com/xuyongroger)) and #117
+([@kripper](https://github.com/kripper)).
+
+### Added
+
+- **The Anthropic Messages API.** `POST /v1/messages` and
+  `POST /v1/messages/count_tokens` let Claude Code and the `anthropic` SDKs
+  use the server directly. Set `ANTHROPIC_BASE_URL` to the server and any
+  API key. Streaming, tool calls, thinking blocks, `system` turns inside
+  `messages` and images (with the vision tower on) all work. A thinking
+  block's signature carries the reasoning, so a block the client sends back
+  replays exactly what the model wrote, even when its display was omitted.
+  A request's last `cache_control` mark becomes one more place the prompt
+  cache can resume from. `/v1/models` carries the Messages model fields.
+- **`repetition_penalty`, with vLLM's rule.** Tokens already in the prompt
+  or the reply are made less likely. It runs after `logit_bias` and before
+  the presence and frequency penalties. It applies to sampled requests, and
+  a greedy request that sends a value other than 1 is a 400.
+  `HALOGEN_REPETITION_PENALTY` sets a server default. The field used to be
+  accepted and ignored.
+- **`HALOGEN_THINKING_BUDGET_MESSAGE`** (#114) sets the sentence the server
+  writes before `</think>` when it closes the think block itself. That
+  happens at the thinking budget, at the answer room and at the end-of-turn
+  guard. Unset, the sentence is Qwen's, as before.
+- **`reasoning_effort: "max"`** is accepted and means `xhigh`. It was a 400.
+
+### Fixed
+
+- **The startup pool fit sized the working memory about 8 GiB too high**
+  (#117), so a pool that fits came out halved. With #117's settings the
+  default checkpoint now gets 524,288 positions, and 1,048,576 with
+  `HALOGEN_MAX_TOK=16384`. The fit reads from the checkpoint whether its
+  experts need w4b's fixed scratch. The container's pre-flight estimates
+  use the same figures, and its GTT check no longer refuses a host that
+  has the room.
+- **A chat request with thinking off counts no reasoning tokens** (#115).
+  A reply that wrote `</think>` as text, such as a translation of a
+  document that quotes it, reported everything before it as reasoning. The
+  text itself was already all in `content`.
+- **`HALOGEN_VISION_TOWER=0` turns the tower off.** It used to exit the
+  container, because 0 was read as a file path. `no`, `false` and `off`
+  work too.
+- **The penalties stay current on a very long reply.** Past about 20,000
+  distinct tokens the penalty list stopped updating without a word. It now
+  holds the whole vocabulary.
+
+### Documentation
+
+- Claude Code and the Messages API, `repetition_penalty`, and the thinking
+  block's closing sentence.
+- The presence and frequency penalties count the thinking block, so a
+  frequency penalty of 1.0 garbles a long reasoning reply (#112).
+- A document that quotes the chat markers can end a reply early, and how
+  to send one (#115).
+- Three host notes: Fedora's SELinux and `/dev/kfd`, the ACPI power
+  profile, and hardware queues beside other GPU servers.
+- The memory figures in the pool and sharing tables are 0.15.1's startup
+  lines.
+
+## 0.15.0
+
+A new default checkpoint. At temperature 0 the output is still
+byte-identical to serial greedy decode.
+
+### Changed
+
+- **The default checkpoint is `qwen38-flash-next-v2.hgn`.** It is one file
+  with no sidecar. It stays closer to the original model's outputs than
+  0.14's checkpoint and its sidecar, and it holds about 3.5 GiB less in
+  memory. The model's lookup table is now its own file,
+  `qwen38-flash-next-ngram.hgn`, beside it. A start with `HALOGEN_DOWNLOAD`
+  set fetches both.
+- **An upgrade keeps the checkpoint you already have.** With
+  `HALOGEN_CHECKPOINT` unset, a volume that holds
+  `qwen38-flash-next-w4b.hgn` and not v2 goes on serving w4b and downloads
+  nothing. The startup log says how to switch. A new, empty volume gets v2.
+- **`HALOGEN_FLASH_PIN_TRUNK=0` applies to w4b only.** v2 refuses it at
+  startup and says so.
+
+### Fixed
+
+- **`halogen verify` and `halogen inspect` read v2.**
+
+## 0.14.2
+
+Fixes from two reports. No weight change. At temperature 0 the output is
+still byte-identical to serial greedy decode. For the reports behind it:
+issues #112 ([@tatianyi](https://github.com/tatianyi)) and #113
+([@charti](https://github.com/charti)).
+
+### Fixed
+
+- **An image in a Responses tool result reaches the model as an image.** A
+  `function_call_output` whose `output` is a content array (a text part and
+  an `input_image`, as a coding agent's file-read tool returns a
+  screenshot) was turned into JSON text, so the image's base64 was read as
+  hundreds of thousands of text tokens and the request was refused as too
+  long. It is now rendered as the chat route already rendered a `tool`
+  message with an image.
+- **A sampled reply can no longer spend its whole budget on a loop of
+  `<|im_end|>` markers inside its reasoning.** The server keeps at most 16
+  end-of-turn tokens as text inside the think block (kept since 0.13.4).
+  The 17th closes the block with the same closing text the thinking budget
+  uses, and the model answers. `usage.completion_tokens_details.reasoning_closed_by`
+  is then `end_of_turn_guard`. Without a thinking budget or answer room on
+  the request, the 17th ends the turn.
+
+### Changed
+
+- **A sampled request that omits `top_k` or `top_p` now uses the model's
+  values, 20 and 0.95** (from its `generation_config.json`), as vLLM does.
+  Before, an omitted filter meant no filter, and at temperature 1 with a
+  presence penalty the output could drift into mixed-script text. A value
+  the request sends still wins, and so do `HALOGEN_TOP_K` and
+  `HALOGEN_TOP_P`. `HALOGEN_TOP_K=0` and `HALOGEN_TOP_P=1` restore the old
+  unfiltered default. Greedy requests are unchanged. `/health` reports the
+  values in force under `sampling.filter_defaults`.
+- **With the vision tower off, `/v1/responses` refuses a tool result that
+  carries an image** (400, naming `HALOGEN_VISION_TOWER`), as the chat
+  route already did. It used to serve the base64 as text.
+- **A tool result array with only text parts is rendered as its text**, not
+  as JSON.
+
+## 0.14.1
+
+Fixes from two reports, and a faster prefill. No weight change. At
+temperature 0 the output is still byte-identical to serial greedy decode.
+For the reports behind it: issues #110
+([@loonylabs-dev](https://github.com/loonylabs-dev)) and #111
+([@apartje](https://github.com/apartje)).
+
+### Fixed
+
+- **A `stop` string no longer matches an `<|im_end|>` the server kept as
+  text inside the model's reasoning** (kept since 0.13.4), so a client that
+  sent the model's end tokens as stop strings no longer gets an empty turn.
+  With no tools to call, a reply that writes a `</tool_call>` in its
+  reasoning keeps thinking instead of ending empty. An empty stop string is
+  ignored instead of failing the request.
+- **`continue_final_message` returns only what it generated.** With tools
+  declared, the partial used to be repeated at the start of `content`, and
+  a tool call the partial had already closed was made again. A call the
+  partial opened and the continuation closed is still made, and so is a
+  call the model writes inside its reasoning when the continued message
+  ends there.
+- **`continue_final_message` with thinking on answers in `content`** when
+  the prompt ends outside the think block. The continuation used to come
+  back as `reasoning_content` with `content` empty, and the thinking budget
+  could write its closing sentence into it.
+- **Q5_0 is read.** 0.14.0 said a GGUF whose lookup table is Q5_0 was
+  read, but the type check refused Q5_0 before the table was reached. Q5_0
+  is now read exactly on every tensor a `llama-quantize` Q4_K_M or Q4_K_S
+  stores it on, and so is a K-quant `ssm_out`, stored as the bf16 the
+  engine computes it in. A public Q4_K_M of this model now converts with
+  nothing refused. `Q6_K` on `ssm_out` is still refused.
+
+### Changed
+
+- **Prefill uses a new routed-expert kernel.** It is groundwork for
+  upcoming format changes, and prompts process faster. Prefill numerics
+  change at rounding level on prompts of 64 tokens or more, so logprobs
+  and near-tie tokens can differ slightly from 0.14.0. A fixed `seed` can
+  give different text than on 0.14.0 for the same reason.
+
+## 0.14.0
+
+Fixes and one addition from five reports, and a better draft head. No weight change. At
+temperature 0 the output is still byte-identical to serial greedy decode,
+and the same as 0.13.8's. For the reports behind
+it: issues #104 ([@OffsiteGuru](https://github.com/OffsiteGuru)), #106 and
+#107 ([@loonylabs-dev](https://github.com/loonylabs-dev)), #93
+([@tatianyi](https://github.com/tatianyi)) and #108
+([@jtsylve](https://github.com/jtsylve)).
+
+### Fixed
+
+- **A streamed chat completion now opens with the role.** No chunk carried
+  `delta.role`. Clients that take a chunk's role from it, such as
+  LangChain's OpenAI client (and so LibreChat), treated every chunk as a
+  generic message and silently dropped tool calls. The first chunk is now
+  `{"role": "assistant", "content": ""}`, as OpenAI, vLLM and llama.cpp
+  send. `/v1/completions` and `/v1/responses` are unchanged.
+- **A request that a stop string ends now reports its real timings.**
+  `timings.prompt_ms` and `predicted_ms` read 0 and `cached_tokens` was
+  missing. They are now the engine's own figures, and the request line and
+  `/metrics` count the request. A stop string made of several tokens could
+  also leave its first pieces at the end of the text. It no longer does.
+- **The GGUF importer applies its conversions for every tensor type.** Three
+  conversions (the DeltaNet value-head order, `ssm_a` to `A_log`, and the
+  +1 norms) were applied for some tensor types and skipped for others, so a
+  GGUF built with an unusual recipe could load with wrong weights and no
+  error. Every community file we know of used the handled types.
+- **A GGUF whose lookup table is Q8_0, Q5_0 or Q5_1 is read as stored.**
+  `convert` refused such a file. Serving one directly was worse: the table
+  was read as IQ4_NL whatever its type. A Q4_K_M, Q5_K or Q6_K recipe
+  produces one of these three types, so the model received wrong n-gram
+  embeddings with no error. Both paths now read the three types, and refuse
+  a type they do not know.
+
+### Added
+
+- **Per-request disk restore figures.** With `HALOGEN_CACHE_DIR` set,
+  `timings.disk_restore_n` and `timings.disk_restore_ms` say how many
+  tokens of the cached prefix came from disk and how long the restore took.
+  Both are 0 for a RAM hit.
+- **Why a request missed the cache.** When a request prefills 1,024 tokens
+  or more, the request line names the closest earlier request and where the
+  two part ways: the prompt differs, the reply differs, or the whole earlier
+  request is a prefix the server no longer holds. `timings.prefix_n` gives
+  the shared length.
+- **The host is checked before anything is downloaded or loaded.** A
+  container started without `--device /dev/kfd`, on WSL2, or on a GPU that
+  is not Strix Halo's is refused at once with the flag or the reason. A
+  download is refused, before its first byte, when the volume lacks the room
+  for it.
+
+### Changed
+
+- **The draft head reads the model's four residual streams as the reference
+  implementation does, and drafts two tokens ahead.** It proposes more
+  tokens that the model accepts: 2.47 committed a round against 1.68. On
+  ten served prompt shapes that is 52.3 tokens per second against 44.4
+  (+18%), and 46.0 against 39.9 (+15%) at 32,000 tokens of context,
+  measured on the reference machine in one session with 0.13.8.
+  `HALOGEN_MTP_DEPTH` sets how many tokens it proposes (default 2; 3 is
+  faster on code generation and slower on agent and prose traffic). The
+  output at temperature 0 is unchanged by either.
+- **`HALOGEN_DOWNLOAD` fetches only what the chosen checkpoint needs**: the
+  checkpoint, its quality sidecar, the vision tower and the tokenizer. The
+  speed sidecar is no longer fetched, and the GGUF draft head is fetched
+  only when a GGUF needs it, as before.
+- **A fixed `seed` gives different text than on 0.13.8** when the draft head
+  is on. The drafts changed (the wiring above, and a fix so a request
+  served from the prompt cache drafts exactly as its cold run did), and a
+  speculative sample depends on its drafts. Each answer is still a sample from the same
+  distribution, and greedy requests are unaffected.
+- **The memory fit uses the checkpoint's real size** (67.99 GiB with its
+  sidecar, not an assumed 67.7). On a 128 GB machine with
+  `HALOGEN_VISION_TOWER=1` the KV pool now starts at 262,144 positions
+  instead of 524,288, which still holds one conversation at the full
+  262,144 context. Other settings that take a few GiB more can do the same;
+  the startup log's `kv pool:` line says which pool you got.
+
+## 0.13.8
+
+One addition from a request. No weight change, and nothing changes for a
+request that does not ask for it. For the request behind it: issue #100
+([@felladrin](https://github.com/felladrin)).
+
+### Added
+
+- **Logprobs at temperature 0, and `top_logprobs`, on the first generated
+  token.** A classifier reads the next-token distribution over a few labels
+  from one forward pass. `logprobs: true` now works at `temperature: 0`, and
+  `top_logprobs` (1 to 20, at any temperature) lists the most likely
+  alternatives, both for the first generated token, so such a request sets
+  `max_tokens: 1`. A request that would need them past the first token is
+  refused with a 400 that says so. A sampled request without `top_logprobs`
+  still carries the chosen token's logprob on every token, as before. On
+  `/v1/chat/completions` and `/v1/completions`, not streamed. The README's
+  Sampling section shows the request shape, with an answer prefix continued
+  by `continue_final_message`.
+- **Each logprob entry names its token.** `token` and `bytes` were `null`;
+  they now carry the token's text and bytes.
+
+### Documentation
+
+- **`:latest` on a machine that already has it.** `run` never refreshes a
+  local tag, so a copy pulled months ago keeps starting. The README now says
+  so and shows `--pull=always` and `podman pull`. Reported in #102
+  ([@mqtt-fan](https://github.com/mqtt-fan)).
+
+## 0.13.7
+
+One tool-calling fix from a report. No weight change, no kernel change,
+nothing in the engine's numerics. For the report behind it: issue #101
+([@fLiPs-fly](https://github.com/fLiPs-fly)).
+
+### Fixed
+
+- **A whole-number argument to a `"number"` parameter went out as a
+  float.** The model writes tool arguments as plain text and the server
+  turns each into JSON by the parameter's declared type. For `"number"` it
+  always made a float, so `30000` reached the client as `30000.0`. Clients
+  that read such a parameter into an integer type reject that: Codex CLI
+  answered "invalid type: floating point `30000.0`, expected usize", and
+  the model retried the same call: 515 rejected calls in the reporter's
+  session. A whole number now stays a whole number, and a value written
+  with a decimal point or an exponent keeps it. This holds on
+  `/v1/chat/completions` and `/v1/responses`, streamed or not.
+- **`nan` or `inf` in a numeric argument produced invalid JSON.** They were
+  written as `NaN` and `Infinity`, which JSON does not have, so a strict
+  client rejected the whole call. They now arrive as the text the model
+  wrote, which the client's own checks can name.
+- **`7.0` for an `"integer"` parameter went out as `7.0`.** It now goes out
+  as `7`.
+
+## 0.13.6
+
+One serving fix from a report. No weight change, no kernel change, nothing
+in the engine's numerics. For the report behind it: issue #89
+([@loonylabs-dev](https://github.com/loonylabs-dev)).
+
+### Fixed
+
+- **`/v1/chat/completions` could stop after announcing a step, with no
+  tool call, deep into a long agent session.** Some clients send a turn's
+  text and its tool calls as two assistant messages, the text first and
+  then a message with only the calls. The server rendered those as two
+  turns, the first one closed right after "Now the changes to the command
+  itself:", so a long history taught the model that an announcement ends a
+  turn, and it copied that more often the longer the session ran. It is
+  the same defect 0.13.5 fixed on `/v1/responses`, whose note said Chat
+  Completions clients were not affected: that held only for clients that
+  send each turn as one message. Consecutive assistant messages are now one
+  turn on both routes. Measured on one of our own agent sessions past 100k
+  tokens, sent with the history split that way, resuming each of 14
+  announcements 10 times at temperature 1.0: 85 of 140 ended the turn after
+  the colon on 0.13.5, and 0 of 140 on this release. The bare checkpoint
+  does it as much as the default with the quality sidecar, so switching the
+  sidecar off does not avoid it.
+
+## 0.13.5
+
+Two serving defects from reports, three fixes to the checkpoint tools, and
+a Quickstart note. No weight change, no kernel change, nothing in the
+engine's numerics. For the reports behind it: issue #99
+([@smazurov](https://github.com/smazurov)), #97
+([@loonylabs-dev](https://github.com/loonylabs-dev)) and #95
+([@jarekjaryszew](https://github.com/jarekjaryszew)).
+
+### Fixed
+
+- **`/v1/responses` could stop after announcing a step, with no tool
+  call.** A Responses client sends a turn's progress text and its function
+  call as separate items. The server replayed them as two assistant turns,
+  the first one closed right after the text, so a long history taught the
+  model that "Reading `report.py` now." ends a turn, and it copied that.
+  A turn's text and all of its calls are now one assistant turn, exactly
+  as the same history renders on `/v1/chat/completions`. On the reporter's
+  request: 0 of 3 runs made the call on 0.13.4, 3 of 3 on this release.
+  Chat Completions clients were not affected.
+- **The prompt cache could forget a live conversation to keep a request's
+  own stale entries.** When a conversation asks a new question behind the
+  same document (a harness's side query does this), its resume point is
+  an earlier entry, and the entries of its previous turn sit past it in
+  the same memory. Since 0.13.3 the server would not drop those entries
+  under pressure (the #94 fix, where such entries are another
+  conversation's live history), and it could not move neighbours to make
+  room either, so it forgot the least recently used conversation instead,
+  a 192k one in the report, and each of those forgets the next. Those
+  entries now go first when they are older than that conversation and
+  cheaper to lose than it is to rebuild, and then the no-loss moves apply.
+  #94's case is unchanged: a conversation still being served is newer than
+  any idle one. Measured here on the previous release with three live
+  conversations beside one asking a new question each turn: 12 regions
+  forgotten and every live one cold from the second question; on this
+  release none. The engine log says `forgot the N entries longer than the
+  hit` when it happens.
+- **`ppl` exited 1 without a checkpoint's tuning plan.** Under
+  `-e HALOGEN_MATMUL_TUNING_FILE=` (the no-plan option) a line reached
+  standard output ahead of the JSON. It now exits 0 and `--json` parses.
+- **`ppl --out` wrote nothing.** The per-position NLL file was never handed
+  to the engine. It is now, and it matches the `--ref-out` dump of the same
+  run position by position.
+- **`HALOGEN_BF16_OVERRIDE` engaged silently.** Startup now prints how many
+  tensors it replaced and how many GiB, or that the pattern matched none.
+
+### Documentation
+
+- **The Quickstart starts with the BIOS carve-out.** Set the UMA frame
+  buffer to its explicit minimum, not Auto (#95).
+
+## 0.13.4
+
+One defect, the largest open one in the tracker: agent turns that came back
+empty. No weight change, no kernel change, and nothing in the engine's
+arithmetic: a reply is identical to 0.13.3's up to the token where 0.13.3
+would have ended it. For the report behind it: issue #84
+([@rba](https://github.com/rba)), whose reproduction bundle and his own
+count of 30 failures by shape made this a direct fix.
+
+### Fixed
+
+- **An agent turn could end with nothing in it.** 15-25% of one agent's
+  turns came back `finish_reason: "stop"` with no content, no tool call and
+  every generated token in `reasoning_content`. The tokenizer has a single
+  token for `<|im_end|>`, the marker that ends a turn, so when the model
+  quoted a ChatML chat template in its reasoning (the session was writing
+  one) it wrote the real end-of-turn token and the server ended the reply
+  mid-sentence. The quoted `<|im_start|>` beside it was dropped from the
+  text too, which is why the cut read like plain truncation. Inside the
+  thinking block that token is now kept as text and generation goes on,
+  and inside an open tool call it is kept up to four times a reply, so a
+  template written through a file-writing tool is written whole. The
+  second half of the same report: nearly half of the reporter's failures
+  were a model that wrote a complete tool call **inside** its thinking
+  block and then ended its turn on it, so the call sat in
+  `reasoning_content` and the client had nothing to run. That call is now
+  made (`finish_reason: "tool_calls"`); its text also stays in the
+  reasoning, where it had already been streamed. Measured here on the
+  reporter's public request, 40 seeds at the card's sampling: 8 empty
+  replies on 0.13.3 (4 of each kind), 0 on this release, every one of the
+  8 now a tool call, and none of the 32 that already answered came back
+  empty. A kept `<|im_end|>` and a quoted
+  `<|im_start|>` appear in the text literally.
+  `usage.completion_tokens_details` carries `end_of_turn_kept` and
+  `tool_call_from_reasoning` when either happened, the log's request line
+  says `end of turn kept as text`, `/health.end_of_turn_guard` says whether
+  it is on, and `HALOGEN_EOS_GUARD=0` restores 0.13.3's behaviour. An
+  end-of-turn token in the answer itself still ends the reply, so #89 (the
+  checkpoint ending turns mid-prose at very long context) is a separate
+  issue and stays open.
+
+## 0.13.3
+
+A prompt-cache regression that cost a busy server whole conversations, a
+chat field that was being dropped without a word, and a startup refusal
+that could not see its own cause. No weight change, no kernel change,
+nothing in the engine's numerics. For the reports behind it: issue #94
+([@phantomii](https://github.com/phantomii) and
+[@davidberardozzi](https://github.com/davidberardozzi)), #96
+([@Gobutsu](https://github.com/Gobutsu)), #95
+([@jarekjaryszew](https://github.com/jarekjaryszew)) and #88
+([@JonRickSanchez](https://github.com/JonRickSanchez)).
+
+### Fixed
+
+- **A conversation could lose its history to another conversation's
+  request.** When several conversations share one system prompt, each
+  stores a resume point at the end of that system block, and those points
+  are identical: same length, same tokens. A conversation whose own
+  history had been evicted would match one of those shared points inside
+  **another conversation's** memory, and the server, which had no way to
+  tell whose memory it had just landed in, would discard that
+  conversation's history and take the space, before it had considered
+  giving up any idle space at all. The robbed conversation then did the
+  same to a third one on its next turn. The effect on a busy server is
+  that a long conversation stops advancing: it resumes from the same early
+  point every turn while its prompt keeps growing, so the share it has to
+  re-read climbs with every turn, and the wall time with it. Measured here
+  on the previous release with five conversations sharing a system prompt:
+  the long one resumed 7,552 rows of 18,490 it could have resumed (41%)
+  by its third turn; on this release it resumes all of them, and the
+  server gives up idle space instead (the engine log's "cheapest" drops go
+  from 10 to 0 over the same run, and the no-loss move that never fired
+  once now does). A gate cell now runs five conversations against a shared
+  system prompt, which no gate here had ever done.
+- **`continue_final_message` did nothing.** Sending a partial assistant
+  message back with `continue_final_message: true` did not resume it: the
+  field was not declared, so it was discarded before anything read it, and
+  every request rendered a fresh assistant turn. With plain text that is
+  invisible, because a new turn that carries on the sentence looks like a
+  continuation. With a tool call cut off by `finish_reason: "length"` it is
+  not: the model opened a second call and rewrote the arguments from the
+  start, so a file bigger than `max_tokens` could never be finished. The
+  field now works, and so does `add_generation_prompt`. A resumed tool call
+  comes back as one finished call carrying the arguments the client had
+  already sent. Sending `continue_final_message` without a trailing
+  assistant message, or together with `add_generation_prompt: true`, is now
+  a 400 rather than silence.
+- **A refusal to start on a machine with a memory carve-out now says so.**
+  On a host whose firmware reserves a large block of RAM for the integrated
+  GPU, the server would refuse to start with a message about free GTT and
+  no way to see why GTT was small. The carve-out is taken before Linux
+  boots, so nothing on the host reports the memory as missing, and the
+  operator is left freeing memory that was never in use. The engine has
+  had a check for this for some time, but it ran after the weights loaded,
+  which is after this refusal. The refusal now names the carve-out, the
+  total it produced, and the BIOS setting to change.
+
+### Added
+
+- **`HALOGEN_CACHE_BRANCHES`** (default 2) sets how many branches of one
+  conversation the cache keeps resume points for. Two is a conversation
+  and one side turn. **Three is a parent forked into two children**, which
+  is what a harness fanning out subagents runs; on two, the parent's
+  resume point is the one dropped when the children store theirs. Raising
+  it costs host memory in whole entries (about 111 MiB each) and raises
+  the entry cap with it: 3 gives about 3.5 GiB of prompt cache against
+  2's 2.7. The entry cap's default is now derived from this rather than
+  set by hand beside it, which is the mistake behind the first half of
+  #94, and a `HALOGEN_CACHE_ENTRIES` too small to hold one conversation's
+  worth per slot now says so at startup instead of quietly costing a
+  conversation its history.
+### Documentation
+
+- **`:latest` exists, and the Quickstart still pins a version.** Every
+  release publishes `ghcr.io/peonist-ai/halogen-flash-server:latest`. The
+  Quickstart names a version because a pinned tag is what makes a bug
+  report answerable and a bad release reversible; the README now says
+  both, and which to use where.
+
+## 0.13.2
+
+One opt-in flag on the engine's memory behaviour, the download's progress
+line, and three README corrections measured on a second machine. No weight
+change, no kernel change, nothing in the engine's numerics (the flag's
+output is byte-identical with it on or off; the bitwise gate and the
+six-fixture gate ran both ways). For the two reports behind it, issue #83
+([@noguespi](https://github.com/noguespi)) and issue #85 / #71
+([@YanissAmz](https://github.com/YanissAmz)); the flag is the thing to
+run there, and it is opt-in until they have.
+
+### Added
+
+- **`HALOGEN_WEIGHTS_LOCK=1` locks the weights in memory.** The weights
+  are registered with the GPU as ordinary file-backed memory, which the
+  kernel is free to reclaim, and this server streams a 47 GiB lookup table
+  through the same file cache on every request. On a host with room the
+  kernel leaves the weights alone (measured on a stock 128 GB machine over
+  a 90-minute soak: not one weight page reclaimed while 16 GiB of table
+  rows came and went), but on a host that is short it reclaims weight
+  pages to make room, and every one of those costs the GPU driver a
+  teardown and restore of the engine's mapping. That cycle is the shape of
+  the stalls in issue #85 and the read faults in issue #83. With the flag
+  set the server `mlock`s every weight range it registers (the checkpoint,
+  the quality sidecar, the vision tower, a GGUF's repacked trunk and its
+  draft head; never the lookup table), which takes them out of the cycle.
+  Measured: a 20 GiB co-tenant silenced the unlocked server from its first
+  request and the watchdog took it down after 15 minutes; a 12 GiB
+  co-tenant beside the locked server, under 1 GiB left on the host, got
+  81 of 81 requests at about 5 percent longer walls. A co-tenant that asks
+  for more than the host has left now triggers the OOM killer, which picks
+  the largest resident set, i.e. this server: the container exits with
+  status 137 within seconds instead of a 15-minute silence, and comes back
+  under a restart policy. Fast and legible, not a way to share the host. Costs: a fraction of a
+  second at startup over already-resident pages (0.6 s for 65.6 GiB in 252
+  ranges on the reference machine; the line `checkpoint: locked ...` says
+  how long, and what `Mlocked` and `MemAvailable` did), and `free` and
+  `MemAvailable` finally drop by the size of the weights, so the startup's
+  second host-memory line (the correction for tools that count locked
+  weights as free) is not printed because it is no longer needed. It needs
+  the memlock limit to cover the weights, and `--ulimit memlock=-1:-1` on
+  the run line is not enough on its own: a rootless container cannot
+  exceed the user's hard limit, which on Ubuntu is 8 MiB by default
+  (measured: the lock failed after 0 bytes on a fresh Ubuntu 26.04 host
+  with the README's exact line). The README says what to put in
+  `/etc/security/limits.conf`; the container warns before the load when
+  it can see the limit is short, the engine prints the limit it has and
+  the same fix if the lock fails, and it runs unlocked either way. Memory the kernel can still move by compaction is not held by
+  this flag; if that turns out to matter on the reporters' hosts, the next
+  step is a pinned allocation under another value of the same flag.
+
+### Fixed
+
+- **The download's progress line counts bytes, not files.** The Hub
+  client's own bar counts files, and sat at `12/14` for the seventeen
+  minutes the 115 GiB checkpoint took on a fresh machine. The container now
+  prints how many gigabytes have arrived and the average rate every 30 s,
+  and drops the client's version nag, its CLI advertisement, its lock-wait
+  chatter and its unauthenticated-request warning from the log.
+
+### Documentation
+
+- **The Quickstart failed as written on Podman.** Podman refuses a bind
+  mount whose source directory does not exist (`statfs ~/halogen-models:
+  no such file or directory`) where Docker creates it; the block now starts
+  with `mkdir -p ~/halogen-models`. Measured on a fresh Ubuntu 26.04
+  install; the same fix in AGENTS.md.
+- **`amdgpu.gttsize` and `ttm.pages_limit` are not required.** The README
+  said their defaults had not been measured. They have now: on a second
+  128 GB machine on a stock kernel command line, the kernel's default GTT
+  (half of RAM) served the Quickstart at the shipped defaults with room to
+  spare, because the weights are registered host memory and do not count
+  against it.
+- **The BIOS carve-out advice was wrong for at least one board.** "Auto or
+  its minimum, about 512 MiB" is true of the reference machine; on a GMKtec
+  EVO-X2, Auto is 64 GiB and the OS saw 61 GiB until the setting was
+  changed to its explicit minimum (2 GB there). The README now says to set
+  the minimum, not Auto.
+
+## 0.13.1
+
+Front end, entrypoint and one line on the engine's socket path. No weight
+change, no kernel change, nothing in the engine's numerics. One report,
+issue #90 ([@AdrianMcAteer](https://github.com/AdrianMcAteer)).
+
+### Fixed
+
+- **The front end could silently serve a 32,768-token context, and one
+  slot, while the engine was correctly at `HALOGEN_CTX`.** It learns the
+  context, the slot count and every feature it advertises from the engine's
+  capability line at connect, with a 5 s budget, and on a miss it fell back
+  to its own command-line default (32,768, which the entrypoint never
+  overrode) for the life of the container: `/health.context` read 32768
+  and a longer prompt got "the prompt does not fit". Nothing said so
+  except the startup line's `engine version unknown`. The report did not
+  reproduce as filed on 0.12.3 (the same environment reads 131072 here and
+  admits a 60k prompt; 0.12.1 to 0.12.3 changed nothing on that path), but
+  the fallback was reachable: the engine answered that line only on its
+  bound session, so a probe queued behind one waited for the session to
+  end, not for the request (measured at 180 s behind a 46 s prefill), and a
+  host that stalls the engine past 5 s at that moment has the same effect.
+  Now the engine answers the capability line on a queued connection the
+  way it answers the health `PING`; the front end makes three attempts,
+  prints `serve_api: capability probe FAILED` naming what it is serving on,
+  re-probes on the next request and prints `capability probe recovered`;
+  `/health` reports `capability_probe: ok` or `failed`; and the entrypoint
+  passes `HALOGEN_CTX` as the fallback, so a failed probe cannot shrink the
+  context below what was configured. `HALOGEN_ENGINE_PROBE_S` (default 5)
+  is the per-attempt budget.
+
+### Documentation
+
+- README, *From an agent harness*: point a harness at this server as a
+  provider, not as its own server. OpenCode's `opencode attach` and
+  `OPENCODE_SERVER` probe `/global/health` and `/api/health`, which are
+  OpenCode's server API and are not answered here; the provider entry
+  (`@ai-sdk/openai-compatible`, `baseURL .../v1`) is the one that works.
+  hermes-agent's `/api/tags`, `/props` and `/version` probes are backend
+  detection and the 404s are harmless (issue #91,
+  [@bobdvb](https://github.com/bobdvb)).
+
+## 0.13.0
+
+The checkpoint tools, as modes of the image: `verify`, `inspect`, `ppl`
+and `niah`. No weight change; no kernel change; the server's numerics are
+untouched (the engine gained one method the tools read the logits through,
+which the server never calls). One front-end addition from issue #86
+([@Lafunamor](https://github.com/Lafunamor)).
+
+### Added
+
+- **`verify FILE`**: reads an `.hgn` back independently of whatever wrote
+  it (header, table, every tensor's dims against the model's geometry, the
+  payload size each format implies, per-tensor checksums over the bytes on
+  disk, codebooks in order, scales finite) and says `PASS`, or `FAIL`
+  naming the first tensor. Exit status is the answer. About 40 s on the full
+  checkpoint.
+- **`inspect FILE [--json] [--no-hash]`**: the precision by tensor family
+  with bits per weight from the shapes, and one sha256 per tensor in table
+  order behind the hash of the header and table.
+- **`ppl FILE --corpus TEXT`** (or `--ids IDS.bin`): teacher-forced
+  perplexity through this engine, the chunk printed with the number.
+  `--vs OTHER` compares two files paired (mean per-token difference, t,
+  95% interval). `--ref-out REF` writes the file's next-token distribution
+  at every position (top-128 log-probs, the tail, the argmax; 50 MB for
+  32k tokens) and `--ref REF` scores another file against it: KL on that
+  support (a stated lower bound on the exact KL), top-1 agreement, the
+  target's probability shift, per band, and `--worst N` decodes the N
+  positions the two files disagree on most. `--json` prints one object.
+- **`niah FILE --corpus TEXT --depths ...`**: a needle-in-a-haystack
+  battery built from your text at the given depths and positions, run
+  through the engine and scored.
+- The README's [Measuring a checkpoint](README.md#measuring-a-checkpoint)
+  section has the recipes, which corpus to use, and what these numbers are
+  not (they are not `llama-perplexity`'s). `AGENTS.md` has the `--json`
+  shapes and the file formats.
+- `/health` lists the image's modes under `modes`, and the image carries
+  the same list in the OCI label `ai.peonist.halogen.modes`
+  (`HALOGEN_IMAGE_MODES`).
+- **`/v1/models` advertises the window and the token limits** (issue #86):
+  `max_model_len` and `context_length` (the served context), `meta.n_ctx_train`,
+  `max_tokens_cap` and `max_tokens_default`, the values `/health` reports,
+  so a generic client or proxy sizes its compaction from the OpenAI surface.
+
+### Notes
+
+- **The first thing these tools showed us was about our own default.** On
+  the wikitext-2 test split, past about 96k tokens of depth, the shipped
+  checkpoint with its quality sidecar puts `<|im_end|>` at the top of its
+  next-token distribution in the middle of running prose at 1,466 of
+  297,052 positions (922 of them above p 0.5); the bare checkpoint does it
+  85 times and unsloth's UD-IQ4_XS 504, so it is the model at depth and
+  the quantization variant sets the rate, and perplexity does not see it.
+  It is not fixed in this release. The numbers, the recipe and what we
+  will do are in the issue opened with this release, which is also an
+  invitation: if you have a quant of this model, run the recipe and post
+  your row.
+- The tools load the model where a mode needs it (`ppl`, `niah`): one model
+  per machine at a time, not beside a running server.
+- A corpus longer than the native context (262,144 tokens; wikitext-2 test
+  is 297,053 under this tokenizer) is scored as consecutive sequences of
+  that length, the state reset at each; `--seq` sets the length, the
+  reference dump records it, and a dump made with another length is
+  refused.
+- The tools read whatever file they are given and refuse a malformed one
+  with a sentence (a header with a rank past four, an entry past the end
+  of the file, a dump whose header does not fit its file), checked under
+  the address and undefined-behaviour sanitizers.
+- Inside the image `ppl` runs under the image's own engine environment
+  (the baked tuning plan, the quality sidecar beside the checkpoint), which
+  is the served numerics; `-e HALOGEN_MATMUL_TUNING_FILE=` runs without the
+  plan. The mode prints which it did.
+- `--corpus` reads the tokenizer from the mounted directory only; a path
+  that is not a directory is refused rather than looked up by name.
+
+## 0.12.3
+
+Entrypoint, front end, the repack command's default, and docs. No
+weight change, no new kernel, nothing in the engine's numerics. Three
+things from reports this weekend: the watchdog's deferral in issue #71
+([@YanissAmz](https://github.com/YanissAmz), tracked as issue #85), a
+`--repack` that wrote a checkpoint missing its lookup table (Hugging Face
+discussion 4), and a request-log field that lied on a lone stream (issue
+#84, [@rba](https://github.com/rba)).
+
+### Fixed
+
+- **`flash_serve --repack` wrote a checkpoint without the n-gram lookup
+  table unless `--with-table` was given, and that file loads and dies with
+  `checkpoint: no tensor named layers.1.ple.ngram_embedding.weight`.** The
+  0.7.0 changelog printed the flag in brackets, and a user who ran the
+  command on their own working GGUF got exactly that (Hugging Face
+  discussion 4). The table is now written by default (`--no-table` is the
+  opt-out), the loader's message for that tensor names both ways to such a
+  file, and the same repack refuses at the plan, writing nothing, when the
+  GGUF itself has no table. The image's `convert` always passed the flag
+  and was never affected. Note for anyone quantizing their own: this engine
+  reads the table in IQ4_NL only, which is what `llama-quantize` produces
+  for it from an IQ4_XS recipe and what the unsloth, bartowski and
+  mradermacher builds carry; a Q4_K_M, Q5_K or Q6_K recipe lands the table
+  on Q5_0, Q5_1 or Q8_0 and is refused with a message naming the type.
+  Reading those is the next GGUF item.
+
+- **A silent engine under constant memory compaction was never taken
+  down.** Since 0.11.9 the watchdog defers a silent probe while the
+  kernel's `compact_stall` counter climbs, because that silence is usually
+  a host short of memory and killing the engine there is what leaves the
+  driver holding its GPU memory (issue #79). Two things were wrong with
+  it. The counter is host-wide, so on a machine that compacts memory
+  without pause it says nothing about this engine; and the watchdog
+  restarted its clock on every deferred probe, so the seconds it printed
+  were the probe step, not the silence. A reporter's engine sat wedged for
+  30 minutes, main thread at 100% of one core in user space, `/health`
+  timing out, container up, while the log said `not counted as a wedge`
+  every 15 seconds. The clock now moves only when the engine answers,
+  every line prints the true silence, the end of a deferral is announced,
+  and the compaction deferral is capped by a new setting,
+  `HALOGEN_ENGINE_WATCHDOG_DEFER_S` (900 s; `0` = the old unbounded
+  behaviour): past it, an engine whose threads are running and not inside
+  the kernel is a wedge whatever the counter says, and the takedown line
+  names the cap and the counter. A thread in uninterruptible sleep is
+  still never killed. The deferral logic has a standing check that drives
+  every branch against a fake engine and a fake `/proc`, and it reads red
+  on the 0.12.2 script.
+- **The request line's `N tok beside other streams` counted tokens
+  produced with the drafter's head off**, which includes the adaptive
+  policy's rest stretches on a lone stream, so the field appeared on
+  requests that had the server to themselves. It now says `with the head
+  off`. The number did not change; the label did.
+
+### Docs
+
+- README: the watchdog's bound under "Give it a machine of its own"; that
+  `amdgpu.noretry=0` changes a lost GPU mapping from a fault (issue #83)
+  into a silent engine (issue #85) and buys no speed; that
+  `vm.compaction_proactiveness=0` does not stop the stalls and slows the
+  startup reservation; the contiguity case of a start that grinds at
+  `reserving the KV pool` with no GTT held. Issue #85 tracks the stalls
+  and wedges under host memory pressure across hosts.
+
+## 0.12.2
+
+Engine, front end, entrypoint and docs. No weight change, no new kernel.
+Four things the server could not say about itself, from two reports this
+week: a fine-tune's assessment on the model's Hugging Face page
+(cygnal) and issue #83 ([@noguespi](https://github.com/noguespi)); and
+one correction to our own speed gate. Every number below is the
+reference machine.
+
+### Added
+
+- **The chat template is probed at startup.** Every thinking control
+  (`enable_thinking`, `reasoning_effort: "none"`, `HALOGEN_ENABLE_THINKING=0`,
+  the budgets and the answer room) works by asking the chat template to
+  render the think block one way or the other, and the server renders
+  whatever template the tokenizer directory carries. A tokenizer mounted
+  from another repository can carry a template without that branch, and
+  through 0.12.1 the server accepted every thinking control against it and
+  rendered thinking anyway, with nothing in the log or on the wire saying
+  so (cygnal's assessment ran 0.11.4 with a hand-mounted `/tokenizer` and
+  reported "no way to disable thinking"). The server now renders a
+  one-message conversation with thinking off and on at startup, in the
+  entrypoint's pre-flight so the answer comes in a second rather than after
+  the weights are pinned, and refuses to start on a template whose two
+  renders do not differ the way the controls assume, naming the file in one
+  sentence. `HALOGEN_TEMPLATE_UNCHECKED=1` serves it anyway with the same
+  sentence as a warning. The startup line and `/health.chat_template` name
+  the template (the path that carries the rendered text and the sha256 of
+  that text) and the probe's result. The weights repo's own `tokenizer/`
+  passes.
+- **Thinking is visible per request.** Every chat request's log line ends
+  with `think on` or `think off`, and when the server closed the think
+  block (the answer room, or the request's own `max_thinking_tokens`) the
+  line says `closed at N by answer room` and the reply's
+  `usage.completion_tokens_details` carries `reasoning_closed_at` and
+  `reasoning_closed_by` (`"answer_room"` or `"max_thinking_tokens"`) beside
+  `reasoning_tokens`; on `/v1/responses` the same two ride
+  `output_tokens_details`. A reply whose block the model closed itself has
+  neither. Under a 2,048 budget the answer room is 1,024 tokens, so a reply
+  that reads as about a thousand hidden tokens and then a short answer is
+  that close; the fields now name it (cygnal's "~1,049 hidden tokens").
+
+### Fixed
+
+- **`HALOGEN_FLASH_PIN_TRUNK=0` runs at the shipped defaults** (issue #83,
+  [@noguespi](https://github.com/noguespi)). The README's own last resort
+  for a shared machine exited on the first request, on every release, with
+  `internal sizing error in the per-forward arena`: the unpinned path's
+  scratch was sized for a decode step (its slack held about 50 prompt
+  tokens) and the path itself had no prefill (the grouped-by-expert prefill
+  reads the weights in place and was skipped without the pin), so a prompt
+  would have run decode kernels once per token. Both are fixed: the scratch
+  is sized for a 32,768-token call, and a prompt of 64 tokens or more
+  stages each layer's experts onto the GPU once per call (1.43 GB a layer)
+  and runs the same grouped prefill the pinned path runs, on the same
+  bytes. What it costs, measured on the reference machine: with the weights in the
+  file cache, a 32,768-token prompt prefills in 26.6 s against 26.7 pinned,
+  8,192 in 8.8 against 7.1, 128 tokens in 2.4 against 1.0, 32 in 2.3
+  against 0.45 (the staging is about 7 s a prompt at any length, and on a
+  long prompt the grouped kernels run faster on the GPU copy than in place,
+  so the two cancel); served, where the unlocked weights compete with the
+  KV pool and the lookup table for the file cache, a 6,500-token prompt
+  took 28 s, and 51 s on the first request after a start (the copy then
+  reads from disk at about 3 GB/s). Decode under the flag is unchanged at 6
+  tokens/s against 37, several times slower as documented. The generated tokens match the pinned run's on the three
+  longer prompts and differ on the 32-token one, as the flag's numeric
+  label has always said. It remains a last resort, and now a working one.
+- **No GPU core dump after a fault** (issue #83). After a GPU memory fault
+  the bundled runtime wrote a GPU core dump of the process (`GPU coredump:
+  ... Falling back to file-based dump`), which for a process with over
+  100 GiB mapped is minutes in uninterruptible sleep before the engine can
+  exit; the container's watchdog read that silence as a host short of
+  memory and waited it out. The container now disables the runtime's dump
+  (`HSA_DISABLE_COREDUMP_ON_EXCEPTION=1`) and the process's core file
+  (`ulimit -c 0`), so a fault is followed by the engine's exit and the
+  takedown path in seconds. Measured with a deliberate fault in a throwaway
+  container holding 48 GiB of GPU memory: without the variable the runtime
+  wrote a 52 GB dump and the process lived 33 s past the fault, on an idle
+  machine with a warm file cache (a host at its memory edge writes that to
+  disk under reclaim, which is the minutes in #83's log); with it, no file
+  and the process ended within a second of the fault.
+- **The speed gate's cold-prefill arm ran its two prompts in the wrong
+  order.** The 32k prompt is now measured first, so its number is cold; in
+  the old order it hit the 8k prompt's cache entry (the tool's prompts are
+  prefixes of each other) and read about 1,690 tok/s where the cold figure
+  is about 1,417. The README's numbers were already the cold ones.
+
+## 0.12.1
+
+Engine, front end, entrypoint and docs. No weight change. Three things
+reported on the model's Hugging Face thread and on issue #20 (one of them
+a speed regression that had stood since 0.11.3), the door that turns a
+GGUF into a checkpoint of the engine's own, and two small owed items.
+Every number below is the reference machine, the same session as its
+control.
+
+### Added
+
+- **Third-party GGUFs load: the DeltaNet projections in any row format**
+  (issue #20, the census by [@Syakyr](https://github.com/Syakyr)).
+  The engine reorders the linear-attention heads of every DeltaNet layer at
+  load, and through 0.12.0 that reorder was implemented for `Q8_0` rows
+  only, so `attn_qkv`, `attn_gate` and `ssm_out` had to be `Q8_0`: unsloth's
+  bit map and nobody else's, and bartowski's and mradermacher's IQ4_XS files
+  were refused by name on their first DeltaNet tensor. The reorder now runs
+  on the decoded planes of every format the engine reads (whole rows, or
+  whole 32-wide chunks of `ssm_out`'s columns), which is exact: gguf-py's
+  own dequant of the source, permuted, matches the repacked planes on every
+  tensor of bartowski's file (2^-11 relative on IQ4_XS, the scale's f16
+  rounding; 0 on the rest), and the C++ repack and the Python reference
+  produce identical bytes. Two more lifts the same file needed: `Q6_K` is
+  read on any tensor (it was the output projection only; the kernels were
+  already general), and a K-quant (`Q4_K` / `Q5_K`) on a dense tensor is
+  read and then kept as a bf16 copy on the GPU, since the affine decode
+  kernels exist for the experts only; the log says how many and how much
+  (`affine trunk: 12 tensors staged to bf16 on the device (0.35 GiB)` on
+  bartowski's IQ4_XS). unsloth's two files repack to the same bytes as
+  before, to the hash. bartowski's `IQ4_XS` (91 GB, three shards), measured
+  beside unsloth's `UD-IQ4_XS` in one session: fixture agreement with
+  transformers 185/192 on both; perplexity over 32K tokens 1.0% higher
+  (5.634 against 5.577; its dense layers are 4-bit where unsloth's are
+  8-bit, its experts IQ4_XS where unsloth's are IQ3_S); prefill within 1%
+  (1,244-1,267 / 1,423-1,425 tok/s at 8,192 / 32,768); serial decode at
+  short context 26.1-32.2 tok/s against 26.0-27.1 (a 4-bit trunk is a
+  gigabyte less to read a token), with the draft head 33.2-35.9 against
+  27.9-30.2 and every speculative stream byte-identical to serial. It holds
+  68 GiB in RAM with the head. mradermacher's `i1-IQ4_XS` (91 GB, one file; `Q5_K` on
+  every DeltaNet input projection, 48 staged tensors, 1.8 GiB) loads the
+  same way: fixture agreement 182/192, serial decode 30.1 tok/s, with the
+  draft head 35.8, byte-identical to serial. What is still refused: a K-quant or `Q6_K` on `ssm_out` (the
+  column reorder would split their 256-wide scale groups; bartowski's
+  `Q4_K_M` and up), and `Q4_1` / `Q5_0` / `Q2_K` / `Q3_K` / IQ2 / IQ1 as
+  before.
+- **`convert`: a GGUF as a checkpoint of the engine's own, once.**
+  `podman run ... halogen-flash-server:0.12.1 convert IN.gguf OUT.hgn`
+  writes the lossless repack the engine builds in RAM at every GGUF start
+  to disk as one file, with the lookup table and the draft head folded in
+  (about 106 GB for an IQ4_XS build, ten minutes on an NVMe disk), and
+  exits. A server started on that file takes the engine's own checkpoint
+  path (`checkpoint_format: hgn`), loads in seconds from a warm disk, needs
+  no GGUF beside it, and answers what the GGUF start answers. The log notes
+  a converted trunk and that the quality sidecar does not apply to it.
+- **A third saved place for the prompt cache: the start of the last
+  message** ([@nightvich](https://huggingface.co/nightvich)'s 1M sweep on
+  the Hugging Face thread, where every new question behind the same
+  document read as cold). The default cache mode saved its place at the
+  end of the system prompt and the end of the previous request; a client
+  that keeps a document in one message and asks each new question in the
+  next matched neither, so every question re-read the document and only an
+  exact repeat hit. The cache now also saves at the start of the request's
+  last message, when that message is not the request's only one: on a
+  30,000-token document the second question is served 99% from the cache
+  and answers in 1.3 s where it took 26 s. The extra save costs nothing
+  measurable on the first request (see the fix below) and nothing on a
+  hit; a one-message request gets no third place; conversations that
+  extend their history each turn were served already and do not change.
+  `HALOGEN_CACHE_SNAP3=0` turns it off; `HALOGEN_CACHE_ENTRIES` defaults to
+  20 (was 16), five per conversation. A cold request and an exact repeat
+  stay byte-identical to what 0.12.0 produced.
+
+### Fixed
+
+- **Every cold prefill under the default cache mode had lost about 5%
+  since 0.11.3** ([@rekillkos](https://huggingface.co/rekillkos) measured
+  it on the Hugging Face thread: `halogen-bench.py`, three runs a version,
+  pp8192 1,381 -> 1,300 tok/s and pp32768 1,565 -> 1,496 at 0.11.2 ->
+  0.11.3, held through 0.12.0). Since 0.11.3 the cache captures its save
+  point at the end of the conversation history without splitting the
+  prefill (the split was issue #65's wrong answers), and the capture
+  reached the state at that point by re-running the linear-attention
+  recurrence over the prompt up to it, in every DeltaNet layer. On a
+  request whose history ends a few tokens before the end of the prompt,
+  every single-message request included, that is a second pass over the
+  whole prompt: about 5.5% of a cold prefill, once per new prompt, never
+  on a cached turn. The recurrence now records the state as it passes the
+  save point instead, which costs one 3 MB store per layer; the state it
+  records is bit for bit the one it continues with, so nothing in any
+  answer changes (checked: a cold request and a resumed turn are
+  byte-identical to the previous mechanism's). Served, cache on, one cold
+  request per size on the reference machine, 0.12.0 -> 0.12.1: pp8192
+  1,190 -> 1,245 tok/s, pp32768 1,348 -> 1,417, each now within 2% of the
+  same image's cache-off figure, which is 0.11.2's level. (A note on the
+  tool: `halogen-bench.py` builds each prompt as a prefix of the next
+  larger one, so with the cache on the 32,768 request hits the 8,192
+  request's entry when run in that order and reads high; run the larger
+  size first for a cold number. The figures here are cold.) The release speed
+  gate now runs a cache-on cold prefill beside its cache-off one; the
+  cache-off sweep it ran alone is exactly the setting that skipped the
+  capture, which is why no release gate saw this. `HALOGEN_PROMPT_CACHE=0`
+  and `=1` reproduce the cache-off number on every version.
+- A request whose prompt alone exceeds the context returned a 400 that
+  printed a negative room (`leaving room for -778714`); it now says how many
+  tokens over the context the prompt is and names the two levers.
+
+### Documentation
+
+- `HALOGEN_SPEC_ADAPT` (the draft head's adaptive policy) has its row in
+  FLAGS.md; it had shipped without one.
+- The README's *Bring your own GGUF* names what is read on which tensor now
+  and what it costs; *Choosing a cache mode* describes the third saved place
+  and drops the advice it replaced.
+
+## 0.12.0
+
+Engine only, two kernels of the model's sparse-attention indexer. No weight
+change, no new setting. Byte-identical output: the block lists and the scores
+both kernels produce are compared bit for bit against the previous kernels at
+32k, 262k and 1M tokens (serial and with the draft head), and the logits of a
+32,768-token prefill and two decode fixtures are identical; every published
+quality number is unmoved. What moves is speed at long context, on both the
+decode and the prefill side. The numbers below are the engine's own harness on
+the reference machine (quality sidecar, the tuned plan, a 1,044,480-token
+prompt at the 1M configuration with `HALOGEN_MAX_TOK=16384`, a 258,048-token
+prompt at the default 32,768 arena); the served figures through this image are
+in the README's 1M section.
+
+### Fixed
+
+- **Decode at long context was paying for the indexer's block SELECT, not its
+  scores.** Each layer's indexer scores every 4-token block of the context and
+  keeps the top 512. The select ran as one workgroup per query row walking
+  every visible block, which at prefill is thousands of rows in parallel and
+  invisible, and at decode is one workgroup per layer, serial in the number
+  of blocks: 5.2 ms of a 33 ms step at 262k and 22 ms of a 53 ms step at 1M,
+  which is the whole of the decode slope [@nightvich](https://huggingface.co/nightvich)
+  measured on the model's Hugging Face thread (42 tok/s at 11k to 16 at 937k
+  on 0.11.1). The select is now a register-resident bisection over slices of
+  the row, spread across the GPU, with the same result: the same blocks, the
+  same tie rule, the same order. Serial decode 30.0 -> 35.2 tok/s at 262k and
+  18.9 -> 32.1 at 1M; with the draft head 43.5 -> 49.4 and 27.2 -> 41.7. What is
+  left of the depth term at decode is the block-key read itself (768 MiB a
+  step at 1M, at the memory roofline), 3.6 ms a step.
+- **Prefill at 1M was paying twice for the same indexer.** The select above
+  was 18% of a 1M prefill pass, and the scoring kernel another 13% at a
+  quarter of the matrix units' rate, because it re-read the whole key set
+  once per 16 query rows. The scoring kernel now keeps 128 block keys per
+  workgroup in registers and walks the query rows, with the same products
+  in the same order. A 1,044,480-token prefill: 1,191 -> 994 s (877 -> 1,051
+  tok/s); a 258,048-token prefill 204 -> 199 s; 32k unchanged.
+
+### Documentation
+
+- The README's 1M section carries the served rates at 262k and 1M measured
+  through this image.
+
+## 0.11.10
+
+### Added
+
+- **`HALOGEN_CACHE_PRUNE_OLD=1` removes the other builds' cache subtrees at
+  startup** (issue #78, @eemin). With `HALOGEN_CACHE_DIR` set, each engine
+  build, weights file, context size and numeric setting keeps its own
+  subtree there, and `HALOGEN_CACHE_DISK_GIB` bounds only the current one,
+  so an upgrade day left 29.5 GB of files no build would read again beside
+  the live 8.5 GB. The default keeps them (a rollback finds its cache warm).
+  With the flag, after the engine has named its own subtree it removes the
+  others and the startup log names each one with its size, then says how
+  much was freed. Only a directory the cache itself wrote is a candidate (a
+  sixteen-hex name holding a `fingerprint` file); anything else under the
+  directory is left alone and counted, as before.
+- **Third-party GGUFs whose small tensors are F16 load** (issue #20's later
+  report, @Syakyr; the Hugging Face thread's "any gguf version"). unsloth's
+  files keep the model's small F32 tensors at F32; bartowski's and
+  orcarouter's IQ4_XS write one of them, `blk.1.ple_conv1d.weight`, as F16,
+  and the engine refused the whole file for it. F16 is read now where the
+  engine's own destination for the tensor is bf16: the values are widened
+  exactly and the repack's existing check that every value is bf16 clean
+  still applies, so the file's values arrive with their bits intact. What
+  the quantizer's F16 step already rounded stays rounded: 101 of that
+  tensor's 40,960 values sit under F16's normal range, and a file that
+  carries them at F16 carries them on F16's grid. Nothing changes for
+  unsloth's files: a synthetic copy of UD-IQ4_XS with that one tensor
+  rewritten to F16 repacks every other tensor byte for byte the original,
+  and that one exactly as the reference tool reads it. A llama.cpp draft
+  head beside such a file (`...-MTP-draft.gguf`)
+  is still not the engine's head: `HALOGEN_MTP_HEAD` pointing at one is
+  refused in two seconds with the name of the file that is.
+
+### Fixed
+
+- **A served run no longer rewrites the baked tuning plan at a clean exit.**
+  Under the shipped `HALOGEN_MATMUL_ALGOS=1` a GEMM shape outside the plan's
+  buckets takes the library's first pick and nothing is measured; the plan
+  was marked dirty for it anyway, and a clean exit wrote it back with the
+  unmeasured buckets added, moving the file's size and time, which the disk
+  cache's fingerprint includes. 0.11.9 read the plan from a copy so the
+  baked file could not move; the engine now does not mark it dirty for a
+  bucket it did not time. A tuning run (`ALGOS` above 1) still records
+  every bucket; an absent or stale file is still written.
+
+### Documentation
+
+- `HALOGEN_REASONING_EFFORT`'s text says all three mappings, `medium` to
+  `medium` included (issue #76, @ker2x).
+
+## 0.11.9
+
+### Fixed
+
+- **The watchdog no longer kills an engine that is silent inside the
+  kernel** (issue #79, @lory9995; issue #35). On a host short of contiguous
+  memory the engine stops for minutes inside a page fault or an allocation
+  while the kernel compacts memory for it, answers nothing, and comes back;
+  the container's watchdog counted that as a wedge and took the container
+  down at 180 s, saying in the same breath that a slow host is not a wedge.
+  On #79's host that kill landed twice on an engine in that state, and the
+  driver then kept the engine's GPU memory after the process was gone (35
+  GiB of GTT with nothing alive, a kernel worker in `svm_range_restore_work`
+  in D), so every later start hung at `reserving the KV pool` until the host
+  rebooted, with the restart policy starting the next one into the same
+  wall. Before a silent probe counts, the watchdog now reads the engine's
+  thread states in `/proc` and the kernel's `compact_stall` counter in
+  `/proc/vmstat`; a thread in uninterruptible sleep, or compaction advancing
+  since the last probe, is logged as `not counted as a wedge` and the clock
+  restarts when it ends. A wedge on a quiet host (threads running, no
+  compaction, no answer) is taken down at the same 180 s as before, and the
+  line says which case it saw. The same end state has been reached on three
+  other hosts by other unclean exits (#34's two machines, our own gate
+  machine), so the README's paragraph on the three amdgpu flags no longer
+  says leaving them off avoids it; it does not.
+- **A start says what the GPU is already holding, and refuses what cannot
+  fit** (issue #79). Before the engine starts, the container reads the
+  driver's own counters (`mem_info_gtt_used` and `_total` under the card's
+  sysfs node, and `/sys/class/kfd/kfd/proc`, the processes holding the GPU)
+  and prints `GTT in use before this start: N GiB of M (F free; this start
+  puts about K GiB there)`. Tens of GiB in use with no process holding the
+  GPU is memory a previous engine's exit did not give back, and the line
+  after it says so and what to do (check `fuser -v /dev/kfd` on the host,
+  then reboot; removing containers does not release it). Held by another
+  process, it is a note. Less free than the pool and the prefill arena need
+  is a refusal at once, since a start that cannot place its pool blocks
+  inside the driver instead of failing. The `still loading` heartbeat and
+  the shutdown line carry the engine's state and the GTT figure, so a report
+  of a hung start has the numbers in it.
+- **`/cache` during a long cold prefill answered 500** (owed since 0.11.5).
+  The engine reports its counters between rounds, and one 32k prefill chunk
+  is longer than the route's 10 s wait. It now answers the last counters it
+  had, with `stale_s` set to their age, and 503 with a reason if it has
+  none yet.
+- **The request line prints `= N t/s` for the prefill only when at least
+  2,048 tokens were processed** (owed since 0.11.5, said on #73 and #74). A
+  warm follow-up that processed 257 tokens in 1.20 s printed `= 214 t/s`,
+  which is one chunk's fixed cost and not a speed, and was read as one. Below
+  the threshold the line says `(257 new)`; `timings` is unchanged.
+- **`evicted` on `/cache` counted the entries a follow-up drops to take its
+  region over** (0.11.8's takeover, issue #75). They are `dropped` now;
+  nothing a later request could have hit was lost, and `evicted` is back to
+  entries forgotten for room.
+- **The pre-flight memory estimate sized every GGUF as UD-IQ4_XS** (issue
+  #80, @philtheriver). "Roughly 72 GiB of weights" was that file's repacked
+  size; the K-quant `UD-Q4_K_XL` repacks to 78 to 80 GiB, and on a 122 GiB
+  box the estimate said 27 GiB to spare while the engine, correctly, refused
+  the last pin 2 GiB under its 16 GiB floor, under a restart policy, fifty
+  times. The check now reads the GGUF's file type from the header (15 = a
+  K-quant, 80 GiB; 30 = IQ4_XS, 72) and sizes the working memory by
+  `HALOGEN_MAX_TOK` (21.3 GiB at 32768, 12.5 at 16384; it had said "11 GiB
+  of scratch" since before the arena was measured), and its warning names
+  the floor and the lever. The engine's refusal is now the summary: how far
+  short, and the levers in the order worth trying (`HALOGEN_MAX_TOK=16384`,
+  the pool, host memory, `PIN_TRUNK=0` last). `HALOGEN_MAX_TOK=16384` boots
+  that box today.
+- **The takedown path had never run on a non-zero exit.** The container's
+  `set -e` ended the entrypoint the moment its `wait -n` returned the
+  watchdog's status or a crashed engine's, so "a component exited; shutting
+  down", the SIGTERM to the engine and the wait after it had never run on a
+  wedge; the runtime ended the engine with the pid namespace. Now: SIGTERM
+  and the engine's own exit, 30 s, then SIGKILL, 30 s, then a line that says
+  the engine is inside the kernel and the host needs a reboot. The shutdown
+  line carries the GTT figure after the exit.
+
+### Documentation
+
+- `HALOGEN_ENGINE_WATCHDOG_S` is in the flag reference; it had been named by
+  the container's own message and two issue replies and by nothing else.
+- The README's host settings section, the shared-host section and a new
+  troubleshooting entry (a start that hangs at `reserving the KV pool`)
+  carry the four occurrences and the check.
+
+## 0.11.8
+
+### Fixed
+
+- **0.11.7's pool changes now apply to clients that do not send
+  `reasoning_content` back** (issue #75, the second report from @jtsylve).
+  Since 0.11.3 the cache keeps a FULL entry at each turn's prompt end, for an
+  exact repeat of that prompt. A follow-up from a client that omits the
+  reasoning cannot match it (the template writes `<think>\n\n</think>` where
+  the model generated `<think>\n`, and the tokens differ), so the entry it
+  hits is the history entry a few tokens shorter, and the region held "a
+  longer entry". That made the region not the conversation's own to take
+  over, and every step 0.11.7 added (grow in place, move, pack, the clamp)
+  was skipped: with free space in the pool the turn took a fresh span, copied
+  its rows and left the old region held as a stale duplicate; with none it
+  fell to `grows in place: forgot 1 longer entries (cheapest)`. Clients that
+  replay their reasoning (Pi with `reasoning: true`) hit the FULL entry
+  itself and were on the fixed path all along; hermes-agent and most
+  OpenAI-shaped clients were not. Now a FULL entry past the hit does not
+  block the takeover; it is dropped (the generation overwrites those rows in
+  any case; what is lost is an exact repeat of the previous prompt after the
+  next turn began). The fan-out recipe with thinking on and no replay reads
+  `moved 2, relocated 3, packed 1, rows_copied 0` where 0.11.7 read `moved 0,
+  relocated 0, rows_copied 4` and forgot the parent on its second turn.
+  `HALOGEN_CACHE_FULL=0` was the stopgap on 0.11.7.
+
+### Documentation
+
+- **A 128 GB box can start with a 262,144 pool without meaning to.** The
+  startup fit budgets `MemTotal` less the 67.7 GiB of resident weights and
+  the 20 GiB host reserve; at `HALOGEN_MAX_TOK=32768` a 524,288 pool needs
+  about 36.7 GiB, and a machine whose `MemTotal` reads 122.7 GiB (a
+  `crashkernel` reservation is enough) has 35.0, so the pool halves and the
+  log says `LOWERING THE POOL TO 262144`. The README's memory section now
+  says so, with the arithmetic; `HALOGEN_MAX_TOK=16384` is the lever
+  (issue #75, @myliuyx).
+
+## 0.11.7
+
+### Fixed
+
+- **A harness fanning out subagents no longer loses the parent's or the
+  children's cache when the pool has the room** (issue #75, @myliuyx). With
+  one parent and two children busy at once, each child turn using most of
+  its reservation, the pool's no-room path forgot the parent on every child
+  re-bind (with two children decoding, the parent's region was the only one
+  the least-recently-used rule could reach), and once the parent was gone
+  the children forgot their own rows on alternate turns: the last resort
+  that moves a conversation's rows into the free span ran cold whenever
+  that span overlapped the rows' old place, which is exactly the case of a
+  region moving down into the hole below itself. The report called it a
+  0.11.5 regression; the same workload at 1/8 scale fails the same way on
+  0.11.4 (both children cold at turn 5, the parent cold from turn 2), so
+  pinning back gains nothing. Now the no-room path takes its no-loss steps
+  first and retries them after every eviction: the region grows in place;
+  a fresh span holds a move; the conversation's own span counts as free
+  and its rows move into a span that includes it, overlap or not (the copy
+  goes in block-aligned chunks in the safe direction); held neighbours are
+  moved up against the next busy region so the region can grow in place
+  (`kv pool: ... moved N held regions ... grows in place (no loss)`); then
+  the 0.11.5 clamp (a smaller budget, no copy); and only then does another
+  conversation get forgotten. The clamp used to come before the moves, so a
+  harness whose turns use their budget had them cut at the room left
+  (`finish_reason: length`) where a copy of milliseconds keeps the whole
+  budget; it no longer does. The log line for a move carries its time
+  (`moved the N rows ... in 12.3 ms`), `/cache.pool` gains `packed`, and
+  `cold_resorts` reads 0 from here on. **Sizing still applies:** three
+  conversations need `pool >= sum over live conversations of (prompt +
+  max_tokens)`, and a child's prompt grows by the whole of each turn's
+  generation when the harness replays the reasoning; the README's memory
+  section has the arithmetic. Reproduced at 1/8 scale (one parent with a
+  step of growth, two children on their own threads each generating 3,100
+  of a 4,096 reservation, six turns) on the 0.11.4 and 0.11.6 images and
+  gated on the fix, plus a text gate for the overlapping copy (the moved
+  rows produce the same greedy continuation as the unmoved ones, byte for
+  byte).
+
+## 0.11.6
+
+### Added
+
+- **The engine reads llama.cpp K-quant GGUFs.** `HALOGEN_CHECKPOINT` may now
+  name a `Q4_K` / `Q5_K` / `Q5_1` file (unsloth's `UD-Q4_K_XL`), which 0.11.5
+  refused by name. Those blocks are read losslessly, as the exact affine
+  planes their values define (a per-block scale and minimum, and the packed
+  4- or 5-bit weights), the same "moved, not requantized" repack the engine
+  already did for the `IQ4_XS` family; a K-quant file's perplexity and
+  fixture agreement are its own, not a rounded copy's. On `UD-Q4_K_XL` this
+  is the most accurate GGUF the engine runs, 0.020 nats better perplexity
+  than `UD-IQ4_XS` and 0.033 better than the engine's own checkpoint over
+  32K tokens, at the same prefill and about 3% slower serial decode. See
+  **Bring your own GGUF** in the README for the full comparison and the list
+  of which block types are read and which are still refused (`Q4_1`, `Q5_0`,
+  `Q2_K`, `Q3_K` and the IQ2/IQ1/F16 families, each by name at startup).
+
+## 0.11.5
+
+### Fixed
+
+- **Two long conversations taking turns no longer forget each other on
+  every turn** (issue #74, @eemin). A conversation keeps its whole
+  reservation (prompt plus `max_tokens`) between turns, and a second
+  conversation's region is placed directly after it. When the first's next
+  turn needed a few hundred more positions, its region could not grow, no
+  free span held a copy, and the only region left to forget was the
+  second's: the reporter's harness reserved 32k a turn and used about 2k,
+  and both sessions re-prefilled their whole history at 100 to 160 s on
+  every turn (`prompt 199574 (61632 cached)`; only the shared system
+  prompt survived). Now a follow-up whose region cannot grow runs in the
+  room the region has left, with `max_tokens` clamped to it, when that
+  room is at least the answer room (`max(1024, 15%)` of `max_tokens`, twice
+  that when the request thinks); the thinking budget moves down with the
+  clamp so the answer room is kept. The log says so (`kv pool: the region
+  at A this request resumes from cannot grow; the turn runs in the N
+  positions it has left (max_tokens 32768 -> 30521)`), the request line
+  ends with `max_tokens clamped 32768 -> 30521`, and `timings` carries
+  `max_tokens_clamped_from` and `max_tokens_clamped_to`. At the reporter's
+  shape (1/8 scale) both sessions now read 99% cached on every turn with
+  nothing forgotten, where 0.11.4 forgot one of them between every turn.
+- **A conversation's rows move to the request's span rather than being
+  copied and left behind.** When a turn resumes from a held region whose
+  longest entry it continues and needs a fresh span (the region cannot
+  grow and has no room left, or the conversation was forked), the rows are
+  moved (`kv pool: moved the N rows this request resumes from, region A ->
+  B ... the old region is free`) instead of copied with the old region
+  kept. The stale duplicates those copies left could not be told from a
+  live conversation by the least-recently-used rule, and with a small
+  reservation a live session was forgotten for one by its fifth turn; that
+  arm now stays warm throughout. A fork's original that never returns is
+  freed the moment the fork resumes. A region another request is decoding
+  in is still copied, as before.
+- **The pool reports its own occupancy** (issue #73, @ker2x). Every
+  `serve_api:` request line now carries the cached share of the prompt, the
+  prefill rate over the tokens actually processed, and the pool's
+  occupancy as the engine reports it (`prompt 59498 (58013 cached, 97.5%),
+  prefill 2.29s = 648 t/s | ... | pool 412224/655360 63%`). `/cache` adds
+  `token_hit_rate` (prompt tokens the cache covered over every prompt token
+  seen; `hit_rate` counts requests) and, under `pool`, `positions`, `used`,
+  `usage_ratio`, `busy_regions`, `held_regions`, `room_clamped`, `moved`.
+  `/metrics`' `llamacpp:kv_cache_tokens` and `kv_cache_usage_ratio` are the
+  engine's occupancy (positions held in every region, busy and held); before
+  this they counted what the requests holding a front-end slot had asked
+  for, admitted or not, which read 913k against a 655k pool in #74's log.
+  That figure keeps a name of its own, `halogen:kv_pool_reserved_tokens`,
+  beside `halogen:kv_pool_positions`. No new flag; nothing on the decode
+  path. A turn that is not clamped generates exactly what it did; a
+  clamped one has a smaller budget and says so.
+
+### Declined
+
+- `HALOGEN_CACHE_IDLE_S`, time-based eviction of idle conversations (issue
+  #74). The reproduction showed the mechanism was placement, not idleness,
+  and the eviction order already forgets the least recently touched region
+  first, which a dead conversation is by construction. A sweep by wall
+  clock could only free positions nothing was waiting for, or evict a
+  conversation that comes back after the timeout. The fork case the request
+  named is covered by the move above.
+
+## 0.11.4
+
+### Fixed
+
+- **A speculative request answers exactly what a serial one answers when the
+  thinking cap fires** (issue #69, @drmokchichien). The thinking budget
+  (`max_thinking_tokens`, and since 0.11.0 the answer room, which at
+  `max_tokens` 256 leaves a budget of one token) closes the think block by
+  force when the budget is spent, and the budget is counted on committed
+  tokens. A speculative round commits several at once, so under the draft
+  head the count crossed the budget inside a round and the close landed a
+  token or more later than it does serially; everything after started from
+  a different token, and the two drafters disagreed whenever the cap fired
+  (the reporter's table: different at 64 to 1024, identical at 8192 where
+  thinking ended on its own; the bench's own identity gate failed all ten
+  cases on 0.11.2). A round now commits at most what the budget has left,
+  so the close lands on exactly the budget's token under any drafter, alone
+  or beside other streams. `tools/bench-serving.py serial,mtp 256 low 3`
+  passes with the prompt cache on and off; the reporter's table reads
+  identical at every size. The same accounting bounds `max_tokens`, so the
+  engine no longer computes the rows a length stop would have discarded.
+  Note for anyone gating identity on 0.11.3: with the cache on, that
+  release passed the bench by accident of request order (the speculative
+  arm resumed from the serial arm's saved state, which carried no draft);
+  `HALOGEN_PROMPT_CACHE=0` showed the defect there too.
+- **A request the KV pool cannot place is no longer parked forever**
+  (issue #68, @kamiox). A request reserves its prompt plus `max_tokens`
+  positions in one contiguous span. When the conversation it continues
+  held a region in the upper half of the pool that could not grow to the
+  new reservation, and forgetting every other conversation's region still
+  left the span below it short (the reporter's: 131,584 needed, 131,328
+  free below, 130,816 possible in place, 256 short either way), the
+  scheduler spared that region, found nothing else to forget, and retried
+  every pass, for ever: nothing else was running, so nothing freed
+  anything, the health probe was answered throughout, `/health` read
+  healthy and the request ended only when the client gave up (17 and 30
+  minutes in the report; reproduced here in a minute at 1/8 scale). Now
+  the last resort moves the conversation's own rows into the free span, so
+  the turn stays a cache hit (the log says `moved the N rows this request
+  resumes from, region A -> B`; the answer is byte for byte the in-place
+  hit's), and when the rows cannot be copied there it forgets them and
+  runs the turn cold instead of waiting. A request that does wait, for a
+  busy conversation to retire, now says so once in the log (`kv pool:
+  request N waits for M positions ...`) and `/cache` carries it under
+  `pool`: `waiting_for_room`, `waiting_s`, `relocated`, `cold_resorts`.
+- **The startup note on host memory left draws its conclusion** (issues
+  #35 @loonylabs-dev and #64 @Bushido76). The engine already printed how
+  much host RAM the weights and the KV pool leave; under about 10 GiB it
+  now also says what that means (the lookup table's rows page in from disk
+  on every long prompt, a prefill takes minutes, the watchdog can read the
+  stall as a wedge) and names the two levers, `HALOGEN_KV_POOL_POSITIONS`
+  and `HALOGEN_MAX_TOK`. The README's memory section carries the
+  reporter's two tables.
+
+## 0.11.3
+
+### Fixed
+
+- **A request that starts cold under the default cache mode now answers
+  exactly as it would with the cache off** (issue #65,
+  @lev-medien-sandkasten). The default mode (`HALOGEN_PROMPT_CACHE=2`) saves
+  its place at the end of the system prompt and at the end of the
+  conversation history, and to save its place there it used to split the
+  prompt's forward pass at that point. A split pass is not the same
+  arithmetic as a single one (the second half runs at a different batch
+  size), so a request with nothing to resume still got slightly different
+  logits from the cache-off answer. At temperature 0 the answer was the same;
+  at `temperature 1.0` the sampler could pick a different early token and, on
+  the reporter's reasoning prompt, deterministically land on a coherent wrong
+  answer that `HALOGEN_PROMPT_CACHE=1` did not produce. The pass now runs
+  unsplit and the state is captured mid-pass instead: a cold request under
+  the default mode is byte-identical to modes `1` and `0`, verified on the
+  reporter's request and on 161 to 32,768-token prompts. A request that
+  *resumes* from the cache is unchanged in kind (a resume was and is a
+  numeric seam, documented under *Choosing a cache mode*); its saved place
+  is now up to 63 tokens before the exact point, and the next turn re-reads
+  those. An exact repeat of a request is a special case: the server now
+  keeps one more entry per conversation, the state at the end of the last
+  request, so a repeated request restores it and reads nothing again,
+  answering byte for byte what it answered the first time (and a little
+  faster). `HALOGEN_CACHE_ENTRIES` therefore defaults to 16 (four per
+  conversation, about 111 MiB of host RAM each); `HALOGEN_CACHE_FULL=0`
+  turns that entry off. `/health` reports `snapshot_align: 64`; `/cache`
+  gains `tapped` and `full_hits`.
+- **Reasoning no longer streams twice on `/v1/responses` when a summary is
+  asked for** (issue #67, @UtkuKaynak). With `reasoning: {"summary":
+  "auto"}` the same text went out both as `response.reasoning_text.delta`
+  and as `response.reasoning_summary_text.delta`, and a client that renders
+  both kinds of delta into one thinking block (Pi, oh-my-pi) showed every
+  word twice. Only the stream the request asked for goes out now: the
+  summary events with a summary asked, the raw `reasoning_text` events
+  without. The reasoning item itself is unchanged (both `summary` and
+  `content` when a summary was asked), so Codex and SDK readers see what
+  they saw before.
+- **The startup line printed while the KV pool is being reserved now names
+  the state it was missing** (issue #33, @felladrin): compaction stalls
+  climbing with the failed count climbing beside them and the free block
+  count flat means the kernel is finding nothing to compact, and the step
+  waits on another large process letting memory go.
+
+### Documentation
+
+- The kernel command line section carries the second data point on
+  `amdgpu.vm_update_mode=0` / `amdgpu.noretry=0` / `amdgpu.sg_display=0`
+  (issue #34, @Unveiledlogic): with them set, GTT stayed allocated after
+  the container exited and the next start refused at the pin guard;
+  without them it was released within seconds. The advice stays: leave
+  them off.
+
+
+## 0.11.2
+
+### Fixed
+
+- **An image request that has to wait for cache room is no longer refused with
+  "GEN declared 1 images but 0 arrived"** (issue #63, @chanadmon11-gif). On a
+  busy server (one slot with the prompt cache holding earlier turns), a
+  mid-conversation image request often has to wait a moment for room before it
+  can start. While it waited, the server dropped the image's pixels and then,
+  on the next attempt, saw an image it no longer had and refused the request
+  with HTTP 400 -- every time, for that turn, while the engine stayed up. The
+  pixels are now kept until the request actually starts, so a queued image turn
+  is served rather than refused. The refusal that remains for a genuinely
+  missing payload now names each declared image (its token offset and size),
+  so a client can pinpoint which one did not arrive.
+
+
+## 0.11.1
+
+### Fixed
+
+- **An image request after a text request no longer takes the engine down**
+  (issue #62, @ionutpopean04). Since 0.10.1, a request without images
+  cleared the slot's image-position table on admission (the fix for a text
+  turn that had inherited the previous image turn's positions on a cache
+  hit), and that clear dropped the table's buffer while keeping its size.
+  The next image request on the same slot whose table fit that size reused
+  the dropped buffer: `HIP flash_model.hip:4510: invalid argument`, the
+  engine exited, the client got `502 engine closed the connection`, and the
+  container restarted. The order was text -> image -> text -> image, which is
+  any client that sends a text-only side request (a chat title, a summary,
+  a sub-agent) between image turns; text -> image -> image -> text was fine,
+  and 0.10.0 was fine. The clear now keeps the buffer, as the 0.5.0 reset
+  path already did. The release gate's vision cell runs the reporter's
+  order and the control order on one server and checks both image answers.
+
+## 0.11.0
+
+### Fixed
+
+- **A side turn no longer evicts the point a conversation continues from**
+  (issue #61, @GavinAstk). oh-my-pi's idle recap sends the whole history plus
+  a question and then drops that turn from its history, so the next real
+  turn continues from where the recap branched. Since 0.8.1 a conversation
+  kept one history entry in the prompt cache, the newest, and the recap's
+  store replaced the one the conversation needed; the next turn matched only
+  the system prompt (`161006 cached` -> `19528 cached`, a 146k-token
+  re-prefill, 179 s), and every recap after the first did the same. A
+  conversation now keeps its two most recently *used* history entries
+  beside the system-prompt entry; the side turn hits and refreshes the true
+  one, and the next real turn hits it again. `HALOGEN_CACHE_ENTRIES`
+  defaults to 12 (three per conversation) instead of 8.
+- **The KV pool no longer forgets what the request it is making room for is
+  about to use** (issue #61). When the pool was full, the allocator dropped
+  the composable-context store's retained messages first, including the
+  ones the request's own plan was about to compose (a 146k re-prefill under
+  the flag whose purpose is that prefill), and then cache entries by global
+  age without sparing the entry the request had just matched, so a rarely
+  hit system-prompt entry could be dropped for its own request's region,
+  which read as a cold prefill with no line in the log (`170604` with no
+  `cached`, 203 s). Eviction is now by region, oldest first; the matched
+  entry is never dropped; a conversation whose only stale entries are dead
+  side turns grows its region in place instead of displacing another
+  conversation; and every eviction prints `kv pool: no room for N
+  positions; forgot ...` so a cold turn has a reason next to it.
+
+### Added
+
+- **Progress lines during a long prompt and a long answer** (issue #49,
+  @Bushido76). The engine log prints `flash_serve: req N prefill P/T tokens,
+  S s` at every 32,768-token chunk of a prompt and every 20 s inside one,
+  and `req N generated K tokens, S s` every 30 s of a generation, so a
+  160k-token compaction is visible while it runs rather than only in the
+  `serve_api:` line at its end.
+- **The answer room.** Thinking no longer consumes the whole `max_tokens`:
+  when a request sends no thinking budget, the think block is closed with
+  `max(1024, 15% of max_tokens)` tokens left for the answer (the same close
+  as `max_thinking_tokens`), so a capped request ends with content rather
+  than `finish_reason: "length"` and an empty `content`. Every agent harness
+  read for this release sends no thinking control to a custom endpoint
+  unless configured to, so the model's `xhigh` was running under whatever
+  cap the harness set for the answer: Pi caps a compaction at 13,107 tokens
+  and discards it on a length stop, hermes-agent persists nothing from one,
+  Cline logs `output_budget_consumed_by_reasoning`. `HALOGEN_THINKING_ANSWER_ROOM`
+  sets the room; `0` restores the previous behaviour; `/health` reports
+  `thinking_answer_room`. Only a request whose thinking would have run past
+  the line is affected.
+- **The harnesses' own names for the thinking controls are read**:
+  `thinking_budget_tokens`, `thinking_budget`, `thinking_token_budget` (the
+  three names Pi's `compat.thinkingTokenBudgetField` can send), the
+  `reasoning` object (`enabled`, `effort`, `max_tokens`: OpenRouter's shape,
+  sent by hermes-agent and aider) and the `thinking` object (`type`,
+  `budget_tokens`: Anthropic's shape, sent by aider's `--thinking-tokens`
+  and Kimi-style clients), on `/v1/chat/completions` and `/v1/responses`.
+  Two names with two values is a 400, as with the token budget. Before this
+  every one of them was silently dropped. `/health` lists them under
+  `supported`.
+
+### Documentation
+
+- A README section, *From an agent harness*: what Pi, oh-my-pi, opencode,
+  Codex CLI, hermes-agent, Cline, Roo Code and aider each send for thinking
+  to a custom OpenAI-compatible server (nothing, unless configured), and
+  the setting on each side that changes it.
+
+## 0.10.2
+
+### Fixed
+
+- **A non-streaming request now stops when its client disconnects**
+  (issue #58, @dabblingwithcode). Streaming requests have been cancelled on
+  disconnect since 0.5.7; a non-streaming one ran to its natural end (EOS,
+  `max_tokens` or the thinking budget) holding its slot, which is what
+  `in_flight: 1` for 150 s after the client had exited was. On every route
+  the connection is now watched once per token; on a disconnect the
+  generation is cancelled within a step, the slot and KV reservation are
+  released, `/health` and `/metrics` show it at once, and the log prints a
+  "client disconnected mid-request" line with the count dropped. The README's
+  cancellation passage says all of this.
+- **Several leading system messages render as one** (issue #60, @suvayu).
+  The model's chat template accepts a single `system` message and only as
+  the first, and refused `opencode`'s prompt, which older builds send as two
+  system messages. `/v1/chat/completions` now merges a leading run of
+  `system`/`developer` messages (strings or text parts) into one, as
+  `/v1/responses` already did. A system message after a user or assistant
+  turn is still refused, now with its position named.
+
+### Documentation
+
+- `docs/FLAGS.md` lists `HALOGEN_CACHE_DIR`, `HALOGEN_CACHE_DISK_GIB` and the
+  three `HALOGEN_COMPOSABLE_CONTEXT*` flags, which the README named and the
+  flag list did not; its "every flag is byte-identical except" note now also
+  names `HALOGEN_INDEXER_BUDGET` and `HALOGEN_COMPOSABLE_CONTEXT`. The
+  composable-context section says its store is in the server's memory, not
+  on disk, and gone at restart.
+
+## 0.10.1
+
+### Fixed
+
+- **Composable context: a long conversation could reuse the wrong retained
+  message, then the engine exited** (issue #59, @GavinAstk). With the flag on
+  and the host store at its byte budget (about 18 retained messages at the
+  default 4 GiB), retaining a new message could evict one while a request was
+  part-way through reusing others, and the request then reused a neighbour
+  of the message it meant to; when the two differed in length the engine
+  refused the next reuse and exited, closing every stream on the server
+  (`cc_place(... ): ... pos N != at`, then `502 engine closed the
+  connection`). A reuse is now checked against the message's own tokens
+  before anything is touched, a message that is gone or different is simply
+  read fresh, a placement the engine cannot make ends that one request with
+  an error instead of the process, and a message the prompt cache's snapshot
+  point had split no longer fails to be retained (`... raw rows ... not
+  stored` on stderr). Reproduced on 0.10.0 with the smoke that now guards it
+  and fixed in this build; with the flag off nothing changes.
+- **A text request that resumed from the prompt cache on a slot whose
+  previous request carried an image inherited that request's image position
+  table**, and its new tokens were rotated by it: the same greedy turn
+  diverged from a fresh run some 70 tokens in. Vision servers only
+  (`HALOGEN_VISION_TOWER`); a cache miss had always cleared it. A request
+  without images now clears the table on admission. Measured before and after
+  on the test machine: identical to the restart control after the fix.
+
+## 0.10.0
+
+### Added
+
+- **Prompt cache on disk** (`HALOGEN_CACHE_DIR`, off by default; issue #40
+  @D-revv, #4). The resume-anywhere prompt cache now also persists to a
+  directory, so a conversation survives a server restart instead of being
+  re-read from the start. Each turn's new attention rows are written behind
+  the request (nothing on the request path waits), and a request no longer in
+  memory is restored from disk: on the test machine a 32k conversation
+  resumed across a stop/start in a few seconds against about 40 s of cold
+  prefill. About 27 KiB per token (0.9 GB at 32k, 7.2 GB at 262k);
+  `HALOGEN_CACHE_DISK_GIB` bounds the directory (default 64, least recently
+  used conversations out). Restore from disk is exact (byte-identical to the
+  in-memory resume across the restart). Each build/weights/setting keeps its
+  own files and never restores another's. Needs a filesystem that accepts
+  direct I/O (a tmpfs or overlay is refused, the cache staying in memory).
+  The bundled compose sets a 60-second stop grace period so the last turn is
+  flushed. See the README's "Prompt cache on disk" section.
+
+## 0.9.1
+
+### Added
+
+- **`HALOGEN_INDEXER_BUDGET`: the model's sparse-attention budget, raisable at
+  startup** (issue #57, @KaiFelixBennett). The checkpoint attends the top 512
+  blocks (2,048 tokens) of the context per query; that value is the default
+  and the byte-identical path. Set to 4096 (any value 2048–8192, rounded down
+  to a multiple of 16) the model attends a superset of what it was trained on,
+  which is a different configuration: in the README's retrieval battery
+  (16k + 32k rows, 96 cases) 4096 read 95/96 against the default's 94/96,
+  recovering both of the default's misses, for 4.5% / 6.7% of prefill at
+  8k / 32k and about 2% of decode; perplexity moved within noise on prose,
+  code and an agentic transcript. 8192 read 96/96 at a consistent perplexity
+  cost and 19% of prefill. Printed at startup, on the INFO line, and at
+  `/health.indexer_budget`; speculative decoding stays byte-identical to
+  serial at every budget. The README's "Attention budget" section has the
+  table.
+
+## 0.9.0
+
+### Added
+
+- **Composable context, opt-in preview** (`HALOGEN_COMPOSABLE_CONTEXT=1`, off
+  by default). With the flag on, each message at or above
+  `HALOGEN_COMPOSABLE_CONTEXT_FLOOR` (default 2048 tokens) is retained in a
+  host store (`HALOGEN_COMPOSABLE_CONTEXT_BYTES`, default 4 GiB, LRU) as it is
+  first read; when a later request repeats that message at any offset behind
+  the same system prompt, the server reuses the retained work instead of
+  reading it again. The use case is harness compaction: a transcript whose head
+  is replaced by a summary and whose tool results are kept verbatim reads only
+  the summary and the new turn fresh, so the first token after a compaction
+  arrives in a couple of seconds instead of after a full re-read. Needs the
+  prompt cache (`HALOGEN_PROMPT_CACHE=2`) and the KV pool (`HALOGEN_KV_POOL=1`);
+  refuses image requests. **Not the prompt cache and not byte-identical:** a
+  reused answer is very close to, but not identical to, the one you would get
+  by reading the text fresh (retrieval in testing held at the same rate); with
+  the flag off nothing changes and every byte-identical guarantee stands. A
+  preview: expect it to get more accurate and broader in later releases.
+  `/health.composable_context` reports it; the finish line names how many
+  chunks a request reused.
+
+## 0.8.1
+
+### Fixed
+
+- **A token the schema grammar refuses ends the request, not the engine
+  connection** (issue #53, @mjbrn, confirmed by @HIM0413). The speculative
+  loop returned the same code for "the grammar refused this token" as for a
+  dead socket, so the daemon dropped its connection to the front end: a 502
+  for the request and a `ConnectionResetError` for the next one on the same
+  connection. It now ends that one request with a `400` whose message names
+  the token, and every other stream is untouched. The message itself is
+  fixed too: a request that ended mid-generation printed its statistics
+  where the reason belongs (`the engine refused this request: 0 0 0 0 0 0
+  0 0`). The disagreement between the device mask and the host automaton at
+  a union-typed property that produced the illegal token is still open;
+  that request fails cleanly now.
+- **The union-type failure's root cause: a UTF-8 continuation-byte count was
+  missing from the grammar's state key**, so a string state mid-multibyte-character
+  shared a mask with its completed-character sibling and the engine admitted a
+  token it then refused. Reproduced on served requests (a free string of emoji
+  and accented text failed 6 of 8 times before the fix, 0 of 8 after) and
+  fixed; the structured-output test suite is unchanged (128/128).
+- **The prompt cache keeps two entries per conversation, so one session's
+  tool calls no longer evict every other session** (issue #54,
+  @loonylabs-dev). Each turn stored a new entry at a new length and the
+  global LRU then dropped other conversations' anchors: eighteen tool calls
+  in one session cost a 120k conversation a 120 s re-prefill. A region now
+  holds its system-prompt anchor and its newest history entry; a third store
+  replaces the leaf in place. `/cache` reports `superseded`.
+- **The vision tower runs only for images the prompt cache did not cover**
+  (issue #52, @Biggles10-claude). Every image in a request went through the
+  tower on every turn, 2.5 s per 1920x1080 frame, including images whose
+  tokens the cache had restored and whose tower output nothing then read: an
+  identical 8-image request the engine called 0.05 s of prefill took 21.7 s.
+  Covered images now skip the tower; their geometry is still bound.
+
+### Added
+
+- **`max_thinking_tokens`, a thinking budget** (issue #56, @loonylabs-dev),
+  on `/v1/chat/completions` and `/v1/responses`, with
+  `HALOGEN_MAX_THINKING_TOKENS` as the server default (the request wins). If
+  the model has not closed its think block after that many generated tokens,
+  the engine closes it (Qwen's own budget sentence, then `</think>`) and the
+  answer follows in the same stream, on the same state: no cancel, no second
+  request, no re-prefill. Greedy decoding at 100k+ of context can loop inside
+  the block and spend the whole `max_tokens` there; the model card's sampling
+  settings are the cure, this bounds the damage. Unset, nothing changes.
+  `/health` reports `max_thinking_tokens_default`.
+- **A floating `:latest` tag** on the container image, from this release on
+  (issue #55, @brzewVCE). The README and compose file stay pinned; `/health`
+  reports whether the front end and engine versions match.
+
+### Documentation
+
+- README: slots cap admission and extra clients queue rather than dilute,
+  with @eemin's sweep from issue #51; the cache's two entries per
+  conversation and when to raise `HALOGEN_CACHE_ENTRIES`; the thinking
+  budget beside the sampling settings.
+
+## 0.8.0
+
+### Added
+
+- **Structured output: `response_format` `json_schema` and `json_object`
+  on `/v1/chat/completions` and `/v1/completions`, `text.format` on
+  `/v1/responses`** (issues #14, @hvico, and #43, @fordiy). The engine
+  enforces the schema while it decodes: each token is the greedy choice
+  among the tokens the schema allows next, so the reply parses and
+  validates by construction. The grammar engine is the server's own (no
+  third-party library): OpenAI's strict-mode subset plus `json_object`,
+  keys in schema order, optional keys skippable, `$ref`/`$defs` with
+  recursion, `anyOf`; `pattern`, `format`, `allOf`, `not`, `if`/`then`/
+  `else` and the other keywords it does not enforce are refused by name
+  (the README lists the three sets, and so does `/health` under
+  `structured_output`). The reasoning block stays unconstrained (the JSON
+  starts after `</think>`), a request with tools may open a tool call
+  instead of the JSON (the schema binds the final text, not a call: the
+  Codex approvals reviewer, which sends a schema on every auto-reviewed
+  approval, keeps its read-only tool checks), and only the end-of-turn
+  token is legal once the value is complete. Every request without a
+  schema is bitwise what it was; a constrained request is identical
+  serial, with the draft head, with prompt lookup, and beside other
+  requests. Greedy only: a sampled request with a schema is a 400 (say
+  `temperature: 0`), and so is a schema with an image. `HALOGEN_GRAMMAR=0`
+  turns it off.
+- **`/metrics`: Prometheus text in llama-server's metric names** (asked
+  for on r/LocalLLaMA after 0.7.0's `timings`). `llamacpp:prompt_tokens_total`,
+  `prompt_seconds_total`, `tokens_predicted_total`,
+  `tokens_predicted_seconds_total` (counters over the engine's own per-request
+  numbers, `prompt_n` being the processed count), `prompt_tokens_seconds` and
+  `predicted_tokens_seconds` (gauges over the requests since the last scrape,
+  as llama-server's), `requests_processing`, `requests_deferred`,
+  `kv_cache_tokens` and `kv_cache_usage_ratio` (the positions the requests in
+  flight reserve, prompt + `max_tokens` each, over the pool), plus `halogen:`
+  counters for what llama-server has no name for: requests, prompt tokens the
+  cache covered, draft tokens proposed and accepted, structured requests.
+  Always on, no engine round trip; `/health` names it.
+- **`reasoning_effort: "none"` turns thinking off for the request** (issue
+  #50, @devThLan), on `/v1/chat/completions` and as `reasoning: {"effort":
+  "none"}` on `/v1/responses`. It was a 400, and agent clients send it on a
+  real path (Hermes turns thinking off for the continuation after a turn that
+  spent its whole budget thinking, and for title generation). It is the same
+  as `chat_template_kwargs: {"enable_thinking": false}`, wins over
+  `HALOGEN_ENABLE_THINKING=1` for that request, and `/health` lists it under
+  `reasoning_effort_values`. The server-side default for thinking off stays
+  `HALOGEN_ENABLE_THINKING=0`; `HALOGEN_REASONING_EFFORT=none` refuses at
+  startup and says so.
+
+### Fixed
+
+- **`timings.prompt_n` is the number of prompt tokens the engine processed,
+  not the whole prompt** (issue #48, @felladrin). `prompt_ms` was always the
+  engine's time on the tokens after the prefix the cache covered, so on a warm
+  turn `prompt_per_second` divided the whole context by the tail's time
+  (97,052 tokens over 1.8 s read as 53,000 tok/s in llama-swap). Now
+  `prompt_n` excludes `cache_n`, as llama-server's does (the context is
+  `prompt_n + cache_n + predicted_n`), and the rate is over those tokens; a
+  fully cached prompt reads `prompt_n: 0` and no rate. `usage` is unchanged:
+  `prompt_tokens` is still the whole prompt with `cached_tokens` beside it.
+
+## 0.7.0
+
+### Added
+
+- **Bring your own GGUF.** `HALOGEN_CHECKPOINT` may name a llama.cpp GGUF of
+  this model (any shard of a split), and the engine opens it itself: at
+  startup it repacks every tensor but the lookup table into the layouts its
+  kernels read, losslessly (the file's own quantized values, moved, never
+  requantized), reads the lookup table from the GGUF in place, and takes the
+  draft head from a 1.4 GiB file of its own (`qwen38-flash-next-mtp.hgn`, on
+  the weights repo; fetched by `HALOGEN_DOWNLOAD`, or `HALOGEN_MTP_HEAD`). The
+  GGUF is then the only large file on disk: 94 GB for unsloth's `UD-IQ4_XS`
+  against the 118 GiB of the engine's own checkpoint.
+
+  Read losslessly: `IQ4_NL`, `IQ4_XS`, `IQ3_S` and `Q4_0` experts, a `Q8_0`
+  trunk, a `Q6_K` output projection, which is unsloth's `UD-IQ4_XS` build and
+  any `llama-quantize` output in those types. The K-quant builds (`Q4_K`,
+  `Q5_K`, `Q5_1`, `Q4_1`, unsloth's `UD-Q4_K_XL`) and the IQ2/IQ1 families are
+  refused by name before anything is loaded; those need kernels for their
+  block layouts and are next.
+
+  Measured on the reference machine with unsloth's `UD-IQ4_XS` against the
+  engine's own checkpoint with its quality sidecar, MTP on in both:
+  perplexity 0.7 to 2.1% better on three corpora and the fixture agreement
+  184/192 against 182 (the 8-bit trunk carries it); prefill within 1% at
+  8,192 and 32,768; serial decode 25.4 tok/s against 35.4 (the 8-bit trunk
+  is 2 GB more a token, and no lossless repack avoids it), 42-45 on
+  coding-agent turns with both drafters against 55-57. Against llama.cpp on
+  the same file, same machine, same session, at their settings on stock ROCm
+  7.14: prefill 1.9x at 8,192 and 2.7x at 32,768, serial decode 1.1 to 1.3x,
+  1.9x on coding-agent turns; every speculative stream byte-identical to
+  serial greedy on their file too. The repacked weights are byte-identical
+  to `tools/gguf2hgn.py`'s (the reference conversion: every tensor's sha256,
+  the header and the table), and a server on the GGUF is bitwise a server on
+  that file. The engine's own checkpoint path did not move (bitwise on a
+  32,768-token prefill and two fixtures).
+
+  Startup on a GGUF is a read of the whole file on eight threads: 18 s from
+  a cold disk on the reference machine, 9 s warm, on every start (the
+  repacked weights live in RAM; the page cache is dropped behind them).
+  `HALOGEN_GGUF_CACHE=1` writes the repack out once beside the GGUF (70 GiB,
+  five minutes on the reference drive; `=<dir>` puts it elsewhere) and later
+  starts take the engine's own path, 1.4 s warm and 16 s cold; a cache is
+  checked against the shards' sizes and modification times and is never used
+  stale (rebuilt with the flag, ignored without, both said in the log).
+  `HALOGEN_GGUF_THREADS` (default 8) sets the repack's workers.
+
+- **`/v1/responses` returns the model's reasoning** (#44, reported with
+  frame-by-frame timings by [@samuelobao](https://github.com/samuelobao)): a
+  `reasoning` output item ahead of the message, its text as a `reasoning_text`
+  content part streamed in `response.reasoning_text.delta` events, and, when
+  the request asks for a reasoning summary (Codex sends
+  `reasoning: {"summary": "auto"}`), the same text again as `summary_text`
+  with the `response.reasoning_summary_*` events, since there is no separate
+  summarizer. Codex renders summaries by default and raw content only with
+  `show_raw_agent_reasoning`. Both routes now report
+  `output_tokens_details.reasoning_tokens` (`completion_tokens_details` on
+  chat), counted from the position of the `</think>` token, and the
+  Responses usage carries `input_tokens_details.cached_tokens`. Dropping the
+  reasoning was a decision from when the only documented reasoning item
+  carried an encrypted payload; it no longer holds.
+- **Statistics in llama-server's shape** (#45, requested by
+  [@DomiStyle](https://github.com/DomiStyle) for llama-swap): a `timings`
+  object on every response on both routes, on the non-streamed body, the
+  stream's finish chunk and its usage chunk, and the `response.completed`
+  frame: `prompt_n`, `predicted_n`, `prompt_ms`, `predicted_ms`,
+  `prompt_per_second`, `predicted_per_second`, `cache_n`, `draft_n`,
+  `draft_n_accepted`. Every field is the engine's own per-request line;
+  `draft_n` counts the draft head's proposals and the prompt-lookup chains'
+  proposed tokens together (the engine now reports the latter), so drafted
+  against accepted is exact.
+- `/health` reports `checkpoint_format`: `hgn`, `gguf` or `gguf-cache`.
+- `flash_serve --repack IN.gguf --out OUT.hgn [--with-table]` writes the same
+  repack to a file, for anyone who wants the artifact; `--repack-hash` prints
+  a sha256 per tensor for the file it would write.
+
+### Fixed
+
+- **Every start on the current quality sidecar said it predated 0.6.0**, and
+  with `HALOGEN_DOWNLOAD` set and the volume writable fetched the sidecar
+  again each time. The check read the file's first 256 KB through a pipe
+  into `grep -q` under `pipefail`; the marker it looks for sits at byte
+  115,944 of the published file, past the pipe buffer, so `grep` exited on
+  the match, `head` died of SIGPIPE and the pipeline's status was the
+  producer's. Found and diagnosed by
+  [@Biggles10-claude](https://github.com/Biggles10-claude) (#47). The
+  producer is a process substitution now, and the release gate runs a cell
+  on the current sidecar (every earlier run had only the stale one to test
+  against).
+
+### Documentation
+
+- README: [Bring your own GGUF](README.md#bring-your-own-gguf), with the
+  format table, the memory and disk figures, the quality and decode trade in
+  numbers, and the same-file comparison against llama.cpp. The published
+  prefill, decode and quality rows are unchanged: the engine's own checkpoint
+  is what they measure.
+
+## 0.6.3
+
+Engine only, one loop. No kernel change, no weight change, bitwise identical
+output (checked on a 32,768-token prefill and on a 1,068-token fixture), so
+every published prefill, decode and quality number is unmoved; the prefill
+rows are best-of-two and this changes the first pass only.
+
+### Fixed
+
+- **The first long prompt after a restart read the lookup table one row at a
+  time.** The model's 47.7 GiB n-gram table is read through the page cache,
+  never held in RAM, and on a 128 GB machine running this server there is
+  never enough cache left to hold all of it (about 13 GiB at the defaults),
+  so any prompt whose rows are not cached reads them from disk. Each row is
+  one 4 KB random read, and the engine issued them one after another and
+  waited for each: 28 MB/s on the reference machine's NVMe drive, a
+  32,768-token prompt paying 46 to 52 s on top of its usual 25 s with the
+  table evicted, and 13.5 s on top of an 8,192-token prompt's 7 s. On a
+  host with less RAM to spare the table is never cached, and every long
+  prompt paid that, at whatever the drive or its contention made one read
+  cost; that is the mechanism behind the minutes reported on #10 and #22
+  by [@mqtt-fan](https://github.com/mqtt-fan), whose watchdog then read the
+  silence as a wedge.
+
+  The rows are now read 64 at a time (`HALOGEN_NGRAM_GATHER_THREADS`, `1`
+  restores the old loop). Same bytes to the same places. Measured on the
+  reference machine with the table evicted before each run: the
+  32,768-token first prompt costs 1.3 s over its usual time instead of 46
+  to 52 (8 threads 7.3 s, 16 and 32 about 3 s, 64 1.3 s, 128 1.2 s); the
+  8,192-token one under half a second instead of 13.5. The health PING is
+  answered through the read as before. The `lookup table: ... took N s`
+  line now says how many threads read it.
+
+  What this does not change: a drive that tops out below 64 reads in
+  flight (SATA queues 32; a spinning disk is slow at any depth) gets that
+  drive's depth rather than one; decode is untouched (16 rows a token); and
+  the amount of the table that fits in cache is the same, so
+  `HALOGEN_KV_POOL_POSITIONS=262144` still leaves more of it resident.
+
+### Documentation
+
+- README: the cold-start cost is stated with the version that changed it, in
+  the pool section and in "If the server starts but crawls on long prompts";
+  `--bench-prefill` in the engine's harness prints each pass, so the
+  first-pass cost is a number in the log rather than something inferred.
+
+## 0.6.2
+
+Front-end only (`tools/serve_api.py`). No kernel change, no weight change, no
+change to any answer on a request that does not mention the placeholder, so
+every published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **A conversation that mentioned `<|image_pad|>` was unservable.** Reported
+  with a precise repro and the mechanism by
+  [@Syakyr](https://github.com/Syakyr) (#39). The tokenizer parses its added
+  tokens out of ordinary text, so the thirteen characters `<|image_pad|>`
+  typed by a user (a pasted log, a quoted traceback, a bug report about this
+  server) or printed by the model became the same special id the chat
+  template writes for an image, and the engine's 0.5.8 check refused it as a
+  placeholder with no image behind it. The next turn re-tokenizes the
+  history, so one mention by either side made every later turn a 400 and the
+  only recovery was a new session with the string rewritten. 0.5.8's
+  changelog called that path "the same defect"; it is not, and the reporter
+  is right that a mention has to be servable as text.
+
+  The API now sends a mentioned placeholder as the ordinary tokens of its
+  spelling (`<`, `|`, `image`, `_pad`, `|`, `>`), decided on the token ids
+  after the template runs, so the model reads exactly the characters that
+  were written and the engine never sees an uncovered placeholder. The
+  template's own placeholder is told apart by the `<|vision_start|>` and
+  `<|vision_end|>` it is always written between when the request carries an
+  image; with no image on the request every placeholder is a mention.
+  `<|video_pad|>` in text is text the same way. Applies to
+  `/v1/chat/completions`, `/v1/responses` and `/v1/completions`. Every
+  request without a mention sends the same ids it did before, checked on the
+  gate. The engine's refusal (0.5.8) is unchanged; from this API it is now
+  reachable only by typing the whole
+  `<|vision_start|><|image_pad|><|vision_end|>` sequence in a request that
+  also attaches an image, which is refused with a message naming both counts.
+
+  A `video` content part is now refused by the API before the template runs
+  (this server has no video path); it used to reach the engine and be
+  refused there, after the stream had started.
+
+- **An error after a streaming response had started cut the connection.**
+  The second half of #39. The engine's refusal, and the first-token and
+  mid-decode timeouts, were raised after the SSE headers had gone out, so
+  the client saw a dropped stream and the log Starlette's
+  `Caught handled exception, but response already started`. A streaming
+  request now ends with its wire's own error: on `/v1/chat/completions` and
+  `/v1/completions` a `data: {"error": {...}}` frame followed by
+  `data: [DONE]` (what the OpenAI SDKs raise as an `APIError`), on
+  `/v1/responses` an `error` event. The log gets one line with the reason.
+  Non-streaming requests still get the 400 they always did.
+
+- **The prompt cache's snapshot point could drift on a conversation with
+  images.** Found while fixing the above: the API added an image's token
+  growth to the snapshot point once per token it walked past the shifted
+  value, not once. Unreachable in practice for an image (its growth outruns
+  the few tokens that follow the history point) and reachable for a
+  mention's five; both passes now read the original points. No served
+  number moved.
+
+## 0.6.1
+
+Serving surface and startup legibility. No kernel change, no weight change, no
+change to any answer, so every published prefill, decode and quality number is
+unmoved.
+
+### Fixed
+
+- **Tool-call arguments were flushed as one burst, and Node clients hung up on
+  the long ones.** Reported with a raw-client measurement by
+  [@smazurov](https://github.com/smazurov) (#36) and, from the client side,
+  by [@iTechMedic](https://github.com/iTechMedic) (#3), who showed every
+  failing client was Node/undici, every passing one was not, and that
+  re-chunking the identical bytes through a proxy removed every failure. The
+  streaming splitter emitted nothing about a call until its closing tag
+  arrived, so a 150-character command was 1.4 s of silence and a file-writing
+  call was minutes, which is undici's 300 s inactivity timer with no client
+  setting to change it.
+
+  A call's id and name now go out as soon as the function tag closes, a
+  string parameter streams as it is written (JSON-escaped in pieces, and the
+  pieces concatenate byte for byte to what a non-streaming request returns),
+  and a non-string parameter goes out when its value closes, because the wire
+  carries values untyped. On the gate, the report's `bash` command is 43
+  argument frames spread over the value's generation instead of 3 at its end.
+  A call cut off by `max_tokens` now leaves its partial arguments on the wire
+  with `finish_reason: "length"`, as OpenAI does.
+
+  Separately, a streaming response now sends an SSE comment line
+  (`: keepalive`) whenever nothing else has gone out for 10 s
+  (`HALOGEN_SSE_KEEPALIVE_S`, 0 disables). SSE parsers ignore comment lines
+  and every HTTP client's inactivity timer resets on one. This also covers a
+  long prefill, which sends nothing before its first token. The
+  client-disconnected log line now ends with the largest gap between frames,
+  the age of the last frame at the hangup, and the keepalive count.
+
+- **The `developer` role was refused with a 400.** Reported by
+  [@felladrin](https://github.com/felladrin) (#32), confirmed by
+  [@k4ss4n](https://github.com/k4ss4n). OpenAI clients send it for reasoning
+  models; pi does for every model it marks as one. It maps to `system` before
+  the template runs, on `/v1/chat/completions` as it already did on
+  `/v1/responses`.
+
+- **Four `/cache` fields were placeholders.** Found while answering
+  [@carrot-root-ai](https://github.com/carrot-root-ai) (#31). `entries`,
+  `evicted`, `cap_bytes` and `reserved_bytes` were stand-ins from when the
+  cache held one entry and were never updated for the eight-entry cache, so a
+  two-prompt run read `entries: 1, evicted: 3`. `entries` and `evicted` are
+  real now; `cap_bytes` and `reserved_bytes` are replaced by `max_entries`
+  and `last_entry_bytes`, and `bytes` is what is resident for the live
+  entries. The counters that were already right (`hits`, `misses`, `stores`,
+  the timings) are unchanged.
+
+### Added
+
+- **`HALOGEN_ENABLE_THINKING`**, the ninth request default, alongside the
+  eight from 0.5.9. `0` renders every request that does not say otherwise
+  without the thinking block; a request that sends `enable_thinking` wins.
+  `/v1/responses` has no such field, so this is the only way to run that
+  route without thinking.
+
+- **A reservation that runs long says why while it runs.** Reported by
+  [@felladrin](https://github.com/felladrin) (#33), who watched
+  `still loading, 300s elapsed` five times on the KV pool step and could not
+  tell a slow disk from a machine that would never finish. Every 30 s
+  (`HALOGEN_RESERVE_TICK_S`) during the working-memory and KV-pool
+  reservations the engine now prints the free contiguous 2 MiB block count
+  and the compaction stalls since the reservations began. Stalls climbing
+  means the kernel is compacting host memory, which finishes on its own. The
+  pool is not sized against the block count, and the report's own log shows
+  why that would not have helped: 16.6 GiB was contiguous two lines before a
+  7.2 GiB pool stalled, and the 21 GiB working reservation between them took
+  it.
+
+### Changed
+
+- **`seccomp:unconfined` is gone** from the compose file and both run
+  commands. Suggested by [@rcmorano](https://github.com/rcmorano) (#8) and
+  measured: the image starts and serves without it under Podman, and the
+  reporter runs Docker without it. `ipc: host` stays; the compose file now
+  says why beside it (the GPU runtime dies in 2 s without it, and no
+  `shm_size` substitutes). If a Docker install breaks on the default profile,
+  the line comes back and this file will say so.
+
+- **The published 0.6.0 source tree lagged the 0.6.0 image on
+  `deploy/entrypoint.sh`.** The image's entrypoint checks whether the quality
+  sidecar on disk predates 0.6.0 (no draft-head entries), fetches just that
+  2.4 GiB file when `HALOGEN_DOWNLOAD` is set and the volume is writable, and
+  otherwise says what is missing; the tree published with 0.6.0 did not carry
+  that change. It does now, and the README's note on the models volume says
+  when a start re-fetches.
+
+### Documentation
+
+- The three kernel flags the README lists for completeness
+  (`amdgpu.vm_update_mode=0`, `amdgpu.noretry=0`, `amdgpu.sg_display=0`) now
+  say they are unmeasured in both directions and cite
+  [@felladrin](https://github.com/felladrin)'s report (#34) of an amdgpu
+  deadlock on a boot that had the first two set: one machine, one occurrence,
+  not isolated to either flag.
+
+## 0.6.0
+
+Faster decode on the traffic an agent produces, and a better draft head. No
+kernel change and no change to any answer: at temperature 0 every token is
+still the model's own greedy choice, verified on every release, and the
+sidecar's 723 existing tensors are byte-identical to 0.5.x's.
+
+### Added
+
+- **Prompt lookup beside the MTP head.** When the last three tokens of the
+  answer already occur earlier in the request's own context (the prompt or
+  what it has generated so far), the three tokens that followed that earlier
+  occurrence are proposed as one chain and verified in a single step, and the
+  head's own draft has to open the chain. Nothing is drafted by a model, so it
+  costs nothing where an answer is new text and pays where it repeats its
+  context, which is most of what a coding agent's turn is: tool-call
+  arguments, file paths, code that quotes the file being edited. Measured on
+  the engine, thinking off, coding-agent turns (SWE-agent trajectories cut at
+  an assistant turn, six prompts, 400 tokens each): **49.1 tok/s with the head
+  alone, 56.3 with prompt lookup beside it (+15%)**, serial 36.8; on
+  function-calling turns (Hermes, six prompts) 48.8 to 53.1 (+9%). With thinking on,
+  the served default: 49.2 to 55.7 on the same SWE prompts (+13%), because
+  this model's reasoning quotes the task and the file. Prose and code text are
+  unchanged within noise. Greedy requests only; a sampled request uses the
+  head alone; like the head it drafts while the request is the only one
+  generating, and the concurrency rows are unchanged (2 streams 56.5 and 4
+  streams 77.1 tokens/s total on this image, every stream byte-identical to
+  alone). `HALOGEN_PLD=0` turns it off. Every one of those runs produced the
+  serial run's tokens exactly.
+
+- **The MTP head's own projections at 8 bits**, in the sidecar. The head had
+  shipped at the base file's 4-bit rounding since 0.1.0 and nobody had
+  measured what that cost, because there was no other head to compare it with.
+  At 8 bits its drafts are accepted 59% of the time on prose against 51%,
+  which is about 4% of decode on prose (43.1 to 44.8 tok/s at 1,500 tokens of
+  context) and within noise on code. The sidecar grows by 0.09 GiB (2.31 to
+  2.40 GiB); its existing 723 tensors are unchanged byte for byte, so
+  `HALOGEN_CK_OVERLAY` and the speed arm behave as before. An older image
+  reads the new file and gains the same.
+
+- The per-request log line ends with the prompt-lookup rounds (`pld N
+  rounds, X acc/round`), the engine's `D` line carries them as two trailing
+  fields, and `/health` reports `prompt_lookup`. The image's own `bench` over
+  its ten prompt shapes reads 45.3 tok/s mean with speculation (43.6 on
+  0.3.0, the same instrument).
+
+### Changed
+
+- The speculative verify reserves 4 rows instead of 2 (about 0.2 GiB of device
+  memory), so a three-token chain fits; the KV-pool fit accounts for it.
+
+## 0.5.9
+
+Server-side defaults for the fields a request leaves out, and two things the
+log now says that it could not before. No kernel change, no weight change, no
+numeric change on any path a request took before: every published prefill,
+decode and quality number is unmoved.
+
+### Added
+
+- **Server-side defaults for sampling, the token budget, and reasoning
+  effort.** Asked for by [@Mushoz](https://github.com/Mushoz) (#30).
+  `HALOGEN_TEMPERATURE`, `HALOGEN_TOP_P`, `HALOGEN_TOP_K`, `HALOGEN_MIN_P`,
+  `HALOGEN_PRESENCE_PENALTY`, `HALOGEN_FREQUENCY_PENALTY`,
+  `HALOGEN_MAX_TOKENS_DEFAULT` and `HALOGEN_REASONING_EFFORT` each set the
+  value a request gets when it omits that field, on all three routes. A field
+  the request sends always wins; a default fills only a field the request
+  omits; a request that sends `temperature: 0` decodes greedy and takes none
+  of the sampling defaults. A value outside its range refuses to start,
+  before the model loads, naming the variable. `/health` reports what is set
+  under `server_defaults` and says which path a temperature-less request
+  takes. The image's own default is unchanged (greedy); the README now gives
+  the model card's settings as the three `-e` lines that switch to them.
+
+### Fixed
+
+- **The engine answers its health check while it reads the lookup table.**
+  Reported by [@mqtt-fan](https://github.com/mqtt-fan) (#10, #22). Reading
+  the model's 47.7 GiB lookup table at the start of a prefill was the one
+  step that could not answer the container's PING. On a host with too little
+  RAM left for the table's file cache that read runs for minutes, and the
+  watchdog took a working server down as a wedge, twice, while the same host
+  with the watchdog off finished every request. The read now answers PING on
+  the same cadence as the rest of a prefill, prints `lookup table: ... took
+  N s` when it runs long, and the watchdog's message says what the code
+  guarantees. The startup pre-flight warns when 10 GiB or more of host RAM
+  is already in use before the engine starts, which is the condition. The
+  slowness itself is the host's memory, not the engine, and is not changed.
+
+- **`commit N/round` in the request log counted tokens the request produced
+  beside other streams.** Same reporter (#22), and the same shape in #3. A
+  request alone for one speculative round and then sharing the engine for
+  189 tokens printed `1 rounds, commit 190.00/round`, which read as a decode
+  defect and was not one. The ratio is now over the speculative rounds'
+  tokens only (healthy is 1.6 to 1.8), and the line ends with `N tok beside
+  other streams` when any were.
+
+### Documentation
+
+- The README's Sampling section gives the model card's recommended settings
+  and how to make them the server's default; the budget section explains why
+  the default budget is a concurrency decision on a 128 GB host.
+
+## 0.5.8
+
+One engine check that can only refuse, and a version that can be read from
+inside the container. No kernel change, no weight change, no numeric change:
+every request the engine served before is served identically, so every
+published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **An image placeholder with no image behind it was answered as if there
+  were one.** Reported by [@jtnishi](https://github.com/jtnishi) (#26). Their
+  compose file ran the `api` container at 0.4.4 and the `engine` at 0.5.6.
+  That front-end predates image support: it rendered the chat template's
+  `<|vision_start|><|image_pad|><|vision_end|>` for the image part and never
+  decoded or sent the pixels. The engine then prefilled the placeholder's
+  ordinary embedding, and the model, which has learned that an image lives at
+  that token, described one. The result was a fluent, confident, different
+  picture every run, unaffected by temperature, with nothing anywhere saying
+  a thing had gone wrong. Reproduced here against one engine: 60 prompt tokens
+  through the 0.4.4 front-end against 2,559 through the current one, for the
+  same image.
+
+  The engine now refuses any prompt in which a placeholder token is not
+  covered by an attached image, naming the token position and the likely
+  cause, and the same goes for a video placeholder (this server has no video
+  path) and for an image declared over a token that is not a placeholder.
+  The check runs once over the prompt ids at admission and can only refuse,
+  so an accepted request is untouched. It also closes a path that was open
+  from any client at any version: a user message whose text contains the
+  literal string `<|image_pad|>` reached the engine the same way, and was
+  answered the same way.
+
+- **The engine's reason for refusing a request now reaches the client.**
+  Until now it went only to the engine's log, and the front-end's `400` had to
+  guess (the old text blamed prompt length). The reason rides the internal
+  protocol after the fixed fields, and the front-end repeats it verbatim:
+  `the engine refused this request: prompt token 38 is the image placeholder
+  <|image_pad|> and no image covers it: ...`.
+
+### Added
+
+- **Each container says which release it is, and the front-end compares.**
+  Nothing running inside the image could read the version label, so neither
+  log in #26 printed one and `/health` had none to show; a careful reporter
+  posting both logs could not see that they disagreed. The first line of every
+  mode is now `halogen: halogen-flash-server 0.5.8, mode api`, the front-end
+  prints its own version beside the engine's at startup and prints a
+  `WARNING` when they differ, and `/health` carries
+  `version: {"api": ..., "engine": ..., "match": ...}`. A mismatch is a warning
+  and not a refusal, because a split across a patch release is harmless and
+  refusing it would break a working install; the engine-side check above is
+  what turns the harmful case into an error.
+
+### Documentation
+
+- The compose file and the README now say it in one place: **both services
+  run the same image tag.** When you bump one, bump the other.
+
+## 0.5.7
+
+Front-end only. No engine change, no kernel change, no weight change, so every
+published prefill, decode and quality number is unmoved.
+
+### Fixed
+
+- **An idle connection was closed after five seconds, and the next request on
+  it failed.** Reported by [@iTechMedic](https://github.com/iTechMedic) (#25).
+  The server never set uvicorn's keep-alive timeout, so it ran at the framework
+  default of 5 s on every release ever shipped. An agent idles between turns for
+  as long as a tool call, a file write, or a person reading the last answer
+  takes, and because `POST` is not idempotent most HTTP clients will not quietly
+  retry on a fresh socket the way they would for a `GET`. The failure therefore
+  reached the user as a socket error partway through a long session.
+
+  The default is now 300 s, and `HALOGEN_KEEPALIVE_TIMEOUT` sets it. An idle
+  connection costs a file descriptor and holds no conversation slot, so there is
+  no reason for it to be short. The race is inherent to HTTP keep-alive, since a
+  server may close at the moment a client writes, so a client that pools
+  connections should still retry a reused socket; what the old default did was
+  turn a rare race into a constant one.
+
+  The report is worth reading for its method. The first reproduction idled 6, 30
+  and 90 seconds between reuses, all above the threshold, which a server closing
+  after *every* response would have matched exactly. Asked for a control, they
+  added back-to-back reuse at zero idle and then bracketed the boundary to
+  between 4 s and 5 s.
+
+- **`chat_template_kwargs` was accepted and silently ignored.** Reported by
+  [@nortejiang-tech](https://github.com/nortejiang-tech) (#24). vLLM and SGLang
+  take the template controls nested, as
+  `chat_template_kwargs: {"enable_thinking": false}`, and that is what most
+  agentic clients send because that is what they were written against. This
+  server declared those controls only as top-level fields, so the nested form
+  was discarded with no warning and no log line: a caller who asked for thinking
+  off got a `200` with thinking on.
+
+  Both spellings now reach the same three controls: `reasoning_effort`,
+  `enable_thinking` and `preserve_thinking`. Sending a control both ways is fine
+  when the values agree and a `400` when they disagree, and an unsupported key
+  inside `chat_template_kwargs` is a `400` naming the keys that work rather than
+  a silent drop.
+
+### Added
+
+- **`/health` says what the token budget is spent on.** Raised by
+  [@tretyakevich](https://github.com/tretyakevich) (#21) and
+  [@nortejiang-tech](https://github.com/nortejiang-tech) (#24). `max_tokens`
+  bounds reasoning and content together, and with no `reasoning_effort` sent the
+  chat template's own default is `xhigh`. On a long agentic prompt that can
+  consume the entire budget before the model closes its thinking block, and the
+  caller then receives an empty `content`, the whole reply in
+  `reasoning_content`, and `finish_reason: "length"`. At least one agent harness
+  reads that as "the model returned no assistant message" and retries, which is
+  deterministic at temperature 0 and so repeats exactly.
+
+  None of that was discoverable. `/health` advertised `max_tokens_default` and
+  said nothing about what consumes it. It now reports
+  `reasoning_effort_default`, `reasoning_effort_values`,
+  `token_budget_covers_reasoning` and `chat_template_kwargs` beside it. To turn
+  reasoning off entirely, send `enable_thinking: false`; `reasoning_effort:
+  "minimal"` is an alias for the template's `low`, which still reasons.
+
+- **A client that hangs up mid-stream now says so in the log.** Raised by
+  [@iTechMedic](https://github.com/iTechMedic) while diagnosing #3, which stays
+  open. Until now a hangup and a clean finish produced identical output: uvicorn
+  logs `200 OK` either way, because the status went out with the headers long
+  before, and the per-request summary never printed because the generator was
+  cancelled before it could emit one. The entire server-side trace of an
+  abandoned stream was a bare access line indistinguishable from success.
+
+  That is a hole in the log, and a hole in a log gets filled by someone's
+  inference: the reporter reasoned from the absence of our own timeout message
+  that the engine had stalled, and the silence was ours. There is now one line
+  on the disconnect path, naming the response id, the frames and characters
+  already sent, and the elapsed time. A disconnect is a normal event rather than
+  an error, so it is a line and not a traceback.
+
+## 0.5.6
+
+### Fixed
+
+- **`/health` said the speculative drafter was not loaded, on every build ever
+  shipped.** Reported by [@aic0d3r](https://github.com/aic0d3r) (#16), who
+  benchmarked four stacks on this hardware and noticed that
+  `drafter_weights_loaded` read `false` while their own measurements showed the
+  drafter working: 43.1 tokens per second drafted against 33.2 serial, with
+  drafted and serial output byte-identical on all ten prompts they tried.
+
+  The field is inherited from an engine that had a separate draft model, where
+  it meant that model's weights were present. This engine has no such model,
+  the MTP head is the drafter, and nothing ever set the field, so it reported a
+  hardcoded `false`. At least one public diagnosis had already misfired off it,
+  reading it as evidence that speculative decoding never loads.
+
+  It now reports whether the MTP head is ready, which is the question the name
+  asks. `shortlist_draft_head` stays `false` beside it and that is correct:
+  this build has no such head, and the fix for a field that lies is not to make
+  an honest neighbour lie the other way.
+
+- **The out-of-memory refusal at startup referred to one of our internal
+  documents.** If pinning the weights would have left the host short, the
+  server refused and explained why by citing a file nobody outside this
+  project can read. It now says the same thing in its own words and names the
+  setting that runs without pinning.
+
+### Added
+
+- **The server detects a BIOS iGPU memory carve-out and says so.** A fixed
+  block of RAM assigned to graphics in firmware is taken before the kernel
+  boots, so it appears nowhere on the host: the machine simply reports itself
+  smaller. This model reads a 47.7 GiB lookup table through the host file cache
+  on every request, so that RAM is taken directly out of what the table needs.
+  The startup memory ledger now reports the carve-out, and warns when it is
+  large enough to matter, naming the BIOS setting.
+
+  It costs you something even when nothing has visibly thrashed: the KV pool
+  sizes itself from the memory total the OS reports, so a carve-out quietly
+  buys fewer resident conversations instead.
+
+### Documentation
+
+- **The conditions the published numbers were measured under are now stated in
+  full**, after #16 measured our decode 11 to 12 percent low on both rows on a
+  70 W handheld and we had never published a power envelope. The Measured
+  section now names the sustained package power and the clock, and it names the
+  IOMMU, which is worth 13 to 16 percent of prefill on this hardware and which
+  no artifact had ever mentioned.
+- **The kernel command line the reference machine boots with is published**, in
+  a new section under Troubleshooting. Numbers nobody can reproduce are not
+  much use. It is labelled as our configuration rather than a tuning guide, and
+  the two settings that are sizes rather than constants are given as a table
+  per machine size instead of as values to paste.
+- **A startup line in the README had been quoting output the server stopped
+  printing three releases ago**, on the one line that tells you how much memory
+  is left. It now shows what the server actually prints, including the second
+  line explaining why `free` and `MemAvailable` disagree with it by the size of
+  the model.
+- **`docs/QUANT.md` is linked from the README.** It has shipped in this
+  repository since 0.1 and nothing pointed at it, so a reader asking how the
+  bits-per-weight figure is derived had no way to find the answer already here.
+- The README has a table of contents, and the two troubleshooting sections have
+  a heading to live under. The explanation of token budgets covering thinking
+  as well as the answer, which is the difference between a short reply and an
+  empty one, was filed under the Codex section; it applies to every client and
+  now has its own section.
+
+## 0.5.5
+
+### Fixed
+
+- **The server could exit in the middle of serving, taking every request in
+  flight with it.** Reported by [@nr23730](https://github.com/nr23730) (#15),
+  who crashed it twice in a few minutes and posted the log that identified it.
+
+  Any request that used a temperature above 0 together with the speculative
+  drafter (both defaults for most clients) was decoded using a block of memory
+  that had already been released. The sampling settings for the request -
+  temperature, seed, and the repetition penalties - lived in that block, and
+  they were read again on every step of the answer.
+
+  Usually the memory still happened to hold the right values, which is why this
+  went unnoticed for nine releases. When it did not, one of two things
+  happened. If the leftover data looked like a plausible temperature, the reply
+  came back normally but was generated with settings that were not the ones
+  asked for. If it happened to be exactly zero, the server treated it as an
+  internal contradiction and shut itself down, and every other request being
+  served at that moment failed with a 502.
+
+  **If you use temperature above 0, we would treat any sampled output from
+  0.4.x or 0.5.0 through 0.5.4 as unreliable, not merely as occasionally
+  crashy.** Greedy decoding (temperature 0, the default when the field is
+  omitted) was never affected: it does not use that path at all, and a
+  48-request control run confirms it.
+
+  Reproduced on the published 0.5.4 image before the fix was written: four
+  concurrent requests at temperature 0.7 took the container down on the first
+  round. The same test against 0.5.5 completes 48 of 48 with the server up.
+
+### Known
+
+- Some internal consistency checks still stop the whole server rather than
+  failing the one request responsible. Nothing is known to reach them, and the
+  path that did reach one is fixed above, but it is the wrong behaviour for a
+  server handling several conversations and we are changing it.
+
+
+## 0.5.4
+
+### Fixed
+
+- **Long replies no longer slow down as they get longer.** The streaming
+  front-end re-decoded the entire answer on every single token and diffed it
+  against what it had already sent, which costs time proportional to the length
+  squared. A reply of a few thousand tokens spent hundreds of microseconds per
+  token on that alone, and a reply running to the cap would have spent about
+  half a minute of pure bookkeeping.
+
+  It now decodes only the last token or two, which is all that can still
+  change. Detokenization cost is flat at 9 to 19 microseconds per token
+  regardless of output length, where before it climbed from 42 to 726. Long
+  answers no longer pay more per token than short ones. The reporter measured
+  the end-to-end effect on their own host at 34-35 rising to 36-37.6 tok/s on
+  replies of several thousand tokens; our own runs vary by about 7% with
+  machine state, so we quote the detokenization cost, which is the part that
+  is controlled.
+
+  **Reported and diagnosed by [@rosstang](https://github.com/rosstang), with
+  measurements and a differential harness, and independently confirmed by
+  [@hvico](https://github.com/hvico).** The problem, the measurements and the
+  analysis that made the fix possible are theirs; the implementation here is
+  our own, written from the description rather than from their patch, and we
+  verified the tokenizer property ourselves before relying on it. Thank you
+  both. (#13)
+
+- **`response_format` is no longer accepted and silently ignored.** A request
+  asking for JSON or a schema returned 200 and prose, so a client had no way to
+  tell that nothing had enforced it. This server has no constrained decoding,
+  so it cannot honour the field. It now refuses with a 400 that says so, on
+  both `/v1/chat/completions` and `/v1/responses` (where the field is spelled
+  `text.format`), matching what the server already does for any other option it
+  cannot honour. `/health` gained a `not_implemented` list so a client can ask
+  before sending. `{"type": "text"}`, the default, is unaffected.
+
+  **Reported by [@hvico](https://github.com/hvico)**, who also laid out what
+  real support would take. Structured output is not implemented and this
+  release does not add it: it makes the gap visible instead. (#14)
+
+
+## 0.5.3
+
+### Faster
+
+- **Long prompts are read 5 to 8 percent faster, and the answers are
+  byte-for-byte the ones 0.5.2 gave.** Nothing about the model or the
+  arithmetic changed. Every layer has to work out which expert handles which
+  token, and that ordering was being produced by a general-purpose sort running
+  on the CPU while the GPU sat idle waiting for it. There are only 512 experts,
+  so the ordering can be counted out directly instead of compared into place.
+  A stable count on the same key produces the identical ordering by definition,
+  which is why the output is unchanged rather than merely close.
+
+  Measured on this machine against 0.5.2 in the same session, on the tuned plan
+  this image ships:
+
+  | prompt | 0.5.2 | 0.5.3 | |
+  |---|---|---|---|
+  | 8,192 tokens | 1,191 tok/s | **1,246 tok/s** | +4.6% |
+  | 32,768 tokens | 1,317 tok/s | **1,424 tok/s** | +8.1% |
+  | 131,072 tokens | 1,259 tok/s (104.1 s) | **1,358 tok/s (96.5 s)** | +7.9% |
+
+  Decode speed is unchanged, and unchanged by construction: generating a token
+  never takes the path this touches.
+
+  The saving is a fixed amount of time per layer, so it is worth more on a long
+  prompt than a short one, and worth more on a fast machine than a slow one.
+
+### Changed
+
+- **The server now reports the memory it actually holds.** The pre-flight
+  estimate printed at startup says plainly that it is an estimate, and the
+  engine prints measured figures once the model is loaded, including the large
+  lookup table it reads from disk and never keeps in memory.
+
+  This matters for anyone sizing a machine, because the usual tools understate
+  it: the weights are locked in place in a way that `MemAvailable` and `free`
+  do not count, so a loaded server looks like it has roughly 68 GB more room
+  than it has. Nothing but the server itself can correct that figure, so it
+  does.
+
+- **`/health` now names `/cache`**, which carries the live prompt-cache
+  counters. It was reachable before but undiscoverable, since it does not sit
+  under `/v1/`. The counters now include how many times a cache hit had to copy
+  its rows and how long that took: if those climb while the hit rate looks
+  healthy, the host is under memory pressure rather than the cache missing.
+
+
+## 0.5.2
+
+### Fixed
+
+- **An image request that generated a long answer could take the engine
+  down.** On some hosts it ended in a GPU page fault and the container was
+  gone; on others the engine simply stopped answering and requests timed out.
+  It needed no second request and no unusual image: only an answer of a few
+  hundred tokens or more, which an image plus a detailed question routinely
+  produces.
+
+  The table that tells the model where each token sits, which images make more
+  complicated than a plain count, was built to cover the prompt and nothing
+  more. It was then used for every token generated after the prompt as well,
+  reading further past the end with each one. The table now covers everything
+  a request can generate, and the values past the prompt are the ordinary
+  count the model would have used anyway, so answers up to that point are
+  unchanged.
+
+  Short answers were never affected, which is why this survived: the gates all
+  asked for short ones. A request that generates 400 lines and then refers
+  back to the image is now part of the release gate.
+
+  Reported on 0.5.1 and present in 0.5.0. Text only servers cannot be
+  affected: the whole path exists only for requests that carry an image.
+
+- **A container could shut itself down in the middle of a request it was
+  serving correctly.** The server has a watchdog: it asks the engine a
+  question every few seconds, and if the engine has not answered for
+  `HALOGEN_ENGINE_WATCHDOG_S` (180 by default) it takes the container down so
+  a restart policy can recover it. The message it prints says a silent engine
+  is a stuck one rather than a busy one, because the engine is supposed to
+  answer between decode rounds and between the pieces a long prompt is read in.
+
+  It was not answering while a prompt was being read in, unless that prompt was
+  longer than one piece. The shipped piece size is 32,768 tokens, so any
+  ordinary prompt went in as a single uninterrupted step and the engine said
+  nothing for the whole of it. On a machine where that step took more than
+  three minutes, the watchdog shut down a container that was working.
+
+  The engine now comes up for air during a prompt, whatever its length. On this
+  hardware the longest it goes without answering fell from the length of the
+  whole prompt to under two seconds: measured 14.8 to 17.0 seconds down to 1.2
+  to 1.5 on a 20,000 token prompt, and 46.3 seconds down to 1.7 on a 100,000
+  token one. Prompt processing and generation speed are unchanged, and the same
+  prompts give byte for byte the same answers as 0.5.1.
+
+  `HALOGEN_ENGINE_YIELD_MS` controls how often it comes up for air, in
+  milliseconds. The default is 250 and there is no reason to change it; 0
+  restores the previous behaviour.
+
+- **A health check could be answered one step later than it needed to be.**
+  Connections that arrived while the engine was busy were accepted after the
+  waiting ones were answered rather than before, so a check that arrived during
+  a piece of work waited for the end of the next one as well.
+
+## 0.5.1
+
+### Fixed
+
+- **An image request sent while another request was still generating could
+  stop the engine.** On some hosts it ended in a GPU memory fault and the
+  container went down and was restarted; on others the engine simply stopped
+  answering, at full GPU load, until the built in watchdog took the container
+  down. Both are the same defect and which one you saw was a matter of where
+  the bad read landed.
+
+  The state that maps an image onto the tokens it occupies, and the position
+  table that goes with it, belonged to one conversation but was kept once for
+  the whole server. Both are sized from the region reserved for the request
+  that created them, while every request in the server used them at its own
+  position. So an image request with a small region, arriving beside a
+  conversation that had a large one, left that conversation reading well past
+  the end of both. The state is now per conversation, and the code that reads
+  it cannot reach another conversation's copy.
+
+  It needed an overlap to happen. An image on its own is unaffected, and so is
+  an image sent after an earlier request has finished, which is why single
+  image use and the release gates never saw it. Reproduced on 0.5.0 before the
+  fix and confirmed on 0.5.1 with the same test: an image alone passes, an
+  image after a 19,000 token request passes, and an image beside that request
+  while it is still generating is what fails.
+
+  If you have seen a 504 saying the engine went silent, this is a candidate for
+  some of those reports, and it is not claimed as the cause of all of them.
+  0.4.3 fixed a different defect with the same symptom.
+
+- **A long prompt left the health check unanswered for the whole of its
+  prefill.** The engine answers a health probe once per pass of its serving
+  loop, and a prompt with nothing else running went in as a single pass, so
+  nothing was answered until the whole prompt was in. Measured on 0.5.0: 60
+  seconds of silence on a prompt of 100,000 tokens, against a watchdog that
+  stops the container at 180. A large image on a long prompt could cross that,
+  and the container was then restarted while it was working correctly.
+
+  The engine now answers between the chunks it already divides a long prompt
+  into. The longest silence is one chunk, measured at 26 seconds at the shipped
+  settings, for prompts of any length and whether or not other requests are
+  running. Health probes allow 30 seconds by default, so this is answered well
+  inside a single probe.
+
+### Notes
+
+- No change to weights, to any default, or to what the server computes. Text
+  output is byte for byte identical to 0.5.0, and so is image output for a
+  request that was not affected by the defect above.
+
+## 0.5.0
+
+### Added
+
+- **The server can read images.** It is off by default and stays off until you
+  point `HALOGEN_VISION_TOWER` at the vision sidecar, or set it to `1` to look
+  for the file beside the checkpoint. With no tower the image path is not
+  merely disabled but absent, so a text-only deployment behaves exactly as it
+  did in 0.4.x, byte for byte.
+
+  Both `/v1/chat/completions` and `/v1/responses` accept an image content part
+  carrying a `data:` URL or bare base64. An `http(s)` URL is refused on
+  purpose: fetching one would make the server issue outbound requests to
+  wherever a client asked, which is a different feature with a different threat
+  model. Several images in one conversation are attributed correctly, including
+  when an earlier one is referred to after a later one arrives.
+
+  `/health` gained a `vision` block saying whether images are accepted, on
+  which routes, in what form, and when they are not, why. An image sent to a
+  server with no tower is a **400 naming the flag**, rather than a generic
+  rejection that blames prompt length.
+
+- **What it reads, stated rather than implied.** Text at 12 pt and above is
+  read exactly at every supported resolution. Below that it degrades gradually
+  instead of failing: in a battery of several hundred readings, every miss was
+  the right field with one to three characters wrong, and none read a different
+  field or invented a value. Two things are worth knowing when you choose a
+  capture size. A **bigger frame is not better** for the same text, since past
+  a point it adds empty area rather than detail. And a **densely filled page is
+  harder than a sparse one** at the same point size, which is a matter of
+  finding the right row rather than seeing it.
+
+- **`HALOGEN_VISION_MAX_PIXELS`**, default 2560x1440. Larger images are
+  downscaled to fit rather than refused, preserving aspect ratio, and nothing
+  is refused until four times that. Measured end to end, one image costs about
+  5.5, 11.8, 25.3 and 105.8 seconds at 1280x800, 1920x1080, 2560x1440 and
+  3840x2160. 4K costs four times a 1440p frame and reads no better, which is
+  why the default is where it is. There is no fixed aspect ratio anywhere in
+  the path: a tall, wide or square crop all work, and a crop smaller than
+  256x256 is scaled up, which helps small text rather than hurting it.
+
+### Changed
+
+- **Image requests are substantially faster.** The work the tower does grows
+  with the square of the picture, so at any real capture size it, and not the
+  language model, is most of the request. That part is now about 2.3 times
+  faster at 1920x1080. Text requests are untouched.
+
+### Fixed
+
+- **A server that had stopped answering could still report itself healthy.**
+  If the engine stopped making progress while its process stayed alive, which
+  is what an aborted GPU queue looks like from outside, the published
+  healthcheck kept passing, `/health` kept returning `ok`, the container stayed
+  up, and every request hung until its timeout. The healthcheck was a bare TCP
+  connect, which the kernel completes without the engine's help, and `/health`
+  answered from the front-end's own state without asking the engine anything.
+
+  Now the engine answers a ping on a queued connection while it is generating,
+  the shipped healthcheck asks for that, `/health` returns **503
+  `engine_unresponsive`** when it does not come back, and a watchdog
+  (`HALOGEN_ENGINE_WATCHDOG_S`, default 180 seconds, `0` to disable) takes the
+  container down so a restart policy can act. Docker does not restart a
+  container for being unhealthy, which is the only reason the old behaviour was
+  survivable.
+
+
+## 0.4.4
+
+### Added
+
+- **The server now says how much of the machine is left when it finishes
+  loading**, because that turned out to be the thing operators most needed to
+  know and had no way to see:
+
+  ```
+  startup [   4.9 s] host memory left for everything else: 620 contiguous 2 MiB
+                     blocks (80.4 GiB total, most of it not contiguous)
+  ```
+
+  When that number is low it adds a note explaining what follows: other large
+  processes on the host compete for what is left, and when it runs out both
+  they and this server can stop for minutes at a time at full CPU with no disk
+  activity and no output. That is not a crash and needs no restart, but it
+  looks exactly like a hang, and two separate reports spent days on it before
+  the server said anything at all.
+
+  The block count leads because it is the number that matters. Plenty of
+  gigabytes can be free while almost none of it is in the large contiguous
+  pieces another big process needs in order to start or to grow.
+
+- **A README section, "Give it a machine of its own"**, with the same
+  information and what to do about it: lower `HALOGEN_KV_POOL_POSITIONS` first,
+  and treat `HALOGEN_FLASH_PIN_TRUNK=0` as a last resort at several times the
+  decode cost rather than as a tuning option. Compacting memory afterwards does
+  not help, because the memory this server holds cannot be moved.
+
+- **`HALOGEN_FLASH_PIN_TRUNK` is documented in the flag reference** as the
+  setting to reach for when you must share a machine, with its cost stated.
+
+### Changed
+
+- **`HALOGEN_DMALLOC_LOG` now takes a size in bytes** as well as `1`. `1` keeps
+  the previous behaviour and reports the large allocations that make up the
+  server's memory budget; a small value such as `4096` reports everything,
+  which is what you want if you are investigating what happens while requests
+  are being served rather than at startup.
+
+## 0.4.3
+
+### Fixed
+
+- **The front-end could open several connections to the engine at once, and
+  strand the requests that were already using the old one.** It keeps a single
+  connection and multiplexes every request over it, reopening that connection
+  when it closes. Every request checked that condition, and the reopen itself
+  was not serialised, so a connection that dropped with work in flight raced
+  all of the waiting callers into opening their own. Measured: six concurrent
+  callers opened six connections.
+
+  Each extra connection leaked the previous socket, started a second reader on
+  the same stream, and replaced the table of in-flight requests and the count
+  of engine slots underneath requests that were still using them. A request
+  whose entry in that table was replaced could no longer be reached by any
+  reader, and the reader responsible for it woke the wrong table when it
+  exited, so nothing ever told that request the connection had gone. It waited
+  out its full token budget and then reported that the engine had gone silent.
+
+  If you have seen an intermittent 504 saying the engine went silent, in either
+  prefill or decode, on prompts of any size, recovering by itself on the next
+  request, this is a candidate. It is not confirmed as the cause of every such
+  report: the race is proven and fixed, and the stranding that follows from it
+  is fixed with it, but we were not able to reproduce the reported stall on our
+  own hardware in 540 requests across three configurations.
+
+- **A cancelled request that had not started yet was not actually cancelled.**
+  Cancellation searched the requests that were running and the one whose prompt
+  was being read, but never the queue, so a client that disconnected before its
+  request began still had it generated in full, into a slot nobody was reading.
+  The front-end cancels every abandoned request, so this was the ordinary path
+  for a client that goes away under load rather than a rare case. It now costs
+  nothing.
+
+### Added
+
+- **A test for the reconnect path**, which runs against a stand-in engine and
+  needs no GPU and no model, so it runs in the release gate on every build. It
+  reads six connections on the previous release and one on this one.
+
+## 0.4.2
+
+### Fixed
+
+- **A healthy server reported itself unhealthy, on every deployment using the
+  two-container `docker-compose.yml` in this repository.** `docker ps` showed
+  `Up (unhealthy)` with a failing streak in the hundreds while the server was
+  answering every request correctly.
+
+  The engine serves one connection at a time. That is deliberate and is how the
+  slots are shared: the API front-end opens a single socket at startup and
+  multiplexes every request over it. But it meant that once the front-end
+  connected, no other connection was ever accepted. The kernel completes a few
+  extra connections into a backlog without the engine's involvement, and that
+  backlog was four, so the first five health probes succeeded and every one
+  after them timed out for the life of the process. Measured with a session
+  held: probes one to five pass, probe six onward never does.
+
+  The engine now accepts and queues connections while a session is running, and
+  serves the queue before asking for a new connection. Probes succeed, and a
+  client that connects while another is being served is served afterwards
+  rather than being dropped. If you added a longer `start_period`, more
+  `retries`, or removed the healthcheck to work around this, you can put it
+  back.
+
+- **`HALOGEN_FLASH_PIN_TRUNK=0` would not start alongside the quality overlay**,
+  exiting with `expected bf16 or Q4C-P, got q8g64`. The unpinned path handled
+  two weight formats and the twelve tensors the quality overlay promotes are a
+  third. It now handles them, and the result is token-for-token identical to
+  the reference implementation.
+
+### Added
+
+- **The server now says when the host's free memory is in the wrong shape.**
+  Free memory can be plentiful and still be unusable in large contiguous
+  pieces, typically right after a large process exits. In that state every big
+  allocation stops to compact memory, most of those attempts fail, and startup
+  can take tens of minutes at 100% of one core with no disk activity and no
+  output, which is indistinguishable from a hang. That is not a hypothetical:
+  it is what a user spent two rounds of a bug report tracking down.
+
+  Before it allocates anything the server now reads the supply of free 2 MiB
+  contiguous blocks and says how many there are, and warns when there are too
+  few. It also reports how many times each startup step had to stop and compact
+  memory. A healthy host does almost none; the reported case did tens of
+  thousands. If you see the warning, stop other large workloads and, as root,
+  `echo 1 > /proc/sys/vm/compact_memory` before starting again.
+
+  `HALOGEN_FRAG_WARN_BLOCKS` and `HALOGEN_FRAG_WARN_STALLS` set the two
+  thresholds; see `FLAGS.md`.
+
+- **The startup now names every step through to the open socket.** The previous
+  release stopped reporting at `model ready`, and the remaining work (reserving
+  serving slots, preparing the prompt cache, opening the socket) ran in
+  silence. A user watching a slow start could not tell which of those it was
+  sitting in. All of them announce themselves now.
+
+## 0.4.1
+
+### Fixed
+
+- **A streamed reply and a non-streamed reply to the same prompt came back
+  slightly different.** Asking with `"stream": true` returned the answer with
+  a leading blank line that the non-streamed form did not have, and the
+  reasoning text differed by leading or trailing whitespace. The model was
+  generating exactly the same tokens either way; the two response builders
+  disagreed about tidying them, and only one of them was trimming. Measured
+  across five prompts on 0.4.0, all five differed.
+
+  One case was more than cosmetic: on a turn where the model called a tool and
+  said nothing else, the non-streamed `content` was `""` and the streamed
+  `content` was a blank line, so a client testing "did the model say anything
+  as well as calling the tool" got different answers depending only on how it
+  had asked. If you have a workaround that trims the streamed content or tests
+  it loosely, you can drop it.
+
+  This affected `/v1/chat/completions`. `/v1/responses` was fixed before 0.4.0
+  shipped and is unchanged.
+
+- **`/v1/completions` returned a 500 on every request, in every release from
+  0.2.0 to 0.4.0.** The endpoint was listed in this README and reported by
+  `/health` the whole time. Internally it read a set of sampling settings that
+  had been added to the chat endpoint's request model and never to this one, so
+  the very first thing it touched raised an error and the request came back as
+  an opaque "internal error". It now works, greedy and sampled, and rejects
+  out-of-range values the same way the chat endpoint does.
+
+  If you tried this route on an earlier release and concluded the server was
+  broken, it was, and only for this route. `/v1/chat/completions` and
+  `/v1/responses` were unaffected.
+
+- **The release gate now tests every route the server advertises.** It reads
+  the endpoint list out of `/health` and exercises each one, so a route cannot
+  be published and left untested, which is exactly how the bug above survived
+  five releases. A route with no test fails the gate rather than passing
+  quietly.
+
+## 0.4.0
+
+### Added
+
+- **The OpenAI Responses API at `POST /v1/responses`**, so clients that dropped
+  Chat Completions can use this server directly. The OpenAI Codex CLI is the
+  one this was built for: set `wire_api = "responses"` in a `model_providers`
+  entry pointing at this server and it works, tool calls included. Streaming
+  and non-streaming are both supported, `function_call` and
+  `function_call_output` round trip, and tool entries that are not functions
+  are ignored rather than rejected. The README has a worked Codex config.
+
+  Verified two ways that do not share an assumption: the Codex CLI driving real
+  tasks end to end against the server, and the official `openai` Python SDK,
+  which parses every event and object into its own typed models.
+
+  Not included, and stated rather than left to be discovered: **reasoning is
+  not returned** (the API carries it as an encrypted item the client hands back
+  and this server stores nothing, so a summary would be invented rather than
+  real; the answer is unaffected), and **there is no response store**, so
+  `previous_response_id`, retrieval by id and cancellation are unavailable.
+  Send the history with each request, which is what Codex does.
+
+- `/health` now lists the endpoints the running build serves, generated from
+  the routing table so it cannot describe a route that is not there.
+
+## 0.3.2
+
+### Fixed
+
+- **A machine that took longer than 30 minutes to load could not start the
+  server at all.** In the default `all` mode the container waited exactly 30
+  minutes for the engine, then started the API against an engine that was
+  still loading, and the API's failure to connect took the whole container
+  down reporting that a component had exited. The engine underneath was
+  working normally. There is no correct fixed limit here, because load time is
+  your disk and your driver rather than anything the server controls, so it
+  now waits for as long as the load takes and watches the engine process
+  instead: if the engine actually dies, you are told immediately. Set
+  `HALOGEN_ENGINE_WAIT_S` to a number of seconds if you would rather the
+  container fail than wait; on expiry it says the engine was still loading and
+  exits, rather than starting a front-end that cannot work.
+- **A warning printed after the engine came up went nowhere.** The readiness
+  check redirected the startup script's own error output to `/dev/null` for
+  the life of the container, so every later message was discarded, including
+  the one naming which component had exited. Fixed.
+- **A failure to load the quality sidecar said only "invalid argument".** It
+  now says how much of the model had loaded, that the limit is the GPU
+  driver's rather than a problem with your file, and what to check first.
+
+### Added
+
+- **The server now says which startup step it is on and how long it has
+  taken**, including a layer counter while it prepares weights. A first start
+  reads about 68 GB off disk and can take minutes on a slow or busy machine;
+  until now that time was completely silent, which made a slow start
+  indistinguishable from a hung one. `HALOGEN_STARTUP_PROGRESS=0` turns it
+  off. If you report a slow start, a log with these lines in it is the most
+  useful thing to attach.
+
+For reference, on the development machine (Ryzen AI Max+ 395, 125 GB, weights
+on NVMe, all defaults) a start takes about 9 seconds with the model already in
+the file cache and about 18 seconds otherwise. A first start after boot is
+bounded by reading 68 GB off your disk.
+
+## 0.3.1
+
+### Fixed
+
+- **0.3.0 could fail to start with "out of memory" on machines where 0.2.0
+  ran.** The default KV pool was three times the context (786,432 positions,
+  about 42 GB on the device), sized on a machine whose ceiling is about 47 GB.
+  A machine with a lower ceiling refused, and the two settings a reader would
+  reach for first do not fix it: `HALOGEN_KV_SLOTS` has not been a memory
+  setting since 0.3 (the slots share one pool and cost about 115 MB each), and
+  `HALOGEN_CTX` bounds a request rather than the allocation.
+- **The default pool is now twice the context** (524,288 positions, about
+  35 GB): two full-length conversations resident, or four at 131k. Set
+  `HALOGEN_KV_POOL_POSITIONS=786432` for three where the machine has room.
+- **The server now measures the device budget at startup and lowers the pool
+  itself** when the configured one will not fit, printing the pool it settled
+  on. It only ever lowers, never below `HALOGEN_CTX`, and it changes nothing
+  about what any conversation computes. `HALOGEN_KV_POOL_FIT=0` turns it off.
+- **The out-of-memory message now names the settings that fix it**, and says
+  which one does not.
+- **A server that started and then crawled on long prompts** with the disk
+  busy was the same oversized default wearing a second symptom. The model
+  reads a large lookup table through the file cache rather than holding it in
+  RAM, so RAM the pool takes is RAM that table loses, and a longer prompt
+  touches more of it. The startup sizing now accounts for it, and
+  `HALOGEN_HOST_RESERVE_GIB` (default 20) is how much it leaves free.
+
+### Changed
+
+- **The server says less at startup.** It still reports what it is serving:
+  the precision it loaded, the KV pool it sized and why, the slots, the cache
+  mode and the address it is listening on. It no longer narrates how its
+  kernels are arranged, which was detail no deployer acts on.
+  `HALOGEN_VERBOSE=1` and `HALOGEN_DMALLOC_LOG=1` are the two settings worth
+  turning on when a start goes wrong, and both are documented in the settings
+  reference.
+- The README's settings table described `HALOGEN_KV_SLOTS` as the memory
+  budget, which was true before 0.3 and not after. Corrected, and the README
+  has a section on what to do when the server will not start.
+
+## 0.3.0
+
+### Added
+
+- **Several conversations at the full context.** The slots share one pool of
+  attention positions instead of each owning a copy, so a slot costs about
+  115 MB, and the pool is sized on its own (`HALOGEN_KV_POOL_POSITIONS`,
+  default three times the context: three full 262k conversations at once,
+  about 42 GB, measured with all three resident and generating; 1,048,576
+  positions fit with `HALOGEN_MAX_TOK=16384`). The pool takes RAM from the
+  page cache that serves the n-gram table, so a prompt whose rows are not
+  cached reads them from disk first; the README's memory section has the
+  measurement and the setting that trades back.
+  The default is now `HALOGEN_KV_SLOTS=4`. A request reserves its prompt plus
+  `max_tokens` positions and waits in arrival order when the pool is full.
+  Each stream stays byte-identical to the same request run alone; four
+  streams together produce about 76 tokens per second in total against 34
+  for one, and a conversation's speed follows its own length, not the pool.
+- **A prompt read in beside running conversations does not freeze them for
+  its whole length.** It is read in pieces the size of the prefill call
+  (`HALOGEN_MAX_TOK`, 32,768) with a generation step for the others between
+  pieces, which keeps its answer byte-identical to running alone: a 131k
+  prompt pauses the others three times for about 28 s instead of once for
+  105 s. `HALOGEN_ADMIT_CHUNK=8192` makes the pause about 8 s for a 32k prompt
+  at about 5 s on its own first token, trading the identity property for that
+  prompt. A prompt that arrives when nothing else is running is read in one
+  call as before.
+- **The speculative drafter no longer holds other requests back.** It
+  speculates while its conversation is the only one generating and joins the
+  batch when another is active, resuming when alone again. The default drafter
+  is unchanged.
+- **The prompt cache keeps eight entries** (`HALOGEN_CACHE_ENTRIES`, least
+  recently used out), two per conversation: at the end of the system prompt
+  and at the end of the history. Conversations taking turns each resume from
+  their own state (turn two at 25,000 tokens: about 0.5 s to the first token,
+  where one entry gave 22 s), and requests sharing a system prompt and asking
+  different things resume from it, whether they arrive together or in turn.
+- `HALOGEN_KV_POOL=0` restores the previous per-slot layout for comparison.
+
+### Changed
+
+- `HALOGEN_KV_SLOTS` defaults to 4 (was 1). `/health` reports the count as
+  before.
+
+## 0.2.0
+
+### Added
+
+- **Sampling.** `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+  `presence_penalty`, `frequency_penalty`, `logit_bias` and `logprobs` on
+  `/v1/chat/completions` and `/v1/completions`. `temperature` absent or 0 is
+  greedy decode and unchanged. Above 0, the request samples from the filtered
+  distribution on the drafter it would otherwise get, so speculative decoding
+  stays on: the accept/reject rule emits exactly the requested distribution.
+  `top_k`, `top_p` and `min_p` compose as an intersection. Penalties count
+  generated tokens. A `seed` reproduces a request on the same drafter and
+  server configuration; a sampled speculative run and a sampled serial run
+  agree in distribution, not token for token. Not implemented and refused
+  with a 400: `top_logprobs`, `logprobs` with `stream: true`, `n > 1`. A value
+  outside a parameter's defined range is refused, not clamped.
+- `/health` reports the sampling parameters the running build supports.
+- **1M context, opt-in.** `HALOGEN_ROPE_YARN=4` with `HALOGEN_CTX=1048576`
+  enables the model card's static YaRN; unset, nothing changes. It rescales
+  every position and costs about 0.5% perplexity at 1k-32k and some
+  speculative acceptance at depth; the README's *1M context* section has the
+  measurements, the memory configuration it needs, and the retrieval scores
+  above 32k, which are the first this project has published. Contexts past
+  262,144 are refused without the factor.
+- **The prompt cache keeps the attention state in place** and saves only
+  the small position-free part of a conversation's state (about 110 MB at
+  any context), so saving and resuming cost well under a second at every
+  context; a follow-up turn at 1M reaches its first token in about half a
+  second on the test machine. Answers are byte-identical to the previous
+  form, which `HALOGEN_CACHE_INPLACE=0` keeps for comparison.
+  `HALOGEN_CACHE_FILE` can still put the snapshot on a file.
+- **The prompt cache now hits on multi-turn chats whose client omits
+  `reasoning_content` from the history**, which is what OpenAI-style
+  clients do. It used to snapshot at the very end of the prompt, inside
+  the assistant opener the template rewrites on the next turn, so every
+  turn of such a conversation re-read the whole prefix. The snapshot now
+  lands at the end of the history; a follow-up turn on a 25,000-token
+  system prompt takes about 1 s to first token instead of 21 s.
+- `/health` reports `rope_scaling`.
+
+### Changed
+
+- Greedy decode is about 1% faster on every path. Token output is unchanged.
+
+## 0.1.1
+
+A bug-fix release. **The engine is unchanged**: no kernel, no checkpoint, no
+format change, and the binary builds from identical source, so every
+performance and quality number below still stands and **your weights do not
+need re-downloading**. The image carries no weights and the mount layout is the
+same, so upgrading is a container pull and nothing else.
+
+### Fixed
+
+- **A default request could come back empty.** `max_tokens` defaulted to 512
+  while the chat template defaults `reasoning_effort` to `xhigh`, and reasoning
+  tokens count against the budget. A request that ran out before the model
+  finished thinking returned `finish_reason: "length"` with an **empty
+  `content`** and the whole reply in `reasoning_content`, which most OpenAI
+  clients do not display. On ten ordinary prompts, three were truncated and
+  "write a Python function that merges overlapping intervals" came back
+  completely blank. The default is now **8192**; eight of eight prompts that
+  finish at all finish inside 2048.
+- **`max_completion_tokens` and `max_output_tokens` were silently ignored.**
+  They were not declared, so a client using the current OpenAI Chat Completions
+  field name had it dropped without an error and got the default no matter what
+  it asked for. The budget was reachable only under the deprecated
+  `max_tokens`. All three names are now accepted and mean the same thing. Send
+  one, or send several as long as they agree; two different values is a 400
+  rather than a guess.
+
+### Changed
+
+- `HALOGEN_MAX_TOKENS_CAP` **16384 to 65536**, so a long reasoning problem is
+  not cut off by server policy. `HALOGEN_QUEUE_TIMEOUT` **2400 to 3600** with
+  it: the two are coupled, and a cap that outlasts the timeout makes one long
+  request 503 everyone queued behind it.
+- `/health` now reports `max_tokens_default` and `token_budget_aliases`, so a
+  client can read which spellings this server accepts instead of guessing.
+
+### If you saw poor output on 0.1.0
+
+Check `finish_reason` on a reply that looked wrong. `"length"` with an empty or
+truncated `content` was this bug, and it was not your configuration. Either pull
+0.1.1, or stay on 0.1.0 and pass `"max_tokens": 8192` explicitly, which is the
+only spelling 0.1.0 reads.
+
+## 0.1.0
+
+
+First release of halogen-flash-server. Container image only; the engine is
+closed source. Weights are published separately and are two files.
+
+### The engine
+
+- **Qwen3.8-Flash-Next end to end on gfx1151.** Gated DeltaNet, QSA with its
+  micro-block indexer, the 512-expert MoE, the gated residual, and the 51B
+  n-gram embedding table, all as kernels written for this silicon. No
+  general-purpose runtime underneath.
+- **4-bit weights as a correctness precondition.** 335 GiB at BF16 against
+  124 GB of unified memory. The served precision is a 4-bit base plus a
+  2.31 GiB quality sidecar, the default, which upgrades the twelve tensors
+  measurement showed the loss was concentrated in. Served precision is
+  5.53 bits per weight, measured from the checkpoint's tensor table.
+- **Context to 262,144 native, and 262,144 admitted by default.** The quality
+  work covers 1k to 32k; beyond that the context is served but unscored.
+- **Prefill to 131,072 tokens** with QSA block selection live.
+
+### Serving
+
+- OpenAI-compatible endpoint: `/v1/chat/completions` (streaming and not),
+  `/v1/models`, `/health`, tool calls.
+- **Static N-slot batching**, one slot by default. Concurrent sequences share
+  the engine, and a request batched alongside others emits byte-identical
+  tokens to the same request run alone.
+- **Lossless speculative decoding** with the model's own MTP head, on by
+  default. Byte-identical to serial greedy decode.
+- **Prompt cache on by default** (mode 2, resume anywhere). A growing session
+  does not re-prefill its shared prefix: a follow-up turn at 100,000 tokens of
+  context costs about 2 s against 88 s cold. `HALOGEN_PROMPT_CACHE=1` snapshots
+  only on chunk boundaries and makes the warm answer byte-identical to a cold
+  one, which the default trades away for speed at every prompt length.
+- **Greedy only. There is no sampler.** `temperature` above 0, `top_p`,
+  `top_k`, `min_p`, `seed`, the penalties, `logit_bias` and `logprobs` are
+  rejected with a 400 naming the reason, rather than quietly served greedy,
+  because a client cannot tell those apart from the response. `/health`
+  reports exactly this. Sampling is a post-0.1.0 feature.
+
+### The image
+
+- `python:3.12-slim` plus AMD's ROCm 7.14.0 wheels, 3.53 GB. **No torch**, no
+  compiler, no devel tree, and no engine source: nothing from the builder stage
+  reaches the runtime but the stripped binary. The OpenAI front-end is Python
+  and necessarily ships as readable source, and it pulls in `transformers` for
+  the chat template.
+- ROCm is **pinned**: the version is ours, not a third party's moving tag.
+- No outbound connections unless `HALOGEN_DOWNLOAD` is set.
+- Ships the two benchmarks it is measured with (`bench`, `sweep`), so the
+  published numbers are reproducible against your own hardware.
+
+### Known limits
+
+- Continuous batching and speculation-inside-a-batch are 0.2. A speculating
+  request holds its slot alone, so concurrent requests queue behind it.
+- gfx1151 only. The build hard-rejects other architectures.

@@ -1,0 +1,83 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/tool_parse.py	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/tool_parse.py	1970-01-01 10:00:01.000000000 +1000
+@@ -27,7 +27,8 @@
+         name = fn.get("name")
+         if not isinstance(name, str):
+             continue
+-        props = (fn.get("parameters") or {}).get("properties")
++        params = fn.get("parameters")
++        props = params.get("properties") if isinstance(params, dict) else None
+         types = {}
+         if isinstance(props, dict):
+             for k, v in props.items():
+@@ -261,6 +262,52 @@
+     j = _blank_before(text, j - len(FUNC_END), b)
+     return text.endswith(PARAM_END, b, j)
+ 
++_TAIL_BLOCK_RE = re.compile(r"<tool_call>|<function=|<parameter=|<\|im_end\|>|<\|endoftext\|>")
++
++def _tail_start(text, b, c):
++    if text.find("<parameter=", b, c) < 0:
++        return -1
++    j = _blank_before(text, c, b)
++    if not text.endswith(FUNC_END, b, j):
++        return -1
++    j = _blank_before(text, j - len(FUNC_END), b)
++    return j - len(PARAM_END) if text.endswith(PARAM_END, b, j) else -1
++
++def _whole_tail_close(text, b, x, final):
++    c = x
++    while True:
++        e = c + len(TC_CLOSE)
++        y = text.find(TC_CLOSE, e)
++        while y >= 0 and not _counted_close(text, y):
++            y = text.find(TC_CLOSE, y + len(TC_CLOSE))
++        if y < 0:
++            if _TAIL_BLOCK_RE.search(text, e):
++                return x
++            return x if final else None
++        t = _tail_start(text, b, y)
++        if t < e or text[t - 1] != "\n":
++            return x
++        span = text[e:t]
++        if (_TAIL_BLOCK_RE.search(span)
++                or not span.replace(PARAM_END, "").replace(FUNC_END, "").strip()):
++            return x
++        if _close_proven(text, y, final):
++            return y
++        if not final and _may_prove(text, y):
++            return None
++        c = y
++
++def _may_prove(text, c):
++    i, n = c + len(TC_CLOSE), len(text)
++    while i < n and text[i].isspace():
++        i += 1
++    rest = text[i:i + 16]
++    if not rest or rest.startswith(_END_MARKUP):
++        return True
++    if any(m.startswith(rest) for m in _END_MARKUP) or TC_OPEN.startswith(rest):
++        return True
++    return text.startswith(TC_OPEN, i) and _opener_shape(text, i) is None
++
+ def _find_blocks(text, final=True):
+     out, pos = [], 0
+     while True:
+@@ -290,10 +337,15 @@
+                 counted.append(m.start())
+                 depth -= 1
+                 if depth == 0:
+-                    if (_tail_whole(text, b, m.start())
+-                            or _close_proven(text, m.start(), final)):
++                    if _close_proven(text, m.start(), final):
+                         chosen = m.start()
+                         break
++                    if _tail_whole(text, b, m.start()):
++                        if text.find("<parameter=", b, m.start()) < 0:
++                            chosen = m.start()
++                            break
++                        chosen = _whole_tail_close(text, b, m.start(), final)
++                        break
+                     depth = 1
+                     if pend is None:
+                         pend = m.start()

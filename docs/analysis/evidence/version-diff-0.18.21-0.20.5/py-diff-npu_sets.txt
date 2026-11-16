@@ -1,0 +1,380 @@
+--- /nix/store/fn6y2w20kbgjd8da8pwxbbc3gvmiycpy-halogen-flash-server-0.18.21/share/halogen/tools/npu_sets.py	1970-01-01 10:00:01.000000000 +1000
++++ /nix/store/lyvyw7njybryws0gizlvxpx337p33xnh-halogen-flash-server-0.20.5/share/halogen/tools/npu_sets.py	1970-01-01 10:00:01.000000000 +1000
+@@ -17,6 +17,12 @@
+ HEADER = "QUESTION:\n"
+ SET_SIZE = 16
+ SPAN_CAP = {"text": 512, "number": 32, "date": 32}
++INSTANCES = 16
++EDGES = ("top", "bottom", "left", "right")
++TYPED_CODES = ("estimate", "box", "boxes", "multiple")
++VSTART, VEND, IMAGE, VIDEO = "<|vision_start|>", "<|vision_end|>", "<|image|>", "<|video|>"
++LEGEND = ("Each edge is a number from 0 to 999, in thousandths of the picture: top and bottom from its top edge, left and right from "
++          "its left edge.")
+ BREAK = "​"
+ 
+ def through(value, knots):
+@@ -44,25 +50,58 @@
+     def table(self, name, value):
+         return through(value, self.tables.get(name))
+ 
++    def level(self, name, share):
++        return through(share, [[y, x] for x, y in self.tables.get(name) or ()])
++
+ @dataclass
+ class Q:
+     kind: str
+     instr: str
+     criteria: object = None
+     unit: str = None
++    grid: tuple = None
++    blocks: int = 0
+ 
+     @property
+     def n_slots(self):
+-        return 2 if self.kind in SPAN_CAP else len(self.criteria) if self.kind == "multiple" else 1
++        return (2 if self.kind in SPAN_CAP else len(self.criteria) if self.kind == "multiple" else 5 if self.kind == "box"
++                else 5 * self.blocks if self.kind == "boxes" else 1)
+ 
+ def question(spec):
+     kind = spec.get("type", "choice")
+     if kind == "choice" and spec.get("multiple"):
+         kind = "multiple"
+-    if kind not in ("noul", "choice", "multiple", "score", "text", "number", "date"):
+-        raise ValueError("question type %r is not a text question" % kind)
++    if kind not in ("noul", "choice", "multiple", "score", "text", "number", "date", "box", "boxes"):
++        raise ValueError("question type %r is not a d1 question" % kind)
++    if kind == "number" and "range" in spec:
++        low, high = (float(x) for x in spec["range"])
++        step = spec.get("step")
++        if not low < high or (step is not None and not float(step) > 0):
++            raise ValueError("an estimate's range runs low to high and its step is above 0")
++        size = 128 if step is None else min(128, round((high - low) / float(step)) + 1)
++        return Q("estimate", spec["instructions"], unit=spec.get("unit"), grid=(low, high, size))
++    if kind == "boxes":
++        mx = spec.get("max")
++        if mx is not None and not (isinstance(mx, int) and not isinstance(mx, bool) and 1 <= mx <= INSTANCES):
++            raise ValueError('"max" belongs to boxes, a whole number from 1 to %d' % INSTANCES)
++        return Q("boxes", spec["instructions"], blocks=INSTANCES if mx is None else mx)
++    if kind == "box":
++        return Q("box", spec["instructions"])
+     return Q(kind, spec["instructions"], spec.get("criteria"), spec.get("unit"))
+ 
++def grid_values(low, high, size):
++    step = (high - low) / (size - 1)
++    return [low + i * step for i in range(size - 1)] + [high], step
++
++def number_groups(tok, low, high, size, scale=1):
++    out = []
++    for v in grid_values(low, high, size)[0]:
++        n = round(v * scale)
++        if not math.isclose(n, v * scale, abs_tol=1e-6) or len(encode(tok, str(n))) != 1:
++            return None
++        out.append(forms(tok, (str(n), " %d" % n)))
++    return out
++
+ def encode(tok, text):
+     return tok.encode(text, add_special_tokens=False).ids
+ 
+@@ -119,7 +158,19 @@
+             out.append(i)
+     return out
+ 
+-def groups(tok, q):
++def groups(tok, q, part=0):
++    if q.kind == "estimate":
++        g = number_groups(tok, *q.grid)
++        if g is None:
++            raise NotImplementedError("an estimate whose grid is not whole numbers of one token each (d1's code grid)")
++        return g
++    if q.kind in ("box", "boxes"):
++        if part % 5 == 0:
++            return [forms(tok, ("yes", "Yes", "YES")), forms(tok, ("no", "No", "NO"))]
++        g = number_groups(tok, 0.0, 0.999, 1000, 1000)
++        if g is None:
++            raise RuntimeError("this tokenizer does not write 0-999 one token each (d1's box edges)")
++        return g
+     if q.kind in ("noul", "multiple"):
+         return [forms(tok, ("yes", "Yes", "YES")), forms(tok, ("no", "No", "NO"))]
+     if q.kind == "score":
+@@ -127,6 +178,17 @@
+     return [[t] + [i for i in forms(tok, [" " + c]) if i != t] for c, t in codes(tok, list(q.criteria))]
+ 
+ def block(tok, q):
++    if q.kind == "box":
++        return ("%s\n\nPresence is yes or no. %s Reply with yes or no at present, then one number at top, bottom, left and right."
++                % (q.instr, LEGEND))
++    if q.kind == "boxes":
++        return ("%s\n\nEvery one of them, %d at most, in reading order (left edge, then top). Present k is yes when there are at least "
++                "k. %s Reply with yes or no at each present, then its top, bottom, left and right." % (q.instr, INSTANCES, LEGEND))
++    if q.kind == "estimate":
++        low, high, size = q.grid
++        unit = " %s" % q.unit if q.unit is not None else ""
++        return "%s\n\nEstimate from %s to %s%s, in steps of %s. Reply with the number only." % (
++            q.instr, "%g" % low, "%g" % high, unit, "%g" % grid_values(low, high, size)[1])
+     if q.kind in SPAN_CAP:
+         unit = " (unit: %s)" % q.unit if q.kind == "number" and q.unit else ""
+         return "%s\n\nRead the %s%s from the state, or nothing if it is absent." % (q.instr, q.kind, unit)
+@@ -146,15 +208,20 @@
+ def suffix(tok, q):
+     body = plain(tok, block(tok, q))
+     head = "%s%s\n%sassistant\n%s" % (body, IM_END, IM_START, LEAD)
+-    if q.kind not in SPAN_CAP and q.kind != "multiple":
++    if q.kind not in SPAN_CAP and q.kind not in ("multiple", "box", "boxes"):
+         return head, [0]
+-    names = ["start", "end"] if q.kind in SPAN_CAP else [json.dumps(n, ensure_ascii=False) for n in q.criteria]
++    names = (["start", "end"] if q.kind in SPAN_CAP else ["present"] + list(EDGES) if q.kind == "box"
++             else ["%s %d" % (n, k) for k in range(1, q.blocks + 1) for n in ("present",) + EDGES] if q.kind == "boxes"
++             else [json.dumps(n, ensure_ascii=False) for n in q.criteria])
+     if len(set(names)) != len(names) or any(not n or "\n" in n for n in names):
+         raise ValueError("slot names must be distinct nonempty single lines")
+     text, ends = head, []
+     for i, n in enumerate(names):
+         text += ("\n" if i else "") + plain(tok, n) + ":"
+         ends.append(len(text))
++    if q.kind == "boxes" and q.blocks < INSTANCES:
++        if tok.decode(tok.encode(text + "\n", add_special_tokens=False).ids[-1:]).rstrip().endswith(":"):
++            text += "\n"
+     enc = tok.encode(text, add_special_tokens=False)
+     ids, offs, at = enc.ids, enc.offsets, []
+     for c in ends:
+@@ -184,6 +251,7 @@
+     names: list
+     offsets: list = field(default_factory=list)
+     width: int = 0
++    media: list = field(default_factory=list)
+ 
+     @property
+     def last(self):
+@@ -205,13 +273,71 @@
+         raise ValueError("token 0 must be a template token (it is the 'nothing' key)")
+     return out
+ 
+-def render(tok, state, questions, set_size=SET_SIZE):
++def video_plan(n, fps_in, fps=2.0, lo=4, hi=768):
++    k = min(max(int(n / fps_in * fps), lo), hi, n)
++    ix = np.linspace(0, n - 1, k).round().astype(int).tolist()
++    jx = ix + [ix[-1]] * (len(ix) % 2)
++    t = [i / fps_in for i in jx]
++    return ix, [(t[i] + t[i + 1]) / 2 for i in range(0, len(t), 2)]
++
++def video_size(k, H0, W0, lo, hi, factor=32):
++    h0, w0 = H0, W0
++    if h0 < factor or w0 < factor:
++        sc = max(factor / h0, factor / w0)
++        h0, w0 = int(h0 * sc), int(w0 * sc)
++    if max(h0, w0) / min(h0, w0) > 200:
++        raise ValueError("a video's aspect ratio must be under 200")
++    hb, wb, tb = round(h0 / factor) * factor, round(w0 / factor) * factor, round(k / 2) * 2
++    if tb * hb * wb > hi:
++        b = math.sqrt(k * h0 * w0 / hi)
++        hb, wb = max(factor, math.floor(h0 / b / factor) * factor), max(factor, math.floor(w0 / b / factor) * factor)
++    elif tb * hb * wb < lo:
++        b = math.sqrt(lo / (k * h0 * w0))
++        hb, wb = math.ceil(h0 * b / factor) * factor, math.ceil(w0 * b / factor) * factor
++    return hb, wb
++
++def media_markup(media):
++    out = ""
++    for m in media or ():
++        if m["kind"] == "image":
++            out += VSTART + IMAGE * m["rows"] + VEND
++        else:
++            out += VSTART + "".join("<%.1f seconds>" % t + VSTART + VIDEO * m["rows"] + VEND for t in m["times"]) + VEND
++    return out
++
++def media_runs(tok, ids):
++    marks = {tok.token_to_id(IMAGE), tok.token_to_id(VIDEO)}
++    out, i = [], 0
++    while i < len(ids):
++        if ids[i] in marks:
++            j = i
++            while j < len(ids) and ids[j] == ids[i]:
++                j += 1
++            out.append((i, j - i))
++            i = j
++        else:
++            i += 1
++    return out
++
++def render(tok, state, questions, set_size=SET_SIZE, media=None):
+     qs = [(n, question(s)) for n, s in questions.items()]
+-    if not isinstance(state, str):
++    mk = media_markup(media)
++    if state is None and not mk:
++        raise ValueError("a request with no state needs a picture or a video")
++    if any(q.kind in ("box", "boxes") for _, q in qs) and sum(m["kind"] == "image" for m in media or ()) != 1:
++        raise ValueError("a box or boxes question reads exactly one picture")
++    if state is not None and not isinstance(state, str):
+         if any(q.kind in SPAN_CAP for _, q in qs):
+             raise NotImplementedError("a read (text / number / date) against a structured state")
+         state = json.dumps(state, ensure_ascii=False, indent=2)
+-    pre = prefix(tok, state)
++    if state is None:
++        if any(q.kind in SPAN_CAP for _, q in qs):
++            raise ValueError("a read (text / number / date) needs a state to read from")
++        pre, header = "%s%suser\n%s" % (BOS, IM_START, mk), ""
++    else:
++        pre, header = prefix(tok, state), HEADER
++        if mk:
++            pre = pre.replace(IM_START + "user\n", IM_START + "user\n" + mk, 1)
+     suf = [suffix(tok, q) for _, q in qs]
+     out = []
+     for k in range(0, len(qs), set_size):
+@@ -226,19 +352,23 @@
+         def place(i, n):
+             name, q = qs[i]
+             for p, off in enumerate(suf[i][1]):
+-                slots.append(Slot(name, q, p, len(ids) - 1 + off, None if q.kind in SPAN_CAP else groups(tok, q)))
++                slots.append(Slot(name, q, p, len(ids) - 1 + off, None if q.kind in SPAN_CAP else groups(tok, q, p)))
+         place(k, 1)
+         for n, i in enumerate(grp, 1):
+             if n == 1:
+                 continue
+-            own = encode(tok, HEADER + suf[i][0])
++            own = encode(tok, header + suf[i][0])
+             ids, qn = ids + own, qn + [n] * len(own)
+             place(i, n)
+-        spans = state_spans(tok, state, text, enc, len(BOS + IM_START) + len("user\n")) \
++        spans = state_spans(tok, state, text, enc, len(BOS + IM_START) + len("user\n") + len(mk)) \
+             if any(qs[i][1].kind in SPAN_CAP for i in grp) else []
+         valid = [i == 0 or s is not None for i, s in enumerate(spans)]
+         width = max((i for i, v in enumerate(valid) if v), default=-1) + 1
+-        out.append(Forward(ids, st, qn, slots, [qs[i][0] for i in grp], spans, width))
++        runs = media_runs(tok, ids) if mk else []
++        want = [m["rows"] for m in media or () for _ in (m.get("times") or [0])]
++        if [n for _, n in runs] != want:
++            raise RuntimeError("the media's placeholders did not tokenize as runs of their rows")
++        out.append(Forward(ids, st, qn, slots, [qs[i][0] for i in grp], spans, width, runs))
+     return out
+ 
+ def softmax(scores, temp):
+@@ -290,19 +420,25 @@
+     return readout_with(f, score, lambda pos, cap: pointer(hidden, f, pos, cap), calib, state)
+ 
+ def readout_with(f, score, ptr, calib, state):
+-    out, mult = {}, {}
++    out, mult, typed = {}, {}, {}
+     for j, sl in enumerate(f.slots):
+         q = sl.q
+         if sl.rows is None:
+             continue
+         toks = sorted({t for g in sl.rows for t in g})
+         at = dict(zip(toks, score(j, sl, toks)))
+-        temp = calib.temperature(q.kind, len(sl.rows)) if q.kind != "multiple" else 1.0
++        temp = calib.temperature(q.kind, len(sl.rows)) if q.kind not in TYPED_CODES else 1.0
+         p = softmax([max(at[t] for t in g) for g in sl.rows], temp)
+         if q.kind == "multiple":
+             mult.setdefault(sl.name, []).append(p[0])
++        elif q.kind in ("box", "boxes"):
++            typed.setdefault(sl.name, [q, []])[1].append(p)
++        elif q.kind == "estimate":
++            out[sl.name] = estimate(q, p, calib)
+         else:
+             out[sl.name] = coded(q, p)
++    for name, (q, ps) in typed.items():
++        out[name] = box_answer(ps, calib) if q.kind == "box" else boxes_answer(ps, calib)
+     for name, ps in mult.items():
+         q = next(s.q for s in f.slots if s.name == name)
+         ps = [calib.table("multiple", p) for p in ps]
+@@ -321,6 +457,89 @@
+         out[name] = readvalue(q, state, found, span, text)
+     return {n: out[n] for n in f.names}
+ 
++def grid_read(values, p, level=None):
++    tot = math.fsum(p)
++    out = {"mean": math.fsum(v * (x / tot) for v, x in zip(values, p))}
++    at = [(k, level(qq) if level else qq) for k, qq in (("p10", 0.1), ("median", 0.5), ("p90", 0.9))]
++    mass = 0.0
++    for v, x in zip(values, p):
++        mass += x / tot
++        for k, qq in at:
++            if k not in out and mass >= qq:
++                out[k] = v
++    for k, _ in at:
++        out.setdefault(k, values[-1])
++    return out
++
++def estimate(q, p, calib):
++    values = grid_values(*q.grid)[0]
++    r = grid_read(values, p, (lambda share: calib.level("estimate", share)) if calib.tables.get("estimate") else None)
++    return {"type": "number", "number": r["median"], "interval": [r["p10"], r["p90"]], "unit": q.unit}
++
++_T_VALUES, _T_STEP = grid_values(0.0, 0.999, 1000)
++
++def _ordered(a, b):
++    if a < b:
++        return a, b
++    half = _T_STEP / 2
++    mid = min(1 - half, max(half, (a + b) / 2))
++    return mid - half, mid + half
++
++def _rect(e):
++    top, bottom = _ordered(e[0], e[1])
++    left, right = _ordered(e[2], e[3])
++    return {"top": top, "bottom": bottom, "left": left, "right": right}
++
++def iou(a, b):
++    ov = (max(0.0, min(a["bottom"], b["bottom"]) - max(a["top"], b["top"]))
++          * max(0.0, min(a["right"], b["right"]) - max(a["left"], b["left"])))
++    ar = lambda x: (x["bottom"] - x["top"]) * (x["right"] - x["left"])
++    return ov / (ar(a) + ar(b) - ov)
++
++def _halton():
++    def ri(i, base):
++        v, sc = 0.0, 1.0
++        while i:
++            i, d = divmod(i, base)
++            sc /= base
++            v += d * sc
++        return v
++    return [tuple(ri(i, b) for b in (2, 3, 5, 7)) for i in range(1, 513)]
++
++_DRAWS = _halton()
++
++def box_confidence(edges, box):
++    import itertools
++    cdfs = [list(itertools.accumulate(x / tot for x in row)) for row, tot in zip(edges, map(math.fsum, edges))]
++    n = len(_T_VALUES)
++    hits = sum(iou(_rect([_T_VALUES[min(n - 1, bisect.bisect_left(c, u))] for c, u in zip(cdfs, pt)]), box) >= 0.5 for pt in _DRAWS)
++    return hits / len(_DRAWS)
++
++def box_medians(edges):
++    return _rect([grid_read(_T_VALUES, row)["median"] for row in edges])
++
++def box_answer(ps, calib):
++    found = calib.table("found:box", ps[0][0])
++    if found < 0.5:
++        return {"type": "box", "box": None, "found": found, "confidence": 0.0}
++    b = box_medians(ps[1:5])
++    return {"type": "box", "box": b, "found": found, "confidence": calib.table("box", box_confidence(ps[1:5], b))}
++
++def boxes_answer(ps, calib):
++    presence, below = [], 1.0
++    for k in range(0, len(ps), 5):
++        below = min(below, calib.table("found:boxes", ps[k][0]))
++        presence.append(below)
++    out = []
++    for k, found in enumerate(presence):
++        if found < 0.5:
++            break
++        blk = ps[5 * k + 1:5 * k + 5]
++        b = box_medians(blk)
++        out.append({"box": b, "found": found, "confidence": calib.table("boxes", box_confidence(blk, b))})
++    out.sort(key=lambda x: (x["box"]["left"], x["box"]["top"]))
++    return {"type": "boxes", "boxes": out, "count": len(out), "at_least": bool(out) and len(out) == len(presence), "presence": presence}
++
+ def coded(q, p):
+     best = max(range(len(p)), key=p.__getitem__)
+     if q.kind == "noul":
+@@ -352,9 +571,9 @@
+         r["unit"] = unit
+     return r
+ 
+-def decide(tok, state, questions, calib, forward, table, set_size=SET_SIZE):
++def decide(tok, state, questions, calib, forward, table, set_size=SET_SIZE, media=None):
+     done = {}
+-    for f in render(tok, state, questions, set_size):
++    for f in render(tok, state, questions, set_size, media):
+         done.update(readout(f, forward(f), table, calib, state))
+     return {n: done[n] for n in questions}
+ 
