@@ -14,7 +14,7 @@
 **cold-cathode** is a Rust reimplementation of the `halogen-flash-server`
 binary blobs published by
 [peonist-ai/halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
-(v0.18.21). The three vendored ELF binaries (`flash_serve`, `halogen-tools`,
+(v0.20.5). The three vendored ELF binaries (`flash_serve`, `halogen-tools`,
 `halogen-npu`), the `halogen-healthcheck` shell script and the
 `halogen-flash-server` launcher were reverse-engineered with
 [REA](https://github.com/morluto/rea) and rebuilt
@@ -41,12 +41,13 @@ rebuild from a shipped binary.
 
 | Item | Detail |
 |---|---|
-| Upstream source | [`github.com/peonist-ai/halogen-flash-server`](https://github.com/peonist-ai/halogen-flash-server) v0.18.21 |
+| Upstream source | [`github.com/peonist-ai/halogen-flash-server`](https://github.com/peonist-ai/halogen-flash-server) v0.20.5 |
 | Upstream licence | Peonist EULA (`lib.licenses.unfreeRedistributable`) |
 | cold-cathode licence | GPL-3.0 (see [`LICENSE`](../LICENSE)) |
 | Rust code | Original work, derived from reverse-engineered contracts — not derived from upstream source code |
-| Reference derivation | `packages/halogen-flash-server/default.nix`, reconstructed from the upstream Nix derivation; `nix build .#halogen-flash-server` reproduces the v0.18.21 package |
-| OCI image digest | `sha256:21006e5347f974241fd11e7bac5fc31759a4187f8267f7b52d8b564986b69821` |
+| Reference derivation | `packages/halogen-flash-server/default.nix`, reconstructed from the upstream Nix derivation; `nix build .#halogen-flash-server` reproduces the v0.20.5 package |
+| OCI image digest | `sha256:3041272385d1ac88e5b842be3dbf4b99472bb079f22430c1ea3b3e0dbd1e1568` |
+| Vendoring note | The 0.20.x image bundles XRT under `/opt/xilinx/xrt` (with `npu/xrt.sha256` pins); this package does not vendor it, so NPU mode relies on the host providing XRT on the loader path |
 
 The Rust sources are original implementations written against contracts
 (specs) derived from REA evidence — strings, symbols, decompiled control flow
@@ -62,7 +63,7 @@ input). It offers two packages:
 
 ```console
 $ nix build .#cold-cathode          # the Rust reimplementation
-$ nix build .#halogen-flash-server  # the upstream v0.18.21 package (reference)
+$ nix build .#halogen-flash-server  # the upstream v0.20.5 package (reference)
 ```
 
 Run the reimplementation:
@@ -111,6 +112,14 @@ each package stands alone.
    orchestrator/subagent execution model: independent work streams dispatched
    in parallel, every code change reviewed by a separate code-reviewer agent
    before it was considered done.
+5. **Version-bump porting.** When upstream moved from v0.18.21 to v0.20.5, the
+   vendored package was bumped manually and the added features were identified
+   with a REA-driven binary diff (`docs/analysis/evidence/
+   version-diff-0.18.21-0.20.5/`), distilled into an objectives list
+   (`docs/analysis/objectives-v0.20.5.md`), and ported in parallel per crate —
+   launcher, engine and NPU — each stream reviewed before landing. The v0.20.5
+   Python front-end and data-asset features (objectives O9–O31) needed no Rust
+   work: the bump delivered them directly under the reuse-as-data rule.
 
 ## Unsafe Rust
 
@@ -141,6 +150,11 @@ Current state of the work:
 - All five entry points (`cold-cathode`, `flash_serve`, `halogen-tools`,
   `halogen-npu`, `halogen-healthcheck`) are implemented in Rust and their CLI
   contract matrices are in place.
+- The vendored reference is at v0.20.5 and its CLI-visible additions are ported:
+  agent-guard mode parsing with NPU model injection, reply-cache budget
+  accounting, the NPU stall watchdog, host-floor backoff restart, the
+  speech-out flag plumbing, the v0.20.5 convert grammar (`--vis`/`--aud`) and
+  the weights stamp — all verified against the reference binaries.
 - GPU-gated paths (ROCm-dependent inference behaviour, NPU/XRT probes) are
   deferred on non-GPU hosts; GPU-dependent outputs are compared structurally,
   not token-for-token.
