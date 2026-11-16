@@ -14,11 +14,11 @@
 let
   image = dockerTools.pullImage {
     imageName = "ghcr.io/peonist-ai/halogen-flash-server";
-    imageDigest = "sha256:65ff9ea3f8a819f465b196cf519b72856c9da76413e16ffea837a4f54dc59f44";
-    outputHash = "sha256-j2Nwb76VoG142DkkrWCpv92v/R7yTOXwaD9OG6IeVPg=";
+    imageDigest = "sha256:3041272385d1ac88e5b842be3dbf4b99472bb079f22430c1ea3b3e0dbd1e1568";
+    outputHash = "sha256-K57Q0I+JMpEnQLDdd0gARBHmLOBRtiQERWp0eg6qGts=";
     outputHashAlgo = "sha256";
     finalImageName = "halogen-flash-server";
-    finalImageTag = "0.19.0";
+    finalImageTag = "0.20.5";
   };
 
   python3Env = python3.withPackages (
@@ -36,13 +36,13 @@ let
 in
 stdenv.mkDerivation {
   pname = "halogen-flash-server";
-  version = "0.19.0";
+  version = "0.20.5";
 
   src = fetchFromGitHub {
     owner = "peonist-ai";
     repo = "halogen-flash-server";
-    rev = "v0.19.0";
-    hash = "sha256:sha256-+cvURiTtfP325QKjRTLlMI52CuqkgBDDXri6f/P4EMI=";
+    rev = "v0.20.5";
+    hash = "sha256-dg79xVLCb6XwWiOLGvKvcXpQWUwN4fjkJcxQAgJtRy4=";
   };
 
   buildInputs = [
@@ -57,6 +57,11 @@ stdenv.mkDerivation {
     makeWrapper
   ];
 
+  # The 0.20.x image bundles its own XRT under /opt/xilinx/xrt (with
+  # npu/xrt.sha256 pins the entrypoint verifies via npu_xrt_own). This
+  # package does not vendor it — the DT_NEEDED lists match 0.19.0, so
+  # halogen-npu's libxrt_coreutil.so.2 stays tolerated as missing and
+  # NPU mode still relies on the host providing XRT on the loader path.
   autoPatchelfIgnoreMissingDeps = "libxrt_coreutil.so.2";
 
   dontConfigure = true;
@@ -158,7 +163,7 @@ stdenv.mkDerivation {
       --run 'export HALOGEN_API_PORT="''${HALOGEN_API_PORT:-8731}"' \
       --run 'export HALOGEN_MAX_TOKENS_CAP="''${HALOGEN_MAX_TOKENS_CAP:-65536}"' \
       --run 'export HALOGEN_QUEUE_TIMEOUT="''${HALOGEN_QUEUE_TIMEOUT:-3600}"' \
-      --run 'export HALOGEN_IMAGE_VERSION="0.18.21"' \
+      --run 'export HALOGEN_IMAGE_VERSION="0.20.5"' \
       --run 'export HALOGEN_IMAGE_MODES="''${HALOGEN_IMAGE_MODES:-all engine api bench sweep convert inspect verify ppl niah}"' \
       --run 'export PYTHONUNBUFFERED="''${PYTHONUNBUFFERED:-1}"' \
       --run 'export HF_HUB_OFFLINE="''${HF_HUB_OFFLINE:-1}"' \
