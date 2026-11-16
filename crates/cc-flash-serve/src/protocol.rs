@@ -357,6 +357,28 @@ pub(crate) fn prefill_line(req: i64, processed: i64, total: i64) -> String {
     format!("flash_serve: req {req} prefill {processed}/{total} tokens, 0.0 s")
 }
 
+/// The v0.20.5 think-block end-of-turn close line (O33), instantiated:
+/// `req %ld think close: %ld forced rows, %s, %ld leaked`. The `req` id is
+/// the request's own id; the `%s` carries the close reason (the reference's
+/// reason strings, e.g. [`NOCALL_NEEDS_GUARD_MESSAGE`]). The port renders
+/// the line from its fields; the think-close numerics stay out of scope.
+pub fn think_close_line(req: i64, forced_rows: i64, reason: &str, leaked: i64) -> String {
+    format!("req {req} think close: {forced_rows} forced rows, {reason}, {leaked} leaked")
+}
+
+/// The v0.20.5 refusal (O33) when a `NOCALL` clause is present without a
+/// `GUARD` (the think block it reads): the reference's exact wording.
+pub const NOCALL_NEEDS_GUARD_MESSAGE: &str = "NOCALL needs GUARD (the think block it reads)";
+
+/// The v0.20.5 `NOCALL`-without-`GUARD` validation (O33): `Some(message)`
+/// when a `NOCALL` clause is present but no `GUARD` supplies the think
+/// block it reads, `None` otherwise. The port keeps the check pure so it is
+/// unit-testable; the GEN grammar parser still accepts and ignores both
+/// clauses (see [`parse_gen`]).
+pub fn validate_nocall_needs_guard(has_nocall: bool, has_guard: bool) -> Option<&'static str> {
+    (has_nocall && !has_guard).then_some(NOCALL_NEEDS_GUARD_MESSAGE)
+}
+
 /// The per-request cadence state for [`generated_line`]: emits the
 /// reference's line once per elapsed [`GEN_PROGRESS_INTERVAL_SECS`]
 /// interval while the token loop runs (the reference's journal shows the
@@ -1121,6 +1143,27 @@ mod tests {
             prefill_line(7, 1, 1),
             "flash_serve: req 7 prefill 1/1 tokens, 0.0 s"
         );
+    }
+
+    #[test]
+    fn think_close_line_and_nocall_guard_match_the_reference_evidence() {
+        // The v0.20.5 think-close line (O33) instantiated.
+        assert_eq!(
+            think_close_line(7, 3, "a reply-end entry", 0),
+            "req 7 think close: 3 forced rows, a reply-end entry, 0 leaked"
+        );
+        // The NOCALL-needs-GUARD validation (O33): the message only when a
+        // NOCALL is present without a GUARD.
+        assert_eq!(
+            validate_nocall_needs_guard(true, false),
+            Some(NOCALL_NEEDS_GUARD_MESSAGE)
+        );
+        assert_eq!(
+            NOCALL_NEEDS_GUARD_MESSAGE,
+            "NOCALL needs GUARD (the think block it reads)"
+        );
+        assert_eq!(validate_nocall_needs_guard(true, true), None);
+        assert_eq!(validate_nocall_needs_guard(false, false), None);
     }
 
     #[test]

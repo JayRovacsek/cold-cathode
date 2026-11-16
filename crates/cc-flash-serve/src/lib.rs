@@ -147,6 +147,19 @@ pub struct ServeArgs {
     pub max_tok: i64,
     /// 0 = auto (derived from `--ctx`).
     pub kv_pool: i64,
+    /// `HALOGEN_CACHE_REPLY` (default 1, per the entrypoint's
+    /// `${HALOGEN_CACHE_REPLY:-1}`): whether the engine keeps a reply-end
+    /// entry per slot (v0.20.5, O32).
+    pub cache_reply: bool,
+    /// `HALOGEN_THINK_EOT_CLOSE` (default 1): whether a think block is
+    /// closed at end of turn (v0.20.5, O33). The default is not pinned by
+    /// the evidence; the port defaults it on because the close is part of
+    /// normal think-block handling.
+    pub think_eot_close: bool,
+    /// `HALOGEN_ANSWER_GUARD_HEADING` (default 0): the answer-guard heading
+    /// rule (v0.20.5, O34). Off unless enabled; no behaviour beyond the
+    /// flag's acceptance is implemented.
+    pub answer_guard_heading: bool,
 }
 
 /// The serve usage line, exactly as the reference prints it (spec "Verbatim
@@ -168,6 +181,9 @@ pub fn parse_serve(args: &[String]) -> Option<ServeArgs> {
         ctx: DEFAULT_CTX,
         max_tok: DEFAULT_MAX_TOK,
         kv_pool: env_strtoll("HALOGEN_KV_POOL_POSITIONS", 0),
+        cache_reply: env_flag("HALOGEN_CACHE_REPLY", true),
+        think_eot_close: env_flag("HALOGEN_THINK_EOT_CLOSE", true),
+        answer_guard_heading: env_flag("HALOGEN_ANSWER_GUARD_HEADING", false),
     };
     let mut i = 0;
     while i < args.len() {
@@ -426,6 +442,19 @@ fn validate_env() -> Result<(), String> {
             return Err(
                 "flash_serve: HALOGEN_SAMPLED_GATE=t1[,t2] needs values in [0, 1]".to_string(),
             );
+        }
+    }
+    // The v0.20.5 boolean flags (O32/O33/O34): each takes the same `0`/`1`
+    // grammar as `HALOGEN_ADMIT_NEST`, so they share one validation loop.
+    for key in [
+        "HALOGEN_CACHE_REPLY",
+        "HALOGEN_THINK_EOT_CLOSE",
+        "HALOGEN_ANSWER_GUARD_HEADING",
+    ] {
+        if let Some(v) = env_var(key) {
+            if parse_flag_bool(&v).is_none() {
+                return Err(format!("flash_serve: {key}={v}: expected 0 or 1"));
+            }
         }
     }
     // HALOGEN_LOCK_ANON=1 prints the lock summary (GPU-gated path).
@@ -725,6 +754,26 @@ fn env_strtod(key: &str, default: f64) -> f64 {
     }
 }
 
+/// Parse a boolean `HALOGEN_*` flag with the reference's grammar (the same
+/// `0`/`1` grammar as `HALOGEN_ADMIT_NEST`): `Some(true)` for `1`,
+/// `Some(false)` for `0`, `None` for anything else.
+fn parse_flag_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// A boolean `HALOGEN_*` flag with a default when the variable is unset or
+/// unparseable (the invalid case is rejected separately by `validate_env`).
+fn env_flag(key: &str, default: bool) -> bool {
+    match env_var(key) {
+        Some(v) => parse_flag_bool(&v).unwrap_or(default),
+        None => default,
+    }
+}
+
 /// C `printf("%g")` rendering (default precision 6).
 pub fn fmt_g(value: f64) -> String {
     if value.is_nan() {
@@ -999,6 +1048,47 @@ mod tests {
     }
 
     #[test]
+    fn v0205_flag_parsing_and_defaults() {
+        // parse_flag_bool shares the `HALOGEN_ADMIT_NEST` grammar.
+        assert_eq!(parse_flag_bool("1"), Some(true));
+        assert_eq!(parse_flag_bool("0"), Some(false));
+        assert_eq!(parse_flag_bool("2"), None);
+        assert_eq!(parse_flag_bool(""), None);
+        assert_eq!(parse_flag_bool("yes"), None);
+        // The defaults (all three unset) and the env overrides, exercised
+        // under the shared-env lock so the parallel threads never race.
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for key in [
+            "HALOGEN_CACHE_REPLY",
+            "HALOGEN_THINK_EOT_CLOSE",
+            "HALOGEN_ANSWER_GUARD_HEADING",
+        ] {
+            env::remove_var(key);
+        }
+        let opts = parse_serve(&args(&[])).expect("empty parses");
+        assert!(opts.cache_reply, "CACHE_REPLY defaults on (entrypoint :-1)");
+        assert!(opts.think_eot_close, "THINK_EOT_CLOSE defaults on");
+        assert!(
+            !opts.answer_guard_heading,
+            "ANSWER_GUARD_HEADING defaults off"
+        );
+        env::set_var("HALOGEN_CACHE_REPLY", "0");
+        env::set_var("HALOGEN_THINK_EOT_CLOSE", "0");
+        env::set_var("HALOGEN_ANSWER_GUARD_HEADING", "1");
+        let opts = parse_serve(&args(&[])).expect("empty parses");
+        assert!(!opts.cache_reply);
+        assert!(!opts.think_eot_close);
+        assert!(opts.answer_guard_heading);
+        for key in [
+            "HALOGEN_CACHE_REPLY",
+            "HALOGEN_THINK_EOT_CLOSE",
+            "HALOGEN_ANSWER_GUARD_HEADING",
+        ] {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
     fn strtol_semantics() {
         assert_eq!(strtol("abc"), 0);
         assert_eq!(strtol("-1"), -1);
@@ -1092,6 +1182,21 @@ mod tests {
                 "x",
                 "flash_serve: HALOGEN_SAMPLED_GATE=t1[,t2] needs values in [0, 1]",
             ),
+            (
+                "HALOGEN_CACHE_REPLY",
+                "x",
+                "flash_serve: HALOGEN_CACHE_REPLY=x: expected 0 or 1",
+            ),
+            (
+                "HALOGEN_THINK_EOT_CLOSE",
+                "2",
+                "flash_serve: HALOGEN_THINK_EOT_CLOSE=2: expected 0 or 1",
+            ),
+            (
+                "HALOGEN_ANSWER_GUARD_HEADING",
+                "yes",
+                "flash_serve: HALOGEN_ANSWER_GUARD_HEADING=yes: expected 0 or 1",
+            ),
         ];
         for (key, value, expected) in cases {
             env::set_var(key, value);
@@ -1116,6 +1221,9 @@ mod tests {
             ("HALOGEN_ADMIT_SPLICE_FOR", "h"),
             ("HALOGEN_ADMIT_NEST", "1"),
             ("HALOGEN_SAMPLED_GATE", "0.5,0.6"),
+            ("HALOGEN_CACHE_REPLY", "0"),
+            ("HALOGEN_THINK_EOT_CLOSE", "1"),
+            ("HALOGEN_ANSWER_GUARD_HEADING", "0"),
         ];
         for (key, value) in &keys {
             env::set_var(key, value);

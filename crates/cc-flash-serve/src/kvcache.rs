@@ -293,6 +293,116 @@ pub fn host_reserve_gib() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Reply-end cache bookkeeping (v0.20.5, API-visible part: O32/O35)
+// ---------------------------------------------------------------------------
+
+/// The reason strings the `req %ld reply entry: …` lines carry in their
+/// `%s` field (byte-exact from the v0.20.5 evidence). The port exposes them
+/// as constants so the refusal/drop lines render the reference's wording;
+/// the KV internals that choose between them stay out of scope.
+pub const REPLY_ENTRY_REASONS: &[&str] = &[
+    "a reply-end entry",
+    "dropped: its history",
+    "the reply entry is off",
+    "this request's reply-end entry",
+    "the engine refused it",
+    "the state is past the reply's end",
+    "the store failed",
+];
+
+/// The outcome of a request's reply-end entry, rendered by
+/// [`reply_entry_line`] as one of the reference's `req %ld reply entry: …`
+/// lines (v0.20.5). Each variant reproduces one of the reference's exact
+/// format strings; the `%s` reasons come from [`REPLY_ENTRY_REASONS`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplyEntryStatus<'a> {
+    /// `%d ids, cached after the call (%.1f ms after its D line), %.1f ms`.
+    CachedAfterCall {
+        n_ids: i64,
+        after_d_ms: f64,
+        total_ms: f64,
+    },
+    /// `%s, %d ids, cached after its D line, %.1f ms`.
+    CachedWithReason {
+        reason: &'a str,
+        n_ids: i64,
+        ms: f64,
+    },
+    /// `none (%s; the state was at %d of %zu ids)`.
+    None { reason: &'a str, at: i64, of: usize },
+    /// `not stored (%s), %d ids`.
+    NotStored { reason: &'a str, n_ids: i64 },
+    /// `not stored after the call (%s), %d ids`.
+    NotStoredAfterCall { reason: &'a str, n_ids: i64 },
+}
+
+/// Render one of the reference's `req %ld reply entry: …` lines (v0.20.5)
+/// for `status`. The `req` id is the request's own id (the reference numbers
+/// requests at the protocol layer and every per-request log line names it);
+/// the `%.1f` fields render with one decimal, matching the format strings.
+pub fn reply_entry_line(req: i64, status: ReplyEntryStatus<'_>) -> String {
+    match status {
+        ReplyEntryStatus::CachedAfterCall {
+            n_ids,
+            after_d_ms,
+            total_ms,
+        } => format!(
+            "req {req} reply entry: {n_ids} ids, cached after the call \
+             ({after_d_ms:.1} ms after its D line), {total_ms:.1} ms"
+        ),
+        ReplyEntryStatus::CachedWithReason { reason, n_ids, ms } => {
+            format!(
+                "req {req} reply entry: {reason}, {n_ids} ids, cached after its D line, {ms:.1} ms"
+            )
+        }
+        ReplyEntryStatus::None { reason, at, of } => {
+            format!("req {req} reply entry: none ({reason}; the state was at {at} of {of} ids)")
+        }
+        ReplyEntryStatus::NotStored { reason, n_ids } => {
+            format!("req {req} reply entry: not stored ({reason}), {n_ids} ids")
+        }
+        ReplyEntryStatus::NotStoredAfterCall { reason, n_ids } => {
+            format!("req {req} reply entry: not stored after the call ({reason}), {n_ids} ids")
+        }
+    }
+}
+
+/// The v0.20.5 prompt-cache budget line (the variant ending `…+ %d reply]`):
+/// the reference reports it when `HALOGEN_CACHE_ENTRIES` is below the count
+/// this configuration needs to keep one conversation's worth of entries per
+/// slot. The `needed` count is `slots × (1 anchor + leaves + full + reply)`
+/// (the entrypoint's `cache_gib` formula's `n`); the port renders the line
+/// from the components rather than recomputing the budget.
+pub fn prompt_cache_budget_line(
+    cache_entries: i64,
+    needed: i64,
+    slots: i64,
+    leaves: i64,
+    full: i64,
+    reply: i64,
+) -> String {
+    format!(
+        "prompt cache: HALOGEN_CACHE_ENTRIES={cache_entries} is below the {needed} this \
+         configuration needs to keep one conversation's worth of entries per slot \
+         ({slots} slot(s) x [1 anchor + {leaves} leaves + {full} full + {reply} reply]). \
+         Conversations past that many lose their history to the global LRU and re-prefill in \
+         full; raise it, or lower HALOGEN_CACHE_BRANCHES if the memory matters more."
+    )
+}
+
+/// The v0.20.5 KV-pool shortening warning (O35): the reference logs it when
+/// a request's region had to give up room it could not grow back. The two
+/// `%s` fields carry the reference's reason and trailing suffix; the port
+/// renders the line from them (the pool-shortening internals stay out of
+/// scope).
+pub fn kv_pool_shortened_line(req: i64, reason: &str, suffix: &str) -> String {
+    format!(
+        "kv pool: request {req} was shortened by the room its region had left, which could \
+         not grow: {reason}{suffix}"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Slot record (the 0x160-byte record of FUN_020120b0 + the §2 request object)
 // ---------------------------------------------------------------------------
 
@@ -923,5 +1033,89 @@ mod tests {
         slot.rollback(1).expect("one position rolls back");
         slot.append_step(&m, 9).expect("append within bound again");
         assert_eq!(slot.context, vec![1, 9]);
+    }
+
+    #[test]
+    fn reply_entry_lines_match_the_reference_formats() {
+        // Each variant reproduces one of the v0.20.5 `req %ld reply entry: …`
+        // format strings, instantiated with concrete fields.
+        assert_eq!(
+            reply_entry_line(
+                7,
+                ReplyEntryStatus::CachedAfterCall {
+                    n_ids: 42,
+                    after_d_ms: 1.5,
+                    total_ms: 12.5,
+                }
+            ),
+            "req 7 reply entry: 42 ids, cached after the call (1.5 ms after its D line), 12.5 ms"
+        );
+        assert_eq!(
+            reply_entry_line(
+                7,
+                ReplyEntryStatus::CachedWithReason {
+                    reason: "a reply-end entry",
+                    n_ids: 42,
+                    ms: 12.5,
+                }
+            ),
+            "req 7 reply entry: a reply-end entry, 42 ids, cached after its D line, 12.5 ms"
+        );
+        assert_eq!(
+            reply_entry_line(
+                7,
+                ReplyEntryStatus::None {
+                    reason: "the engine refused it",
+                    at: 30,
+                    of: 42,
+                }
+            ),
+            "req 7 reply entry: none (the engine refused it; the state was at 30 of 42 ids)"
+        );
+        assert_eq!(
+            reply_entry_line(
+                7,
+                ReplyEntryStatus::NotStored {
+                    reason: "the store failed",
+                    n_ids: 42,
+                }
+            ),
+            "req 7 reply entry: not stored (the store failed), 42 ids"
+        );
+        assert_eq!(
+            reply_entry_line(
+                7,
+                ReplyEntryStatus::NotStoredAfterCall {
+                    reason: "the reply entry is off",
+                    n_ids: 42,
+                }
+            ),
+            "req 7 reply entry: not stored after the call (the reply entry is off), 42 ids"
+        );
+        // The reason constants are byte-exact from the evidence.
+        assert!(REPLY_ENTRY_REASONS.contains(&"a reply-end entry"));
+        assert!(REPLY_ENTRY_REASONS.contains(&"dropped: its history"));
+    }
+
+    #[test]
+    fn prompt_cache_budget_line_ends_with_the_reply_term() {
+        // The v0.20.5 variant adds `+ %d reply]` to the per-slot breakdown.
+        assert_eq!(
+            prompt_cache_budget_line(8, 20, 4, 8, 1, 1),
+            "prompt cache: HALOGEN_CACHE_ENTRIES=8 is below the 20 this configuration needs \
+             to keep one conversation's worth of entries per slot (4 slot(s) x [1 anchor + \
+             8 leaves + 1 full + 1 reply]). Conversations past that many lose their history \
+             to the global LRU and re-prefill in full; raise it, or lower \
+             HALOGEN_CACHE_BRANCHES if the memory matters more."
+        );
+    }
+
+    #[test]
+    fn kv_pool_shortened_line_matches_the_reference_format() {
+        assert_eq!(
+            kv_pool_shortened_line(7, "the region at 1024", " (max_tokens 256 -> 128)"),
+            "kv pool: request 7 was shortened by the room its region had left, which could \
+             not grow: the region at 1024 (max_tokens 256 -> 128)"
+        );
     }
 }
